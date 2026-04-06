@@ -1,0 +1,76 @@
+@import "tailwindcss";
+
+:root {
+  --bg:         #0d0e13;
+  --surface:    #1a1b23;
+  --surface-2:  #22232e;
+  --border:     #2a2b38;
+  --border-2:   #3a3b4a;
+  --text:       #c8cad4;
+  --text-h:     #f0f1f5;
+  --text-muted: #5a5d70;
+  --gold:       #c9a227;
+  --gold-dim:   rgba(201, 162, 39, 0.15);
+  --gold-border:rgba(201, 162, 39, 0.35);
+  --green:      #22c55e;
+  --amber:      #f59e0b;
+  --red:        #ef4444;
+  --blue:       #60a5fa;
+  --purple:     #a78bfa;
+  --accent:     #c9a227;
+
+  font: 13px/1.5 ui-monospace, Consolas, 'Courier New', monospace;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body { margin: 0; overflow: hidden; }
+
+#root {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* ── Status badge colours ── */
+.status-active   { color: var(--green); }
+.status-sleeping { color: var(--text-muted); }
+.status-waiting  { color: var(--amber); }
+.status-error    { color: var(--red); }
+.status-done     { color: var(--blue); }
+
+/* ── Gate badge ── */
+.gate-pending  { border-color: var(--amber); color: var(--amber); }
+.gate-approved { border-color: var(--green); color: var(--green); }
+.gate-force    { border-color: var(--purple); color: var(--purple); }
+.gate-blocked  { border-color: var(--red);  color: var(--red); }
+
+/* ── Gold glow for active session ── */
+.session-active-glow {
+  box-shadow: 0 0 0 1px var(--gold-border), inset 0 0 12px var(--gold-dim);
+}
+
+/* ── Pulse animation for waiting state ── */
+@keyframes pulse-amber {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+.pulse-amber { animation: pulse-amber 1.5s ease-in-out infinite; }
+
+/* ── Sleeping shimmer ── */
+@keyframes shimmer {
+  0%   { opacity: 0.3; }
+  50%  { opacity: 0.7; }
+  100% { opacity: 0.3; }
+}
+.shimmer { animation: shimmer 3s ease-in-out infinite; }
