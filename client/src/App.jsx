@@ -603,7 +603,151 @@ function CheckpointsPanel({ selected }) {
   )
 }
 
+// ─── Chat Panel ───────────────────────────────────────────────────────────────
+
+function ChatPanel({ send, streamEvents }) {
+  const [projectPath, setProjectPath] = useState('C:/Project/RomanPrototype')
+  const [input, setInput] = useState('')
+  const [running, setRunning] = useState(false)
+  const [sessionId, setSessionId] = useState(null)
+  const [messages, setMessages] = useState([])
+  const bottomRef = useRef(null)
+
+  // Process incoming stream events
+  useEffect(() => {
+    if (!streamEvents.length) return
+    const ev = streamEvents[streamEvents.length - 1]
+    if (ev.projectPath !== projectPath) return
+    const { event } = ev
+
+    if (event.type === 'system' && event.subtype === 'init') {
+      setSessionId(event.session_id)
+    } else if (event.type === 'assistant') {
+      const blocks = event.message?.content ?? []
+      const textBlocks = blocks.filter(b => b.type === 'text').map(b => b.text).join('')
+      const toolBlocks = blocks.filter(b => b.type === 'tool_use')
+      if (textBlocks) setMessages(m => [...m, { role: 'assistant', text: textBlocks, ts: Date.now() }])
+      for (const t of toolBlocks)
+        setMessages(m => [...m, { role: 'tool', toolName: t.name, input: t.input, ts: Date.now() }])
+    } else if (event.type === 'result') {
+      setRunning(false)
+      const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : ''
+      setMessages(m => [...m, { role: 'result', text: `完成${cost}`, ts: Date.now() }])
+    } else if (event.type === 'done') {
+      setRunning(false)
+    }
+  }, [streamEvents, projectPath])
+
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
+
+  async function handleSend() {
+    if (!input.trim() || running) return
+    const prompt = input.trim()
+    setInput('')
+    setRunning(true)
+    setMessages(m => [...m, { role: 'user', text: prompt, ts: Date.now() }])
+    await fetch('/api/claude/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectPath, prompt, sessionId }),
+    })
+  }
+
+  function handleStop() {
+    fetch('/api/claude/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectPath }),
+    })
+    setRunning(false)
+  }
+
+  function handleKeyDown(e) {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) handleSend()
+  }
+
+  function clearChat() { setMessages([]); setSessionId(null) }
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* Project path bar */}
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--border)] shrink-0">
+        <span className="text-[9px] text-[var(--text-muted)] uppercase tracking-widest shrink-0">Project</span>
+        <input
+          value={projectPath}
+          onChange={e => { setProjectPath(e.target.value); setSessionId(null); setMessages([]) }}
+          className="flex-1 bg-transparent text-[10px] text-[var(--text)] font-mono outline-none border-b border-[var(--border)] pb-0.5"
+        />
+        {sessionId && (
+          <span className="text-[9px] text-[var(--text-muted)] font-mono shrink-0">{sessionId.slice(0,8)}</span>
+        )}
+        <button onClick={clearChat} className="text-[9px] text-[var(--text-muted)] hover:text-[var(--text)] shrink-0">✕ clear</button>
+      </div>
+
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2 min-h-0">
+        {messages.length === 0 && (
+          <div className="text-[10px] text-[var(--text-muted)] text-center mt-8">
+            輸入訊息開始對話，不需要 VS Code 介面
+          </div>
+        )}
+        {messages.map((m, i) => (
+          <div key={i} className={`text-[11px] leading-relaxed ${
+            m.role === 'user'      ? 'text-[var(--gold)]' :
+            m.role === 'assistant' ? 'text-[var(--text)]' :
+            m.role === 'tool'      ? 'text-sky-400 font-mono text-[10px]' :
+            'text-[var(--text-muted)] text-[10px]'
+          }`}>
+            {m.role === 'user' && <span className="opacity-50 mr-1">›</span>}
+            {m.role === 'tool' && (
+              <span className="bg-sky-900/30 border border-sky-700/50 rounded px-1.5 py-0.5 inline-block">
+                [{m.toolName}] {JSON.stringify(m.input).slice(0, 80)}
+              </span>
+            )}
+            {m.role !== 'tool' && <span style={{ whiteSpace: 'pre-wrap' }}>{m.text}</span>}
+          </div>
+        ))}
+        {running && (
+          <div className="text-[10px] text-[var(--text-muted)] animate-pulse">Claude 思考中…</div>
+        )}
+        <div ref={bottomRef} />
+      </div>
+
+      {/* Input area */}
+      <div className="shrink-0 border-t border-[var(--border)] p-2 flex gap-2">
+        <textarea
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder="輸入訊息… (Ctrl+Enter 送出)"
+          rows={3}
+          disabled={running}
+          className="flex-1 bg-[var(--surface)] border border-[var(--border)] rounded px-2 py-1.5 text-[11px] text-[var(--text)] resize-none outline-none placeholder:text-[var(--text-muted)] disabled:opacity-50"
+        />
+        <div className="flex flex-col gap-1">
+          <button
+            onClick={handleSend}
+            disabled={running || !input.trim()}
+            className="px-3 py-1.5 rounded bg-[var(--gold)]/20 border border-[var(--gold)]/50 text-[var(--gold)] text-[10px] hover:bg-[var(--gold)]/30 disabled:opacity-40"
+          >
+            送出
+          </button>
+          {running && (
+            <button
+              onClick={handleStop}
+              className="px-3 py-1.5 rounded bg-red-900/30 border border-red-700/50 text-red-300 text-[10px] hover:bg-red-800/50"
+            >
+              停止
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 const TABS = [
+  { id: 'chat',      label: 'Chat' },
   { id: 'tasks',     label: 'Tasks' },
   { id: 'history',   label: 'History' },
   { id: 'analytics', label: 'Analytics' },
@@ -620,7 +764,8 @@ export default function App() {
   const [logs, setLogs] = useState([])
   const [renamingId, setRenamingId] = useState(null)
   const [renameVal, setRenameVal] = useState('')
-  const [activeTab, setActiveTab] = useState('tasks')
+  const [activeTab, setActiveTab] = useState('chat')
+  const [streamEvents, setStreamEvents] = useState([])
   // pendingPermission is now read from selected.pendingPermission (server-side state)
   const logContainerRef = useRef(null)
   const isAtBottomRef = useRef(true)
@@ -658,6 +803,9 @@ export default function App() {
     if (msg.type === 'session_remove') {
       setSessions(prev => prev.filter(s => s.id !== msg.sessionId))
       setSelectedId(prev => prev === msg.sessionId ? null : prev)
+    }
+    if (msg.type === 'claude_stream') {
+      setStreamEvents(prev => [...prev.slice(-200), msg])
     }
   })
 
@@ -796,7 +944,10 @@ export default function App() {
           </div>
 
           {/* Tab content */}
-          <div className="flex-1 overflow-y-auto min-h-0">
+          <div className="flex-1 overflow-hidden min-h-0 flex flex-col">
+            {activeTab === 'chat' && (
+              <ChatPanel send={send} streamEvents={streamEvents} />
+            )}
             {activeTab === 'tasks' && (
               <div className="py-2 px-2 h-full">
                 {selected?.tasks?.length > 0

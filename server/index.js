@@ -2,7 +2,7 @@ import Fastify from 'fastify'
 import wsPlugin from '@fastify/websocket'
 import fs from 'fs'
 import path from 'path'
-import { spawnSync } from 'child_process'
+import { spawnSync, spawn } from 'child_process'
 import os from 'os'
 import crypto from 'crypto'
 
@@ -12,12 +12,31 @@ const CLAUDIA_URL = 'http://localhost:48901'
 const app = Fastify({ logger: false })
 await app.register(wsPlugin)
 
+// ─── Claude Binary Auto-detect ───────────────────────────────────────────────
+
+function findClaudeExe() {
+  // 1. Check VS Code extension (primary on Windows)
+  const extDir = path.join(os.homedir(), '.vscode', 'extensions')
+  if (fs.existsSync(extDir)) {
+    const dirs = fs.readdirSync(extDir).filter(d => d.startsWith('anthropic.claude-code')).sort().reverse()
+    for (const d of dirs) {
+      const candidate = path.join(extDir, d, 'resources', 'native-binary', 'claude.exe')
+      if (fs.existsSync(candidate)) return candidate
+    }
+  }
+  // 2. Fallback: PATH
+  return 'claude'
+}
+
+const CLAUDE_EXE = findClaudeExe()
+
 // ─── State ────────────────────────────────────────────────────────────────────
 
 const sessions           = new Map()   // sessionId → Session
 const clients            = new Set()   // WebSocket clients
 const pendingPermissions = new Map()   // permId → { resolve, timer, sessionId }
 const logHistory         = []          // all log entries, capped at 500
+const claudeProcs        = new Map()   // projectPath → { proc, sessionId, status }
 
 function broadcast(msg) {
   const data = JSON.stringify(msg)
@@ -615,6 +634,79 @@ app.get('/api/logs', async (request) => {
   if (last) logs = logs.slice(-Number(last))
   return { logs }
 })
+
+// ─── Claude Subprocess API ───────────────────────────────────────────────────
+
+function spawnClaude(projectPath, prompt, sessionId = null) {
+  // Kill any existing process for this project
+  const existing = claudeProcs.get(projectPath)
+  if (existing?.proc) try { existing.proc.kill() } catch {}
+
+  const args = [
+    '--output-format', 'stream-json',
+    '--verbose',
+    '--dangerously-skip-permissions',
+    '-p', prompt,
+  ]
+  if (sessionId) args.unshift('--resume', sessionId)
+
+  const proc = spawn(CLAUDE_EXE, args, { cwd: projectPath, stdio: ['ignore', 'pipe', 'pipe'] })
+  const entry = { proc, sessionId, projectPath, status: 'running' }
+  claudeProcs.set(projectPath, entry)
+
+  let buf = ''
+  proc.stdout.on('data', chunk => {
+    buf += chunk.toString()
+    const lines = buf.split('\n')
+    buf = lines.pop() // keep incomplete line
+    for (const line of lines) {
+      if (!line.trim()) continue
+      try {
+        const event = JSON.parse(line)
+        // Capture session_id from init
+        if (event.type === 'system' && event.subtype === 'init')
+          entry.sessionId = event.session_id
+        // Skip hook noise
+        if (event.type === 'system' && (event.subtype === 'hook_started' || event.subtype === 'hook_response')) continue
+        broadcast({ type: 'claude_stream', projectPath, event })
+      } catch {}
+    }
+  })
+
+  proc.stderr.on('data', chunk => {
+    const text = chunk.toString().trim()
+    if (text) broadcast({ type: 'claude_stream', projectPath, event: { type: 'stderr', text } })
+  })
+
+  proc.on('close', code => {
+    entry.status = 'done'
+    broadcast({ type: 'claude_stream', projectPath, event: { type: 'done', exitCode: code } })
+    setTimeout(() => { if (claudeProcs.get(projectPath) === entry) claudeProcs.delete(projectPath) }, 10_000)
+  })
+
+  return entry
+}
+
+app.post('/api/claude/run', async (request) => {
+  const { projectPath, prompt, sessionId } = request.body
+  if (!prompt) return { ok: false, error: 'missing prompt' }
+  if (!isSafeCwd(projectPath)) return { ok: false, error: 'invalid projectPath' }
+  const entry = spawnClaude(projectPath, prompt, sessionId ?? null)
+  return { ok: true, projectPath, sessionId: entry.sessionId }
+})
+
+app.post('/api/claude/stop', async (request) => {
+  const { projectPath } = request.body
+  const entry = claudeProcs.get(projectPath)
+  if (entry?.proc) try { entry.proc.kill(); entry.status = 'stopped' } catch {}
+  return { ok: true }
+})
+
+app.get('/api/claude/processes', async () => ({
+  processes: [...claudeProcs.entries()].map(([p, e]) => ({
+    projectPath: p, sessionId: e.sessionId, status: e.status,
+  }))
+}))
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 
