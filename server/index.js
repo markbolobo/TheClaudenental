@@ -182,16 +182,17 @@ app.post('/hook/SessionStart', async (request) => {
   // Check both confirmed session_ids and pending spawns (by cwd) to handle race condition
   const cwdNorm = (e.cwd ?? '').replace(/\\/g, '/').toLowerCase()
   if (subprocessSids.has(e.session_id) || pendingSpawnCwds.has(cwdNorm)) return { ok: true }
-  const name = projectName(e.cwd)
+  const name = getSessionTopic(e.session_id) ?? projectName(e.cwd)
   // Remove old done/inactive sessions from the same project to keep the list clean
   for (const [id, old] of sessions) {
-    if (id !== e.session_id && old.displayName === name && old.status !== 'active' && old.status !== 'waiting') {
+    if (id !== e.session_id && (old.displayName === name || old.cwd === e.cwd) && old.status !== 'active' && old.status !== 'waiting') {
       sessions.delete(id)
       broadcast({ type: 'session_remove', sessionId: id })
     }
   }
   const s = upsertSession(e.session_id, {
     displayName: name,
+    topic: name !== projectName(e.cwd) ? name : undefined,
     cwd: e.cwd,
     status: 'active',
     startedAt: Date.now(),
@@ -243,6 +244,11 @@ app.post('/hook/PreToolUse', async (request) => {
   if (e.cwd && (!s.cwd || s.displayName === 'Session')) {
     s.cwd = e.cwd
     s.displayName = projectName(e.cwd)
+  }
+  // Try to resolve better topic from JSONL if we only have projectName
+  if (!s.topic && s.displayName === projectName(e.cwd)) {
+    const topic = getSessionTopic(e.session_id)
+    if (topic) { s.topic = topic; s.displayName = topic }
   }
   // Always clear stale pendingPermission (e.g. after server restart + VS Code approval)
   if (s.pendingPermission) {
@@ -396,6 +402,38 @@ function patchTask(tasks, tid, patch) {
 
 const CLAUDE_DIR = path.join(os.homedir(), '.claude')
 
+/** Read first user message or ai-title from a session's JSONL as display name */
+function getSessionTopic(sessionId) {
+  const projectsDir = path.join(CLAUDE_DIR, 'projects')
+  try {
+    for (const proj of fs.readdirSync(projectsDir)) {
+      const candidate = path.join(projectsDir, proj, `${sessionId}.jsonl`)
+      if (!fs.existsSync(candidate)) continue
+      const lines = fs.readFileSync(candidate, 'utf-8').split('\n').filter(Boolean)
+      let aiTitle = null
+      for (const l of lines) {
+        try {
+          const obj = JSON.parse(l)
+          if (obj.type === 'ai-title' && obj.aiTitle) aiTitle = obj.aiTitle
+        } catch {}
+      }
+      if (aiTitle) return aiTitle
+      for (const l of lines) {
+        try {
+          const obj = JSON.parse(l)
+          if (obj.type === 'user') {
+            const c = obj.message?.content
+            const text = typeof c === 'string' ? c : c?.[0]?.text ?? ''
+            const clean = text.replace(/^(\s*<[^>]+>[\s\S]*?<\/[^>]+>\s*)+/, '').trim()
+            if (clean) return clean.slice(0, 50)
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+  return null
+}
+
 // List all past sessions across all projects
 app.get('/api/history', async () => {
   const projectsDir = path.join(CLAUDE_DIR, 'projects')
@@ -461,11 +499,11 @@ app.get('/api/history/:sessionId', async (request) => {
       if (obj.type === 'assistant') {
         const c = obj.message?.content
         const text = Array.isArray(c) ? c.filter(x=>x.type==='text').map(x=>x.text).join('') : ''
-        if (text.trim()) messages.push({ role: 'assistant', text: text.trim().slice(0, 800), ts: obj.timestamp })
+        if (text.trim()) messages.push({ role: 'assistant', text: text.trim(), ts: obj.timestamp })
       }
     }
   } catch {}
-  return { ok: true, messages: messages.slice(0, 200) }
+  return { ok: true, messages: messages.slice(-500) }
 })
 
 // ─── CLAUDE.md API ────────────────────────────────────────────────────────────

@@ -299,6 +299,28 @@ function useWebSocket(url, onMessage) {
 
 // ─── Tab panels ──────────────────────────────────────────────────────────────
 
+const HISTORY_PREVIEW_LEN = 300
+
+function HistoryMessage({ message: m }) {
+  const [expanded, setExpanded] = useState(false)
+  const isLong = m.text.length > HISTORY_PREVIEW_LEN
+  const displayed = expanded || !isLong ? m.text : m.text.slice(0, HISTORY_PREVIEW_LEN) + '…'
+  return (
+    <div className={`text-[11px] rounded px-2 py-1 ${m.role === 'user' ? 'bg-[var(--surface-2)] text-[var(--gold)]' : 'text-[var(--text-muted)]'}`}>
+      <div className="font-semibold text-[9px] uppercase mb-0.5 opacity-60">{m.role}</div>
+      <div className="whitespace-pre-wrap break-words">{displayed}</div>
+      {isLong && (
+        <button
+          onClick={() => setExpanded(x => !x)}
+          className="mt-1 text-[9px] text-[var(--gold)]/70 hover:text-[var(--gold)] underline"
+        >
+          {expanded ? '▲ 收起' : '▼ 展開全文'}
+        </button>
+      )}
+    </div>
+  )
+}
+
 function HistoryPanel({ onContinue }) {
   const [list, setList] = useState([])
   const [active, setActive] = useState(null)
@@ -332,10 +354,7 @@ function HistoryPanel({ onContinue }) {
       <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2">
         {loading && <div className="text-[var(--text-muted)] text-xs">Loading…</div>}
         {messages.map((m, i) => (
-          <div key={i} className={`text-[11px] rounded px-2 py-1 ${m.role === 'user' ? 'bg-[var(--surface-2)] text-[var(--gold)]' : 'text-[var(--text-muted)]'}`}>
-            <div className="font-semibold text-[9px] uppercase mb-0.5 opacity-60">{m.role}</div>
-            <div className="whitespace-pre-wrap break-words">{m.text}</div>
-          </div>
+          <HistoryMessage key={i} message={m} />
         ))}
       </div>
     </div>
