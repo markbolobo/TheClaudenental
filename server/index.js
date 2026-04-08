@@ -47,6 +47,31 @@ function broadcast(msg) {
   }
 }
 
+// ─── Session persistence ──────────────────────────────────────────────────────
+
+const SESSIONS_FILE = path.join(os.homedir(), '.claude', 'theclaudenental-sessions.json')
+
+function persistSessions() {
+  try {
+    const data = {}
+    for (const [id, s] of sessions) data[id] = s
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data))
+  } catch {}
+}
+
+function loadPersistedSessions() {
+  try {
+    const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf-8'))
+    for (const [id, s] of Object.entries(data)) {
+      // Mark previously-active as done since we don't know if they're still running
+      if (s.status === 'active' || s.status === 'waiting') s.status = 'done'
+      sessions.set(id, s)
+    }
+  } catch {}
+}
+
+loadPersistedSessions()
+
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 
 app.get('/ws', { websocket: true }, (socket) => {
@@ -130,6 +155,12 @@ function updateTaskGate(tasks, taskId, action) {
 
 // ─── Session helpers ──────────────────────────────────────────────────────────
 
+let _persistTimer = null
+function schedulePersist() {
+  if (_persistTimer) return
+  _persistTimer = setTimeout(() => { _persistTimer = null; persistSessions() }, 2000)
+}
+
 function upsertSession(sessionId, patch = {}) {
   if (!sessions.has(sessionId)) {
     sessions.set(sessionId, {
@@ -144,6 +175,7 @@ function upsertSession(sessionId, patch = {}) {
   const s = sessions.get(sessionId)
   Object.assign(s, patch)
   sessions.set(sessionId, s)
+  schedulePersist()
   return s
 }
 
@@ -185,9 +217,10 @@ app.post('/hook/SessionStart', async (request) => {
   const name = getSessionTopic(e.session_id) ?? projectName(e.cwd)
   // Remove old done/inactive sessions from the same project to keep the list clean
   for (const [id, old] of sessions) {
-    if (id !== e.session_id && (old.displayName === name || old.cwd === e.cwd) && old.status !== 'active' && old.status !== 'waiting') {
+    if (id !== e.session_id && old.cwd === e.cwd && old.status !== 'active' && old.status !== 'waiting') {
       sessions.delete(id)
       broadcast({ type: 'session_remove', sessionId: id })
+      schedulePersist()
     }
   }
   const s = upsertSession(e.session_id, {
@@ -367,6 +400,7 @@ app.post('/api/sessions/clear-inactive', async () => {
     if (s.status !== 'active' && s.status !== 'waiting') {
       sessions.delete(id)
       removed.push(id)
+      schedulePersist()
     }
   }
   for (const id of removed) broadcast({ type: 'session_remove', sessionId: id })

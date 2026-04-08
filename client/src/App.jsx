@@ -217,7 +217,7 @@ function CharacterZone({ status }) {
   )
 }
 
-function InputBar({ onSend }) {
+function InputBar({ onSend, className = '' }) {
   const [value, setValue] = useState('')
   const textRef = useRef(null)
 
@@ -236,7 +236,7 @@ function InputBar({ onSend }) {
   }
 
   return (
-    <div className="flex items-end gap-2 px-3 py-2 border-t border-[var(--border)] bg-[var(--surface)]">
+    <div className={`flex items-end gap-2 px-3 py-2 border-t border-[var(--border)] bg-[var(--surface)] ${className}`}>
       <textarea
         ref={textRef}
         value={value}
@@ -648,7 +648,17 @@ function ChatPanel({ send, streamEvents, chatInit }) {
     prevChatInitRef.current = chatInit
     setProjectPath(chatInit.projectPath)
     setSessionId(chatInit.sessionId)
-    setMessages([{ role: 'assistant', text: `▶ 繼續 session: ${chatInit.sessionId}`, ts: Date.now() }])
+    setMessages([{ role: 'system', text: '載入歷史紀錄…', ts: Date.now() }])
+    fetch(`/api/history/${chatInit.sessionId}`)
+      .then(r => r.json())
+      .then(d => {
+        const hist = (d.messages ?? []).map(m => ({ ...m, historical: true }))
+        setMessages([
+          ...hist,
+          { role: 'system', text: `─── 以上為歷史紀錄，從此繼續 ───`, ts: Date.now() },
+        ])
+      })
+      .catch(() => setMessages([{ role: 'system', text: '歷史紀錄載入失敗', ts: Date.now() }]))
   }, [chatInit])
 
   // Process incoming stream events
@@ -747,7 +757,11 @@ function ChatPanel({ send, streamEvents, chatInit }) {
           </div>
         )}
         {messages.map((m, i) => (
-          <div key={i} className="text-[11px] leading-relaxed">
+          <div key={i} className={`text-[11px] leading-relaxed ${m.historical ? 'opacity-50' : ''}`}>
+            {/* System / divider */}
+            {m.role === 'system' && (
+              <div className="text-[9px] text-[var(--text-muted)] text-center py-1 border-t border-[var(--border)] mt-1">{m.text}</div>
+            )}
             {/* User message */}
             {m.role === 'user' && (
               <div className="text-[var(--gold)]">
@@ -837,6 +851,126 @@ const TABS = [
   { id: 'agents',    label: 'Agents' },
   { id: 'mcp',       label: 'MCP' },
 ]
+
+const MOBILE_TABS = [
+  { id: 'chat',     label: 'CHAT',     icon: '◻' },
+  { id: 'tasks',    label: 'TASKS',    icon: '✓' },
+  { id: 'history',  label: 'HISTORY',  icon: '◷' },
+  { id: 'sessions', label: 'SESSIONS', icon: '◈' },
+  { id: 'more',     label: 'MORE',     icon: '⋯' },
+]
+
+// ─── Mobile components ────────────────────────────────────────────────────────
+
+function MobileSessionBar({ sessions, selectedId, setActiveTab }) {
+  const sel = sessions.find(s => s.id === selectedId)
+  return (
+    <div className="flex md:hidden items-center gap-2 px-3 h-9 border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
+      {sel
+        ? <><StatusDot status={sel.status} /><span className="text-[10px] text-[var(--text-h)] truncate flex-1">{sel.displayName}</span></>
+        : <span className="text-[10px] text-[var(--text-muted)] flex-1">No session selected</span>
+      }
+      <button
+        onClick={() => setActiveTab('sessions')}
+        className="text-[9px] px-2 py-1 rounded bg-[var(--surface-2)] border border-[var(--border)] text-[var(--text-muted)] shrink-0"
+      >
+        Sessions ▾
+      </button>
+    </div>
+  )
+}
+
+function MobileTabBar({ activeTab, setActiveTab }) {
+  return (
+    <nav className="md:hidden shrink-0 flex items-center px-3 pt-2 bg-[var(--surface)] border-t border-[var(--border)]" style={{ paddingBottom: 'max(20px, env(safe-area-inset-bottom))' }}>
+      <div className="flex flex-1 h-[52px] bg-[var(--surface-2)] rounded-full border border-[var(--border)] p-1">
+        {MOBILE_TABS.map(t => (
+          <button key={t.id} onClick={() => setActiveTab(t.id)}
+            className={`flex-1 flex flex-col items-center justify-center gap-0.5 rounded-full text-center transition-colors ${
+              activeTab === t.id
+                ? 'bg-[var(--gold)] text-[var(--bg)]'
+                : 'text-[var(--text-muted)] hover:text-[var(--text)]'
+            }`}
+          >
+            <span className="text-[11px] leading-none">{t.icon}</span>
+            <span className="text-[7px] font-semibold tracking-wide leading-none">{t.label}</span>
+          </button>
+        ))}
+      </div>
+    </nav>
+  )
+}
+
+function MobileSessionsPanel({ sessions, selectedId, setSelectedId, setActiveTab }) {
+  return (
+    <div className="flex flex-col h-full">
+      <div className="px-3 py-2 text-[10px] uppercase tracking-widest text-[var(--text-muted)] border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
+        Sessions
+      </div>
+      <div className="flex-1 overflow-y-auto py-1 px-1">
+        {sessions.map(s => (
+          <SessionItem key={s.id} session={s} isSelected={s.id === selectedId}
+            onClick={() => { setSelectedId(s.id); setActiveTab('chat') }}
+            onDoubleClick={() => {}}
+          />
+        ))}
+        {sessions.length === 0 && <div className="text-[10px] text-[var(--text-muted)] text-center mt-8">No sessions yet</div>}
+      </div>
+    </div>
+  )
+}
+
+function MobileMorePanel({ selected, send, logs, sessions }) {
+  const [sub, setSub] = useState('agent')
+  const SUB = ['agent', 'analytics', 'claude.md', 'agents', 'mcp', 'hooks']
+  return (
+    <div className="flex flex-col h-full">
+      <div className="flex overflow-x-auto border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
+        {SUB.map(t => (
+          <button key={t} onClick={() => setSub(t)}
+            className={`px-3 py-2 text-[9px] uppercase tracking-wider shrink-0 border-b-2 transition-colors ${
+              sub === t ? 'border-[var(--gold)] text-[var(--gold)]' : 'border-transparent text-[var(--text-muted)]'
+            }`}>{t}</button>
+        ))}
+      </div>
+      <div className="flex-1 overflow-hidden min-h-0 flex flex-col">
+        {sub === 'agent' && (
+          <div className="flex flex-col h-full overflow-y-auto">
+            <CharacterZone status={selected?.status ?? 'idle'} />
+            {selected?.pendingPermission && (
+              <div className="mx-3 mb-3 border border-amber-500/50 rounded p-2 bg-amber-900/10">
+                <div className="text-[10px] text-amber-400 font-semibold uppercase tracking-wider mb-1 pulse-amber">⏳ Permission</div>
+                <div className="text-[10px] text-[var(--text)] mb-1 font-mono truncate">{selected.pendingPermission.toolName}</div>
+                <div className="text-[9px] text-[var(--text-muted)] mb-2 break-all line-clamp-2">{selected.pendingPermission.summary}</div>
+                <div className="flex gap-1">
+                  <button onClick={() => send({ type: 'permission_response', permissionId: selected.pendingPermission.permissionId, action: 'approve' })} className="flex-1 py-1 rounded bg-green-900/40 border border-green-700 text-green-300 text-[10px]">✓ Allow</button>
+                  <button onClick={() => send({ type: 'permission_response', permissionId: selected.pendingPermission.permissionId, action: 'allow_always' })} className="flex-1 py-1 rounded bg-yellow-900/40 border border-yellow-600 text-yellow-300 text-[10px]">⭐ Always</button>
+                  <button onClick={() => send({ type: 'permission_response', permissionId: selected.pendingPermission.permissionId, action: 'block' })} className="flex-1 py-1 rounded bg-red-900/40 border border-red-700 text-red-300 text-[10px]">✕ Block</button>
+                </div>
+              </div>
+            )}
+            <div className="px-3 py-2 border-t border-[var(--border)] flex-1 overflow-y-auto">
+              <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] mb-2">Checkpoints</div>
+              <CheckpointsPanel selected={selected} />
+            </div>
+          </div>
+        )}
+        {sub === 'analytics' && <AnalyticsPanel sessions={sessions} />}
+        {sub === 'claude.md'  && <ClaudeMdPanel selected={selected} />}
+        {sub === 'agents'     && <AgentsPanel />}
+        {sub === 'mcp'        && <McpPanel />}
+        {sub === 'hooks'      && (
+          <div className="flex-1 overflow-y-auto px-3 py-1 font-mono text-[10px]">
+            {logs.length === 0 && <span className="text-[var(--text-muted)]">Waiting for events…</span>}
+            {logs.map((l, i) => (
+              <div key={i} className={`leading-5 ${l.level === 'user' ? 'text-[var(--gold)]' : l.level === 'permission' ? 'text-amber-400' : 'text-[var(--text-muted)]'}`}>{l.text ?? JSON.stringify(l)}</div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 
@@ -938,7 +1072,7 @@ export default function App() {
   }
 
   return (
-    <div className="flex flex-col h-screen bg-[var(--bg)] text-[var(--text)]">
+    <div className="flex flex-col h-full bg-[var(--bg)] text-[var(--text)]">
 
       {/* ── Top bar ── */}
       <header className="flex items-center gap-3 px-4 py-2 border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
@@ -959,8 +1093,8 @@ export default function App() {
       {/* ── Main layout ── */}
       <div className="flex flex-1 min-h-0">
 
-        {/* Left: Sessions list */}
-        <aside className="w-52 shrink-0 border-r border-[var(--border)] flex flex-col bg-[var(--surface)] overflow-hidden">
+        {/* Left: Sessions list — desktop only */}
+        <aside className="hidden md:flex w-52 shrink-0 border-r border-[var(--border)] flex-col bg-[var(--surface)] overflow-hidden">
           <div className="px-3 py-2 text-[10px] uppercase tracking-widest text-[var(--text-muted)] border-b border-[var(--border)] flex items-center">
             <span className="flex-1">Sessions</span>
             <button
@@ -1013,8 +1147,11 @@ export default function App() {
         {/* Center: Tab panel */}
         <main className="flex-1 flex flex-col min-w-0">
 
-          {/* Tab bar */}
-          <div className="flex items-center border-b border-[var(--border)] bg-[var(--surface)] shrink-0 overflow-x-auto">
+          {/* Mobile: session indicator */}
+          <MobileSessionBar sessions={sessions} selectedId={selectedId} setActiveTab={setActiveTab} />
+
+          {/* Tab bar — desktop only */}
+          <div className="hidden md:flex items-center border-b border-[var(--border)] bg-[var(--surface)] shrink-0 overflow-x-auto">
             {TABS.map(tab => (
               <button key={tab.id} onClick={() => setActiveTab(tab.id)}
                 className={`px-3 py-2 text-[10px] uppercase tracking-widest shrink-0 border-b-2 transition-colors ${
@@ -1051,10 +1188,13 @@ export default function App() {
             {activeTab === 'claudemd'  && <ClaudeMdPanel selected={selected} />}
             {activeTab === 'agents'    && <AgentsPanel />}
             {activeTab === 'mcp'       && <McpPanel />}
+            {/* Mobile-only tabs */}
+            {activeTab === 'sessions'  && <MobileSessionsPanel sessions={sessions} selectedId={selectedId} setSelectedId={setSelectedId} setActiveTab={setActiveTab} />}
+            {activeTab === 'more'      && <MobileMorePanel selected={selected} send={send} logs={logs} sessions={sessions} />}
           </div>
 
-          {/* Event log */}
-          <div className="h-28 border-t border-[var(--border)] flex flex-col bg-[var(--surface)] shrink-0">
+          {/* Event log — desktop only */}
+          <div className="hidden md:flex h-28 border-t border-[var(--border)] flex-col bg-[var(--surface)] shrink-0">
             <div className="px-3 py-1 text-[10px] uppercase tracking-widest text-[var(--text-muted)] border-b border-[var(--border)]">
               Hook Events
             </div>
@@ -1071,11 +1211,11 @@ export default function App() {
             </div>
           </div>
 
-          <InputBar onSend={handleSend} />
+          <InputBar onSend={handleSend} className="hidden md:flex" />
         </main>
 
-        {/* Right: Character + Gate summary */}
-        <aside className="w-48 shrink-0 border-l border-[var(--border)] flex flex-col bg-[var(--surface)] overflow-hidden">
+        {/* Right: Character + Gate summary — desktop only */}
+        <aside className="hidden md:flex w-48 shrink-0 border-l border-[var(--border)] flex-col bg-[var(--surface)] overflow-hidden">
           <div className="px-3 py-2 text-[10px] uppercase tracking-widest text-[var(--text-muted)] border-b border-[var(--border)]">
             Agent
           </div>
@@ -1158,6 +1298,9 @@ export default function App() {
         </aside>
 
       </div>
+
+      {/* Mobile bottom tab bar */}
+      <MobileTabBar activeTab={activeTab} setActiveTab={setActiveTab} />
     </div>
   )
 }
