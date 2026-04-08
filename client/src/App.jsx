@@ -299,7 +299,7 @@ function useWebSocket(url, onMessage) {
 
 // ─── Tab panels ──────────────────────────────────────────────────────────────
 
-function HistoryPanel() {
+function HistoryPanel({ onContinue }) {
   const [list, setList] = useState([])
   const [active, setActive] = useState(null)
   const [messages, setMessages] = useState([])
@@ -319,7 +319,15 @@ function HistoryPanel() {
     <div className="flex flex-col h-full">
       <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--border)] shrink-0">
         <button onClick={() => setActive(null)} className="text-[var(--text-muted)] hover:text-[var(--text)] text-xs">← Back</button>
-        <span className="text-xs text-[var(--text-h)] truncate">{active.title}</span>
+        <span className="flex-1 text-xs text-[var(--text-h)] truncate">{active.title}</span>
+        {active.cwd && (
+          <button
+            onClick={() => onContinue({ sessionId: active.sessionId, projectPath: active.cwd })}
+            className="shrink-0 px-2 py-1 rounded bg-[var(--gold)]/20 border border-[var(--gold)]/50 text-[var(--gold)] text-[9px] hover:bg-[var(--gold)]/30"
+          >
+            ▶ Continue in Chat
+          </button>
+        )}
       </div>
       <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2">
         {loading && <div className="text-[var(--text-muted)] text-xs">Loading…</div>}
@@ -605,13 +613,24 @@ function CheckpointsPanel({ selected }) {
 
 // ─── Chat Panel ───────────────────────────────────────────────────────────────
 
-function ChatPanel({ send, streamEvents }) {
+function ChatPanel({ send, streamEvents, chatInit }) {
   const [projectPath, setProjectPath] = useState('C:/Project/RomanPrototype')
   const [input, setInput] = useState('')
   const [running, setRunning] = useState(false)
   const [sessionId, setSessionId] = useState(null)
   const [messages, setMessages] = useState([])
   const bottomRef = useRef(null)
+  const prevChatInitRef = useRef(null)
+
+  // Apply chatInit when it changes (from History "Continue in Chat")
+  useEffect(() => {
+    if (!chatInit) return
+    if (chatInit === prevChatInitRef.current) return
+    prevChatInitRef.current = chatInit
+    setProjectPath(chatInit.projectPath)
+    setSessionId(chatInit.sessionId)
+    setMessages([{ role: 'assistant', text: `▶ 繼續 session: ${chatInit.sessionId}`, ts: Date.now() }])
+  }, [chatInit])
 
   // Process incoming stream events
   useEffect(() => {
@@ -624,11 +643,28 @@ function ChatPanel({ send, streamEvents }) {
       setSessionId(event.session_id)
     } else if (event.type === 'assistant') {
       const blocks = event.message?.content ?? []
-      const textBlocks = blocks.filter(b => b.type === 'text').map(b => b.text).join('')
-      const toolBlocks = blocks.filter(b => b.type === 'tool_use')
-      if (textBlocks) setMessages(m => [...m, { role: 'assistant', text: textBlocks, ts: Date.now() }])
-      for (const t of toolBlocks)
-        setMessages(m => [...m, { role: 'tool', toolName: t.name, input: t.input, ts: Date.now() }])
+      const newMsgs = []
+      for (const b of blocks) {
+        if (b.type === 'thinking')
+          newMsgs.push({ role: 'thinking', text: b.thinking, ts: Date.now() })
+        else if (b.type === 'text' && b.text.trim())
+          newMsgs.push({ role: 'assistant', text: b.text, ts: Date.now() })
+        else if (b.type === 'tool_use')
+          newMsgs.push({ role: 'tool_use', toolName: b.name, input: b.input, toolId: b.id, ts: Date.now() })
+      }
+      if (newMsgs.length) setMessages(m => [...m, ...newMsgs])
+    } else if (event.type === 'user') {
+      // Tool results
+      const blocks = event.message?.content ?? []
+      for (const b of blocks) {
+        if (b.type === 'tool_result') {
+          const output = Array.isArray(b.content)
+            ? b.content.filter(x => x.type === 'text').map(x => x.text).join('').slice(0, 300)
+            : String(b.content ?? '').slice(0, 300)
+          if (output.trim())
+            setMessages(m => [...m, { role: 'tool_result', toolId: b.tool_use_id, output, ts: Date.now() }])
+        }
+      }
     } else if (event.type === 'result') {
       setRunning(false)
       const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : ''
@@ -692,19 +728,46 @@ function ChatPanel({ send, streamEvents }) {
           </div>
         )}
         {messages.map((m, i) => (
-          <div key={i} className={`text-[11px] leading-relaxed ${
-            m.role === 'user'      ? 'text-[var(--gold)]' :
-            m.role === 'assistant' ? 'text-[var(--text)]' :
-            m.role === 'tool'      ? 'text-sky-400 font-mono text-[10px]' :
-            'text-[var(--text-muted)] text-[10px]'
-          }`}>
-            {m.role === 'user' && <span className="opacity-50 mr-1">›</span>}
-            {m.role === 'tool' && (
-              <span className="bg-sky-900/30 border border-sky-700/50 rounded px-1.5 py-0.5 inline-block">
-                [{m.toolName}] {JSON.stringify(m.input).slice(0, 80)}
-              </span>
+          <div key={i} className="text-[11px] leading-relaxed">
+            {/* User message */}
+            {m.role === 'user' && (
+              <div className="text-[var(--gold)]">
+                <span className="opacity-50 mr-1">›</span>
+                <span style={{ whiteSpace: 'pre-wrap' }}>{m.text}</span>
+              </div>
             )}
-            {m.role !== 'tool' && <span style={{ whiteSpace: 'pre-wrap' }}>{m.text}</span>}
+            {/* Assistant text */}
+            {m.role === 'assistant' && (
+              <div className="text-[var(--text)]" style={{ whiteSpace: 'pre-wrap' }}>{m.text}</div>
+            )}
+            {/* Thinking block */}
+            {m.role === 'thinking' && (
+              <details className="border border-purple-700/40 rounded bg-purple-900/10 px-2 py-1">
+                <summary className="text-[9px] text-purple-400 cursor-pointer select-none uppercase tracking-widest">💭 Thinking</summary>
+                <div className="mt-1 text-[10px] text-purple-300/70 font-mono" style={{ whiteSpace: 'pre-wrap' }}>{m.text}</div>
+              </details>
+            )}
+            {/* Tool use */}
+            {m.role === 'tool_use' && (
+              <details className="border border-sky-700/40 rounded bg-sky-900/10 px-2 py-1">
+                <summary className="text-[9px] text-sky-400 cursor-pointer select-none">
+                  <span className="uppercase tracking-widest">⚙ {m.toolName}</span>
+                  <span className="ml-2 text-sky-500/60 font-mono">{Object.values(m.input)[0]?.toString().slice(0, 60) ?? ''}</span>
+                </summary>
+                <pre className="mt-1 text-[10px] text-sky-300/70 overflow-x-auto">{JSON.stringify(m.input, null, 2)}</pre>
+              </details>
+            )}
+            {/* Tool result */}
+            {m.role === 'tool_result' && (
+              <details className="border border-emerald-700/40 rounded bg-emerald-900/10 px-2 py-1">
+                <summary className="text-[9px] text-emerald-400 cursor-pointer select-none uppercase tracking-widest">↩ Result</summary>
+                <pre className="mt-1 text-[10px] text-emerald-300/70 overflow-x-auto">{m.output}</pre>
+              </details>
+            )}
+            {/* Completion */}
+            {m.role === 'result' && (
+              <div className="text-[10px] text-[var(--text-muted)] border-t border-[var(--border)] pt-1 mt-1">{m.text}</div>
+            )}
           </div>
         ))}
         {running && (
@@ -766,6 +829,12 @@ export default function App() {
   const [renameVal, setRenameVal] = useState('')
   const [activeTab, setActiveTab] = useState('chat')
   const [streamEvents, setStreamEvents] = useState([])
+  const [chatInit, setChatInit] = useState(null)
+
+  function handleContinueInChat({ sessionId, projectPath }) {
+    setChatInit({ sessionId, projectPath })
+    setActiveTab('chat')
+  }
   // pendingPermission is now read from selected.pendingPermission (server-side state)
   const logContainerRef = useRef(null)
   const isAtBottomRef = useRef(true)
@@ -946,7 +1015,7 @@ export default function App() {
           {/* Tab content */}
           <div className="flex-1 overflow-hidden min-h-0 flex flex-col">
             {activeTab === 'chat' && (
-              <ChatPanel send={send} streamEvents={streamEvents} />
+              <ChatPanel send={send} streamEvents={streamEvents} chatInit={chatInit} />
             )}
             {activeTab === 'tasks' && (
               <div className="py-2 px-2 h-full">
@@ -958,7 +1027,7 @@ export default function App() {
                 }
               </div>
             )}
-            {activeTab === 'history'   && <HistoryPanel />}
+            {activeTab === 'history'   && <HistoryPanel onContinue={handleContinueInChat} />}
             {activeTab === 'analytics' && <AnalyticsPanel sessions={sessions} />}
             {activeTab === 'claudemd'  && <ClaudeMdPanel selected={selected} />}
             {activeTab === 'agents'    && <AgentsPanel />}

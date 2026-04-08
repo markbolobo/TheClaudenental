@@ -37,6 +37,8 @@ const clients            = new Set()   // WebSocket clients
 const pendingPermissions = new Map()   // permId → { resolve, timer, sessionId }
 const logHistory         = []          // all log entries, capped at 500
 const claudeProcs        = new Map()   // projectPath → { proc, sessionId, status }
+const subprocessSids     = new Set()   // session_ids spawned by us (filtered from sessions list)
+const pendingSpawnCwds   = new Set()   // project paths currently spawning (pre-registers before init event)
 
 function broadcast(msg) {
   const data = JSON.stringify(msg)
@@ -176,6 +178,10 @@ app.post('/hook', async (request) => {
 app.post('/hook/SessionStart', async (request) => {
   const e = request.body
   forwardToClaudia(e, 'SessionStart')
+  // Ignore sessions spawned by our own subprocess — they appear in Chat, not Sessions list
+  // Check both confirmed session_ids and pending spawns (by cwd) to handle race condition
+  const cwdNorm = (e.cwd ?? '').replace(/\\/g, '/').toLowerCase()
+  if (subprocessSids.has(e.session_id) || pendingSpawnCwds.has(cwdNorm)) return { ok: true }
   const name = projectName(e.cwd)
   // Remove old done/inactive sessions from the same project to keep the list clean
   for (const [id, old] of sessions) {
@@ -199,6 +205,7 @@ app.post('/hook/SessionStart', async (request) => {
 app.post('/hook/Stop', async (request) => {
   const e = request.body
   forwardToClaudia(e, 'Stop')
+  if (subprocessSids.has(e.session_id)) return { ok: true }
   const reason = e.stop_reason ?? ''
   const isSleeping = reason === 'max_tokens'
   const status = isSleeping ? 'sleeping' : 'done'
@@ -221,6 +228,7 @@ app.post('/hook/Stop', async (request) => {
 app.post('/hook/SessionEnd', async (request) => {
   const e = request.body
   forwardToClaudia(e, 'SessionEnd')
+  if (subprocessSids.has(e.session_id)) { subprocessSids.delete(e.session_id); return { ok: true } }
   setStatus(e.session_id, 'done')
   emitLog(e.session_id, `[SessionEnd]`)
   return { ok: true }
@@ -401,13 +409,14 @@ app.get('/api/history', async () => {
         const sessionId = file.replace('.jsonl', '')
         const fullPath = path.join(projPath, file)
         const stat = fs.statSync(fullPath)
-        // Read ai-title and first user message
-        let title = null, firstMsg = null
+        // Read ai-title, cwd, and first user message
+        let title = null, firstMsg = null, cwd = null
         try {
           const lines = fs.readFileSync(fullPath, 'utf-8').split('\n').filter(Boolean)
           for (const l of lines) {
             const obj = JSON.parse(l)
-            if (obj.type === 'ai-title' && obj.aiTitle) { title = obj.aiTitle; break }
+            if (!cwd && obj.cwd) cwd = obj.cwd
+            if (obj.type === 'ai-title' && obj.aiTitle) { title = obj.aiTitle }
           }
           for (const l of lines) {
             const obj = JSON.parse(l)
@@ -419,7 +428,7 @@ app.get('/api/history', async () => {
             }
           }
         } catch {}
-        result.push({ sessionId, project: proj, title: title ?? firstMsg ?? sessionId.slice(0,8), mtime: stat.mtimeMs, size: stat.size })
+        result.push({ sessionId, project: proj, cwd, title: title ?? firstMsg ?? sessionId.slice(0,8), mtime: stat.mtimeMs, size: stat.size })
       }
     }
   } catch {}
@@ -642,6 +651,10 @@ function spawnClaude(projectPath, prompt, sessionId = null) {
   const existing = claudeProcs.get(projectPath)
   if (existing?.proc) try { existing.proc.kill() } catch {}
 
+  // Pre-register before spawn so SessionStart hook can filter by cwd (race condition fix)
+  const normalCwd = projectPath.replace(/\\/g, '/').toLowerCase()
+  pendingSpawnCwds.add(normalCwd)
+
   const args = [
     '--output-format', 'stream-json',
     '--verbose',
@@ -663,9 +676,12 @@ function spawnClaude(projectPath, prompt, sessionId = null) {
       if (!line.trim()) continue
       try {
         const event = JSON.parse(line)
-        // Capture session_id from init
-        if (event.type === 'system' && event.subtype === 'init')
+        // Capture session_id from init + mark as subprocess session
+        if (event.type === 'system' && event.subtype === 'init') {
           entry.sessionId = event.session_id
+          subprocessSids.add(event.session_id)
+          pendingSpawnCwds.delete(normalCwd)
+        }
         // Skip hook noise
         if (event.type === 'system' && (event.subtype === 'hook_started' || event.subtype === 'hook_response')) continue
         broadcast({ type: 'claude_stream', projectPath, event })
