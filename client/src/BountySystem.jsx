@@ -198,6 +198,14 @@ function PieChart({ slices, size = 88 }) {
       className="rounded-full bg-[var(--surface-2)] border border-[var(--border)] shrink-0" />
   )
   const cx = size / 2, cy = size / 2, r = size * 0.43
+  // SVG arc degenerates when start === end (full circle). Handle single-slice specially.
+  if (pos.length === 1) {
+    return (
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="shrink-0">
+        <circle cx={cx} cy={cy} r={r} fill={pos[0].color} />
+      </svg>
+    )
+  }
   let a = -Math.PI / 2
   return (
     <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="shrink-0">

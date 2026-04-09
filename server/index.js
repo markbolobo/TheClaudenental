@@ -425,6 +425,18 @@ app.get('/api/usage/heat', async () => {
   const claudeDir = path.join(os.homedir(), '.claude', 'projects')
   if (!fs.existsSync(claudeDir)) return { session5h: { cost: 0, count: 0 }, weekly7d: { cost: 0, count: 0 }, updatedAt: now }
 
+  // Claude Code JSONL stores type:"assistant" entries with message.usage token counts.
+  // There is no type:"result" with total_cost_usd — must compute cost from usage fields.
+  const computeCost = (model, usage) => {
+    const p = PRICING[model] ?? PRICING['claude-sonnet-4-6']
+    return (
+      (usage.input_tokens                ?? 0) * p.input      / 1_000_000 +
+      (usage.output_tokens               ?? 0) * p.output     / 1_000_000 +
+      (usage.cache_read_input_tokens     ?? 0) * p.cacheRead  / 1_000_000 +
+      (usage.cache_creation_input_tokens ?? 0) * p.cacheWrite / 1_000_000
+    )
+  }
+
   try {
     for (const proj of fs.readdirSync(claudeDir)) {
       const projDir = path.join(claudeDir, proj)
@@ -433,20 +445,23 @@ app.get('/api/usage/heat', async () => {
         if (!f.endsWith('.jsonl')) continue
         const fullPath = path.join(projDir, f)
         try {
-          const age = now - fs.statSync(fullPath).mtimeMs
-          if (age > WIN_7D) continue
-          let cost = null
+          // Quick pre-filter: skip files not touched in 7d
+          if (now - fs.statSync(fullPath).mtimeMs > WIN_7D) continue
           for (const line of fs.readFileSync(fullPath, 'utf-8').split('\n')) {
             try {
               const obj = JSON.parse(line)
-              if (obj.type === 'result' && typeof obj.total_cost_usd === 'number') {
-                cost = (cost ?? 0) + obj.total_cost_usd
-              }
+              if (obj.type !== 'assistant') continue
+              const msg = obj.message
+              if (!msg?.usage?.output_tokens) continue   // skip non-generating turns
+              const ts = obj.timestamp ? new Date(obj.timestamp).getTime() : null
+              if (!ts) continue
+              const age = now - ts
+              if (age > WIN_7D) continue
+              const cost = computeCost(msg.model ?? '', msg.usage)
+              if (cost <= 0) continue
+              cost7d += cost; count7d++
+              if (age <= WIN_5H) { cost5h += cost; count5h++ }
             } catch {}
-          }
-          if (cost != null && cost > 0) {
-            cost7d += cost; count7d++
-            if (age <= WIN_5H) { cost5h += cost; count5h++ }
           }
         } catch {}
       }
