@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { useCostEngine, BountyOverlay, BountyToast, ContractModal, fmtCost, tierKey } from './BountySystem.jsx'
+import { useCostEngine, BountyOverlay, BountyToast, ContractModal, fmtCost } from './BountySystem.jsx'
 import BountySettings from './BountySettings.jsx'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -43,14 +43,14 @@ function StatusDot({ status }) {
   return <span className={`text-xs ${cls}`}>{STATUS_ICON[status] ?? '?'}</span>
 }
 
-function SessionItem({ session, isSelected, onClick, onDoubleClick, liveCost, onCostClick, autoResumeArmed, onToggleAutoResume }) {
+function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick, autoResumeArmed, onToggleAutoResume }) {
   const base = 'flex items-center gap-2 px-3 py-2 rounded cursor-pointer transition-all'
   const selectedCls = isSelected
     ? 'bg-[var(--surface-2)] session-active-glow'
     : 'hover:bg-[var(--surface-2)]'
 
   // ── Cost delta animation ─────────────────────────────────────────────────
-  const rawCost = liveCost ?? session.costUsd ?? null
+  const rawCost = session.costUsd ?? null
   const [displayedCost, setDisplayedCost] = useState(rawCost)
   const [deltaAmt, setDeltaAmt]           = useState(null)   // number | null
   const [deltaPhase, setDeltaPhase]       = useState('idle') // 'idle'|'show'|'fade'
@@ -1102,7 +1102,6 @@ export default function App() {
   const [currentAnim, setCurrentAnim]           = useState(null)
   const [showBountySettings, setShowBountySettings] = useState(false)
   const [contractModal, setContractModal]       = useState(null)
-  const [liveCosts, setLiveCosts]               = useState({})   // { 'session:<id>' | normPath: total }
   const [historyCosts, setHistoryCosts]         = useState({})   // { [sessionId]: costUsd }
 
   // Track which session is currently open in Chat (for animation gating)
@@ -1176,25 +1175,16 @@ export default function App() {
 
   // Cost engine — receives stream events and fires animation triggers
   const costSnap = useCostEngine(streamEvents, (anim) => {
-    const { key, total } = anim
+    const { key, delta } = anim
     // Resolve session from key
     const sessById  = key.startsWith('session:') ? sessions.find(s => s.id === key.slice(8)) : null
     const sessByCwd = !sessById ? sessions.find(s => normPath(s.cwd) === key) : null
     const sess = sessById ?? sessByCwd
 
-    // Always update live cost display (both keys for safe lookup)
-    setLiveCosts(prev => {
-      const next = { ...prev, [key]: total }
-      if (sess) {
-        next[normPath(sess.cwd)]    = total
-        next[`session:${sess.id}`] = total
-      }
-      return next
-    })
-
-    // Keep historyCosts in sync — no re-fetch needed
+    // ADD delta to historyCosts baseline — never replace (engine total starts from 0)
+    // This makes session.costUsd = API baseline + live increments → correct total for display
     if (sess) {
-      setHistoryCosts(prev => ({ ...prev, [sess.id]: total }))
+      setHistoryCosts(prev => ({ ...prev, [sess.id]: (prev[sess.id] ?? 0) + delta }))
     }
 
     // Fire animation only when Chat tab is active AND this is the currently open session
@@ -1226,7 +1216,7 @@ export default function App() {
   const isOverlay = (animTier === 'L' && animLevel && animLevel < 3)
     ? false
     : animTier != null && !(animTier === 'L' && animLevel < 3)
-  // L1/L2 = badge flash only (handled inline in SessionItem via liveCosts)
+  // L1/L2 = badge flash only (no overlay)
 
   function handleContinueInChat({ sessionId, projectPath }) {
     setChatInit({ sessionId, projectPath })
@@ -1432,7 +1422,6 @@ export default function App() {
                     key={s.id}
                     session={{ ...s, costUsd: historyCosts[s.id] ?? s.costUsd ?? null }}
                     isSelected={s.id === selectedId}
-                    liveCost={liveCosts[`session:${s.id}`] ?? liveCosts[normPath(s.cwd)] ?? null}
                     onClick={() => {
                       setSelectedId(s.id)
                       if (s.cwd) handleContinueInChat({ sessionId: s.id, projectPath: s.cwd })
