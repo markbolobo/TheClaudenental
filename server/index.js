@@ -544,7 +544,14 @@ app.get('/api/history/:sessionId', async (request) => {
   if (!filePath) return { ok: false, messages: [] }
   const messages = []
   let costUsd = null
-  let totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0
+  const byType   = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  const byModel  = {}   // { [model]: { input, output, cacheRead, cacheWrite, cost } }
+  const PRICING  = {
+    'claude-sonnet-4-6':         { input: 3,  output: 15, cacheRead: 0.30, cacheWrite: 3.75 },
+    'claude-opus-4-6':           { input: 5,  output: 25, cacheRead: 0.50, cacheWrite: 6.25 },
+    'claude-haiku-4-5-20251001': { input: 1,  output: 5,  cacheRead: 0.10, cacheWrite: 1.25 },
+  }
+  const DEFAULT_P = PRICING['claude-sonnet-4-6']
   try {
     const lines = fs.readFileSync(filePath, 'utf-8').split('\n').filter(Boolean)
     for (const l of lines) {
@@ -561,23 +568,45 @@ app.get('/api/history/:sessionId', async (request) => {
           const text = Array.isArray(c) ? c.filter(x=>x.type==='text').map(x=>x.text).join('') : ''
           if (text.trim()) messages.push({ role: 'assistant', text: text.trim(), ts: obj.timestamp })
           if (obj.message?.usage) {
-            const u = obj.message.usage
-            totalInput += u.input_tokens ?? 0
-            totalOutput += u.output_tokens ?? 0
-            totalCacheRead += u.cache_read_input_tokens ?? 0
-            totalCacheWrite += u.cache_creation_input_tokens ?? 0
+            const u   = obj.message.usage
+            const mn  = obj.message.model ?? 'unknown'
+            const p   = PRICING[mn] ?? DEFAULT_P
+            byType.input      += u.input_tokens                ?? 0
+            byType.output     += u.output_tokens               ?? 0
+            byType.cacheRead  += u.cache_read_input_tokens     ?? 0
+            byType.cacheWrite += u.cache_creation_input_tokens ?? 0
+            if (!byModel[mn]) byModel[mn] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
+            byModel[mn].input      += u.input_tokens                ?? 0
+            byModel[mn].output     += u.output_tokens               ?? 0
+            byModel[mn].cacheRead  += u.cache_read_input_tokens     ?? 0
+            byModel[mn].cacheWrite += u.cache_creation_input_tokens ?? 0
+            byModel[mn].cost       += (
+              (u.input_tokens ?? 0) * p.input + (u.output_tokens ?? 0) * p.output +
+              (u.cache_read_input_tokens ?? 0) * p.cacheRead + (u.cache_creation_input_tokens ?? 0) * p.cacheWrite
+            ) / 1e6
           }
         }
         if (obj.type === 'result' && typeof obj.total_cost_usd === 'number') {
           costUsd = (costUsd ?? 0) + obj.total_cost_usd
+          // modelUsage from result event overrides per-message estimates for subprocess sessions
+          if (obj.modelUsage) {
+            for (const [mn, mu] of Object.entries(obj.modelUsage)) {
+              if (!byModel[mn]) byModel[mn] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
+              byModel[mn].input      = mu.inputTokens               ?? byModel[mn].input
+              byModel[mn].output     = mu.outputTokens              ?? byModel[mn].output
+              byModel[mn].cacheRead  = mu.cacheReadInputTokens      ?? byModel[mn].cacheRead
+              byModel[mn].cacheWrite = mu.cacheCreationInputTokens  ?? byModel[mn].cacheWrite
+              byModel[mn].cost       = mu.costUSD                   ?? byModel[mn].cost
+            }
+          }
         }
       } catch {}
     }
-    if (costUsd === null && (totalInput + totalOutput + totalCacheRead) > 0) {
-      costUsd = (totalInput * 3 + totalOutput * 15 + totalCacheRead * 0.3 + totalCacheWrite * 3.75) / 1e6
+    if (costUsd === null && (byType.input + byType.output + byType.cacheRead) > 0) {
+      costUsd = (byType.input * 3 + byType.output * 15 + byType.cacheRead * 0.3 + byType.cacheWrite * 3.75) / 1e6
     }
   } catch {}
-  return { ok: true, messages: messages.slice(-500), costUsd }
+  return { ok: true, messages: messages.slice(-500), costUsd, byType, byModel }
 })
 
 // ─── VS Code session live tail ────────────────────────────────────────────────

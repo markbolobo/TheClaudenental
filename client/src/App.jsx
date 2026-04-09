@@ -1028,10 +1028,18 @@ export default function App() {
   const [showBountySettings, setShowBountySettings] = useState(false)
   const [contractModal, setContractModal]       = useState(null) // { sessionName, costData }
   const [liveCosts, setLiveCosts]               = useState({})   // { [normPath]: total }
+  const [historyCosts, setHistoryCosts]         = useState({})   // { [sessionId]: costUsd }
 
-  // Load bounty settings once
+  // Load bounty settings + historical costs once
   useEffect(() => {
     fetch('/api/bounty/settings').then(r => r.json()).then(setBountySettings).catch(() => {})
+    fetch('/api/history').then(r => r.json()).then(d => {
+      const map = {}
+      for (const s of d.sessions ?? []) {
+        if (s.costUsd != null) map[s.sessionId] = s.costUsd
+      }
+      setHistoryCosts(map)
+    }).catch(() => {})
   }, [])
 
   // Cost engine — receives stream events and fires animation triggers
@@ -1233,7 +1241,7 @@ export default function App() {
                 : (
                   <SessionItem
                     key={s.id}
-                    session={s}
+                    session={{ ...s, costUsd: historyCosts[s.id] ?? s.costUsd ?? null }}
                     isSelected={s.id === selectedId}
                     liveCost={liveCosts[normPath(s.cwd)] ?? null}
                     onClick={() => {
@@ -1241,9 +1249,18 @@ export default function App() {
                       if (s.cwd) handleContinueInChat({ sessionId: s.id, projectPath: s.cwd })
                     }}
                     onDoubleClick={() => { setRenamingId(s.id); setRenameVal(s.displayName) }}
-                    onCostClick={() => {
-                      const costData = costSnap[normPath(s.cwd)] ?? null
-                      setContractModal({ sessionName: s.displayName, costData })
+                    onCostClick={async () => {
+                      // Prefer live cost engine data; fall back to fetching history detail
+                      const live = costSnap[normPath(s.cwd)]
+                      if (live) {
+                        setContractModal({ sessionName: s.displayName, costData: live })
+                      } else {
+                        const d = await fetch(`/api/history/${s.id}`).then(r => r.json()).catch(() => ({}))
+                        setContractModal({
+                          sessionName: s.displayName,
+                          costData: { total: d.costUsd ?? 0, byType: d.byType ?? {}, byModel: d.byModel ?? {} },
+                        })
+                      }
                     }}
                   />
                 )
