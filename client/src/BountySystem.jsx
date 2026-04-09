@@ -243,11 +243,11 @@ export function ContractModal({ sessionName, costData, onClose }) {
   }))
 
   return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center overlay-in"
-      style={{ background: 'rgba(0,0,0,0.88)' }} onClick={onClose}>
-      <div className="relative w-full max-w-md mx-4 bg-[var(--surface)] border border-[var(--gold-border)] rounded-sm
+    <div className="fixed inset-0 z-[70] flex items-start justify-center overlay-in overflow-y-auto"
+      style={{ background: 'rgba(0,0,0,0.88)', paddingTop: 'max(env(safe-area-inset-top), 1rem)', paddingBottom: 'max(env(safe-area-inset-bottom), 1rem)' }}
+      onClick={onClose}>
+      <div className="relative w-full max-w-md mx-4 my-auto bg-[var(--surface)] border border-[var(--gold-border)] rounded-sm
         shadow-[0_0_60px_rgba(201,162,39,0.12)]"
-        style={{ maxHeight: '90vh', overflowY: 'auto' }}
         onClick={e => e.stopPropagation()}>
 
         {/* Header */}
