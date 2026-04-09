@@ -1035,6 +1035,110 @@ app.get('/health', async () => ({
   clients: clients.size,
 }))
 
+// ─── JSONL directory scanner (fallback session discovery) ────────────────────
+// Runs every 8s. Discovers sessions whose hooks may have been missed (e.g. after
+// server restart, or VS Code sessions in other projects). Only touches sessions
+// modified within the last 30 minutes so it stays lightweight.
+
+const SCAN_WINDOW_MS   = 30 * 60 * 1000   // look at files touched in last 30 min
+const SCAN_INTERVAL_MS = 8_000
+
+function scanJsonlSessions() {
+  const projectsDir = path.join(CLAUDE_DIR, 'projects')
+  const now = Date.now()
+  try {
+    for (const proj of fs.readdirSync(projectsDir)) {
+      const pd = path.join(projectsDir, proj)
+      if (!fs.statSync(pd).isDirectory()) continue
+      for (const file of fs.readdirSync(pd)) {
+        // Skip subagent dirs and non-jsonl files
+        if (!file.endsWith('.jsonl')) continue
+        const fp  = path.join(pd, file)
+        const st  = fs.statSync(fp)
+        // Only consider recently-modified files
+        if (now - st.mtimeMs > SCAN_WINDOW_MS) continue
+        const sid = file.replace('.jsonl', '')
+        // Skip sessions we already know about and are still active
+        const existing = sessions.get(sid)
+        if (existing?.status === 'active') {
+          // Still active — auto-watch if not already watching
+          if (!watchedSessions.has(sid)) {
+            const fp2 = findJsonlPath(sid)
+            if (fp2) {
+              const initial   = parseNewLines(fp2, 0)
+              const lineCount = initial?.lineCount ?? 0
+              const watcher   = fs.watchFile(fp2, { interval: 1500 }, () => {
+                const entry = watchedSessions.get(sid)
+                if (!entry) return
+                const result = parseNewLines(fp2, entry.lineCount)
+                if (!result || !result.messages.length) return
+                entry.lineCount = result.lineCount
+                broadcast({ type: 'session_live', sessionId: sid, messages: result.messages })
+              })
+              watchedSessions.set(sid, { watcher, filePath: fp2, lineCount })
+            }
+          }
+          continue
+        }
+        // Read minimal info from JSONL to build/refresh the session
+        try {
+          const lines = fs.readFileSync(fp, 'utf-8').split('\n').filter(Boolean)
+          let cwd = null, aiTitle = null, firstUser = null, lastStatus = 'done'
+          let hasActivity = false
+          for (const l of lines) {
+            try {
+              const o = JSON.parse(l)
+              if (!cwd && o.cwd) cwd = o.cwd
+              if (o.type === 'ai-title' && o.aiTitle) aiTitle = o.aiTitle
+              if (o.type === 'user' && !firstUser) {
+                const c = o.message?.content
+                const t = typeof c === 'string' ? c : (Array.isArray(c) ? c.filter(x=>x.type==='text').map(x=>x.text).join('') : '')
+                const clean = t.replace(/^(\s*<[^>]+>[\s\S]*?<\/[^>]+>\s*)+/, '').trim()
+                if (clean) firstUser = clean.slice(0, 60)
+              }
+              if (o.type === 'assistant') hasActivity = true
+              // Most recent result/stop tells us status
+              if (o.type === 'result') lastStatus = 'done'
+            } catch {}
+          }
+          if (!hasActivity) continue   // skip empty/init-only files
+          // Determine if session looks "active" (file modified < 3 min ago and no result event at end)
+          const recentlyWritten = now - st.mtimeMs < 3 * 60 * 1000
+          const lastLine = lines[lines.length - 1] ?? ''
+          let lastType = null
+          try { lastType = JSON.parse(lastLine).type } catch {}
+          const looksActive = recentlyWritten && lastType !== 'result'
+          const status = looksActive ? 'active' : 'done'
+          const displayName = aiTitle ?? firstUser ?? sid.slice(0, 8)
+          // Upsert — don't downgrade active→done for hooks that already set active
+          const cur = sessions.get(sid)
+          if (cur && cur.status === 'active' && status === 'done') continue
+          const s = upsertSession(sid, { displayName, cwd: cwd ?? cur?.cwd, status, startedAt: st.birthtimeMs ?? st.mtimeMs })
+          broadcast({ type: 'session', session: s })
+          schedulePersist()
+          // Auto-watch newly-discovered active sessions
+          if (status === 'active' && !watchedSessions.has(sid)) {
+            const fp2 = findJsonlPath(sid)
+            if (fp2) {
+              const initial   = parseNewLines(fp2, 0)
+              const lineCount = initial?.lineCount ?? 0
+              const watcher   = fs.watchFile(fp2, { interval: 1500 }, () => {
+                const entry = watchedSessions.get(sid)
+                if (!entry) return
+                const result = parseNewLines(fp2, entry.lineCount)
+                if (!result || !result.messages.length) return
+                entry.lineCount = result.lineCount
+                broadcast({ type: 'session_live', sessionId: sid, messages: result.messages })
+              })
+              watchedSessions.set(sid, { watcher, filePath: fp2, lineCount })
+            }
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+}
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 await app.listen({ port: PORT, host: '0.0.0.0' })
@@ -1045,3 +1149,7 @@ console.log(`TheClaudenental server running on http://localhost:${PORT}`)
 for (const [, s] of sessions) {
   if (s.pendingPermission) s.pendingPermission = null
 }
+
+// Start JSONL scanner
+scanJsonlSessions()
+setInterval(scanJsonlSessions, SCAN_INTERVAL_MS)
