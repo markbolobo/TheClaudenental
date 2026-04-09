@@ -1432,9 +1432,9 @@ export default function App() {
     const sessByCwd = !sessById ? sessions.find(s => normPath(s.cwd) === key) : null
     const sess = sessById ?? sessByCwd
 
-    // ADD delta to historyCosts baseline — never replace (engine total starts from 0)
-    // This makes session.costUsd = API baseline + live increments → correct total for display
-    if (sess) {
+    // ADD delta to historyCosts baseline for live subprocess runs only.
+    // session_live events are historical replays already captured in the API baseline — skip them.
+    if (sess && !key.startsWith('session:')) {
       setHistoryCosts(prev => ({ ...prev, [sess.id]: (prev[sess.id] ?? 0) + delta }))
     }
 

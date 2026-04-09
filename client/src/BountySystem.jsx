@@ -260,28 +260,31 @@ export function ContractModal({ sessionName, costData, onClose }) {
         {/* Pie charts */}
         <div className="flex gap-3 px-5 py-4">
           {[
-            { title: 'Usage Type', slices: typeSlices, fmt: v => fmtTok(v) },
-            { title: 'By Model',   slices: modelSlices, fmt: v => fmtCost(v) ?? '$0.0000' },
-          ].map(({ title, slices, fmt }) => (
-            <div key={title} className="flex-1 min-w-0">
-              <div className="text-[8px] text-[var(--text-muted)] uppercase tracking-wider mb-2 text-center">{title}</div>
-              <div className="flex flex-col items-center gap-2">
-                <PieChart slices={slices} size={84} />
-                <div className="w-full space-y-1">
-                  {slices.filter(s => s.value > 0).map(s => (
-                    <div key={s.label} className="flex items-center gap-1.5 text-[9px]">
-                      <span className="w-1.5 h-1.5 rounded-sm shrink-0" style={{ background: s.color }} />
-                      <span className="text-[var(--text-muted)] flex-1 truncate">{s.label}</span>
-                      <span className="tabular-nums text-[var(--gold)]">{fmt(s.value)}</span>
-                    </div>
-                  ))}
-                  {slices.filter(s => s.value > 0).length === 0 && (
-                    <div className="text-[9px] text-[var(--text-muted)] text-center">Accumulating…</div>
-                  )}
+            { title: 'Usage Type', slices: typeSlices,  fmtVal: (v, tot) => tot > 0 ? `${((v / tot) * 100).toFixed(1)}%` : '0%' },
+            { title: 'By Model',   slices: modelSlices, fmtVal: (v, tot) => tot > 0 ? `${((v / tot) * 100).toFixed(1)}%` : '0%' },
+          ].map(({ title, slices, fmtVal }) => {
+            const sliceTotal = slices.filter(s => s.value > 0).reduce((a, s) => a + s.value, 0)
+            return (
+              <div key={title} className="flex-1 min-w-0">
+                <div className="text-[8px] text-[var(--text-muted)] uppercase tracking-wider mb-2 text-center">{title}</div>
+                <div className="flex flex-col items-center gap-2">
+                  <PieChart slices={slices} size={84} />
+                  <div className="w-full space-y-1">
+                    {slices.filter(s => s.value > 0).map(s => (
+                      <div key={s.label} className="flex items-center gap-1.5 text-[9px]">
+                        <span className="w-1.5 h-1.5 rounded-sm shrink-0" style={{ background: s.color }} />
+                        <span className="text-[var(--text-muted)] flex-1 truncate">{s.label}</span>
+                        <span className="tabular-nums text-[var(--gold)]">{fmtVal(s.value, sliceTotal)}</span>
+                      </div>
+                    ))}
+                    {slices.filter(s => s.value > 0).length === 0 && (
+                      <div className="text-[9px] text-[var(--text-muted)] text-center">Accumulating…</div>
+                    )}
+                  </div>
                 </div>
               </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
 
         {/* Token breakdown */}
@@ -403,7 +406,7 @@ function CustomMediaOverlay({ tierCode, cfg, onDone, children }) {
   const fadeClass = `transition-opacity duration-500 ${phase === 'out' ? 'opacity-0 pointer-events-none' : 'opacity-100'}`
 
   if (mediaType === 'image') return (
-    <div className={`fixed inset-0 z-[65] flex items-center justify-center overlay-in ${fadeClass}`}
+    <div className={`fixed inset-0 z-[85] flex items-center justify-center overlay-in ${fadeClass}`}
       style={{ background: '#000' }}>
       <img
         src={`/api/bounty/asset/${tierCode}/media`}
@@ -416,7 +419,7 @@ function CustomMediaOverlay({ tierCode, cfg, onDone, children }) {
   )
 
   if (mediaType === 'video') return (
-    <div className={`fixed inset-0 z-[65] flex items-center justify-center overlay-in ${fadeClass}`}
+    <div className={`fixed inset-0 z-[85] flex items-center justify-center overlay-in ${fadeClass}`}
       style={{ background: '#000' }}>
       <video
         src={`/api/bounty/asset/${tierCode}/media`}
@@ -479,7 +482,7 @@ function DefaultOverlay({ anim, settings, onDone }) {
   const fade = `transition-opacity duration-500 ${phase === 'out' ? 'opacity-0 pointer-events-none' : 'opacity-100'}`
 
   if (tier === 'H' && level === 2) return (
-    <div className={`fixed top-0 left-0 right-0 z-[65] flex items-center justify-center gap-6 px-4 py-3
+    <div className={`fixed top-0 left-0 right-0 z-[85] flex items-center justify-center gap-6 px-4 py-3
       bg-[var(--bg)] border-b border-[var(--gold-border)] banner-drop ${fade}`}>
       <span className="text-[7px] text-[var(--gold)]/50 tracking-[0.3em] uppercase shrink-0">— Bounty Increased —</span>
       <span className="text-xl font-bold text-[var(--gold)] tabular-nums">+{fmtCost(delta)}</span>
@@ -488,7 +491,7 @@ function DefaultOverlay({ anim, settings, onDone }) {
   )
 
   if (tier === 'H' && level === 3) return (
-    <div className={`fixed bottom-0 left-0 right-0 z-[65] h-2/5 flex flex-col items-center justify-center gap-3
+    <div className={`fixed bottom-0 left-0 right-0 z-[85] h-2/5 flex flex-col items-center justify-center gap-3
       border-t border-[var(--gold-border)] overlay-in ${fade}`}
       style={{ background: 'linear-gradient(to top,rgba(0,0,0,0.97),rgba(13,14,19,0.93))' }}>
       <div className="text-[7px] text-[var(--gold)]/50 tracking-[0.3em] uppercase">— Bounty Increased —</div>
@@ -499,7 +502,7 @@ function DefaultOverlay({ anim, settings, onDone }) {
   )
 
   if (tier === 'H' && level === 4) return (
-    <div className={`fixed inset-0 z-[65] flex flex-col items-center justify-center gap-3 overlay-in ${fade}`}
+    <div className={`fixed inset-0 z-[85] flex flex-col items-center justify-center gap-3 overlay-in ${fade}`}
       style={{ background: 'rgba(0,0,0,0.93)' }}>
       <div className="text-[7px] text-[var(--gold)]/50 tracking-[0.35em] uppercase mb-3">— The Continental —</div>
       <div className="text-[11px] text-[var(--gold)]/70 tracking-widest uppercase mb-1">Contract Amended</div>
@@ -508,7 +511,7 @@ function DefaultOverlay({ anim, settings, onDone }) {
   )
 
   if (tier === 'S' && level === 1) return (
-    <div className={`fixed inset-0 z-[65] flex flex-col items-center justify-center gap-4 overlay-in ${fade}`}
+    <div className={`fixed inset-0 z-[85] flex flex-col items-center justify-center gap-4 overlay-in ${fade}`}
       style={{ background: 'rgba(0,0,0,0.95)' }}>
       <div className="text-[7px] text-[var(--gold)]/40 tracking-[0.35em] uppercase">— The High Table —</div>
       <div className="text-[11px] text-[var(--gold)]/80 tracking-[0.2em] uppercase">Marker Registered</div>
@@ -518,7 +521,7 @@ function DefaultOverlay({ anim, settings, onDone }) {
   )
 
   if (tier === 'S' && level === 2) return (
-    <div className={`fixed inset-0 z-[65] flex flex-col items-center justify-center gap-4 overlay-in ${fade}`}
+    <div className={`fixed inset-0 z-[85] flex flex-col items-center justify-center gap-4 overlay-in ${fade}`}
       style={{ background: 'rgba(0,0,0,0.95)' }}>
       <GoldParticles count={40} />
       <div className="relative z-10 flex flex-col items-center gap-4">
@@ -531,7 +534,7 @@ function DefaultOverlay({ anim, settings, onDone }) {
   )
 
   if (tier === 'S' && level === 3) return (
-    <div className={`fixed inset-0 z-[65] flex flex-col items-center justify-center gap-4 overlay-in ${shaking ? 'screen-shake' : ''} ${fade}`}
+    <div className={`fixed inset-0 z-[85] flex flex-col items-center justify-center gap-4 overlay-in ${shaking ? 'screen-shake' : ''} ${fade}`}
       style={{ background: 'rgba(0,0,0,0.96)' }}>
       <GoldParticles count={20} />
       <div className="relative z-10 flex flex-col items-center gap-4">
@@ -544,7 +547,7 @@ function DefaultOverlay({ anim, settings, onDone }) {
   )
 
   if (tier === 'S' && level === 4) return (
-    <div className={`fixed inset-0 z-[65] flex flex-col items-center justify-center gap-4 overlay-in ${fade}`}
+    <div className={`fixed inset-0 z-[85] flex flex-col items-center justify-center gap-4 overlay-in ${fade}`}
       style={{ background: 'rgba(0,0,0,0.97)' }}>
       <GoldParticles count={60} />
       <div className="relative z-10 flex flex-col items-center gap-4 text-center px-4">
@@ -561,7 +564,7 @@ function DefaultOverlay({ anim, settings, onDone }) {
   )
 
   if (tier === 'C') return (
-    <div className={`fixed inset-0 z-[65] flex items-center justify-center overlay-in ${fade}`}
+    <div className={`fixed inset-0 z-[85] flex items-center justify-center overlay-in ${fade}`}
       style={{ background: 'rgba(0,0,0,0.95)' }}>
       <div className="flex flex-col items-center gap-3 text-center px-6 max-w-xs w-full">
         <div className="text-[7px] text-[var(--gold)]/40 tracking-[0.35em] uppercase">— The Continental —</div>
@@ -619,7 +622,7 @@ export function BountyToast({ anim, settings, onDone }) {
   const effectiveDur = hasCustomMedia ? imgDur * 1000 : dur
 
   return (
-    <div className={`fixed top-4 right-4 z-[60] flex items-center gap-3 px-4 py-3
+    <div className={`fixed top-4 right-4 z-[85] flex items-center gap-3 px-4 py-3
       bg-[var(--surface)] border border-[var(--gold-border)] rounded-sm
       shadow-[0_4px_24px_rgba(201,162,39,0.25)] pointer-events-none
       transition-[transform,opacity] duration-500 overflow-hidden
