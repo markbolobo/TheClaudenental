@@ -730,7 +730,7 @@ function CheckpointsPanel({ selected }) {
 
 function normPath(p) { return (p ?? '').replace(/\\/g, '/').toLowerCase().replace(/\/$/, '') }
 
-function ChatPanel({ streamEvents, chatInit }) {
+function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
   const [projectPath, setProjectPath] = useState('C:/Project/RomanPrototype')
   const [input, setInput] = useState('')
   const [running, setRunning] = useState(false)
@@ -914,10 +914,20 @@ function ChatPanel({ streamEvents, chatInit }) {
         {running && (
           <div className="text-[10px] text-[var(--text-muted)] animate-pulse">Claude 思考中…</div>
         )}
+
+        {/* Hook event log — inline at bottom of chat */}
+        {(logs ?? []).filter(l => !l.sessionId || l.sessionId === selectedId).map((log, i) => (
+          <div key={`log-${i}`} className={`text-[10px] font-mono leading-5 ${
+            log.level === 'user'       ? 'text-[var(--gold)]/70' :
+            log.level === 'permission' ? 'text-amber-400/80' :
+            'text-[var(--text-muted)]/60'
+          }`}>{log.text ?? JSON.stringify(log)}</div>
+        ))}
+
         <div ref={bottomRef} />
       </div>
 
-      {/* Input area */}
+      {/* Input area — spawns Claude subprocess via /api/claude/run */}
       <div className="shrink-0 border-t border-[var(--border)] p-2 flex gap-2">
         <textarea
           value={input}
@@ -1222,23 +1232,6 @@ export default function App() {
     setChatInit({ sessionId, projectPath })
     setActiveTab('chat')
   }
-  // pendingPermission is now read from selected.pendingPermission (server-side state)
-  const logContainerRef = useRef(null)
-  const isAtBottomRef = useRef(true)
-
-  // Auto-scroll log to bottom unless user scrolled up
-  useEffect(() => {
-    const el = logContainerRef.current
-    if (!el) return
-    if (isAtBottomRef.current) el.scrollTop = el.scrollHeight
-  }, [logs])
-
-  function handleLogScroll() {
-    const el = logContainerRef.current
-    if (!el) return
-    isAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
-  }
-
   // Auto-watch active sessions so session_live events flow into cost engine
   const watchedRef = useRef(new Set())
   function autoWatch(sessionId) {
@@ -1479,7 +1472,7 @@ export default function App() {
           {/* Tab content */}
           <div className="flex-1 overflow-hidden min-h-0 flex flex-col">
             {activeTab === 'chat' && (
-              <ChatPanel streamEvents={streamEvents} chatInit={chatInit} />
+              <ChatPanel streamEvents={streamEvents} chatInit={chatInit} logs={logs} selectedId={selectedId} />
             )}
             {activeTab === 'tasks' && (
               <div className="py-2 px-2 h-full">
@@ -1499,24 +1492,6 @@ export default function App() {
             {/* Mobile-only tabs */}
             {activeTab === 'sessions'  && <MobileSessionsPanel sessions={sessions} selectedId={selectedId} setSelectedId={setSelectedId} setActiveTab={setActiveTab} />}
             {activeTab === 'more'      && <MobileMorePanel selected={selected} send={send} logs={logs} sessions={sessions} />}
-          </div>
-
-          {/* Event log — desktop only */}
-          <div className="hidden md:flex h-28 border-t border-[var(--border)] flex-col bg-[var(--surface)] shrink-0">
-            <div className="px-3 py-1 text-[10px] uppercase tracking-widest text-[var(--text-muted)] border-b border-[var(--border)]">
-              Hook Events
-            </div>
-            <div ref={logContainerRef} onScroll={handleLogScroll}
-              className="flex-1 overflow-y-auto px-3 py-1 font-mono text-[10px]">
-              {logs.length === 0 && <span className="text-[var(--text-muted)]">Waiting for events…</span>}
-              {logs.filter(l => !l.sessionId || l.sessionId === selectedId).map((log, i) => (
-                <div key={i} className={`leading-5 ${
-                  log.level === 'user'       ? 'text-[var(--gold)]' :
-                  log.level === 'permission' ? 'text-amber-400' :
-                  'text-[var(--text-muted)]'
-                }`}>{log.text ?? JSON.stringify(log)}</div>
-              ))}
-            </div>
           </div>
 
           <InputBar onSend={handleSend} className="hidden md:flex" />
