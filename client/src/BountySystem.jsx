@@ -450,15 +450,15 @@ function DefaultOverlay({ anim, settings, onDone }) {
     const T = []
     const t = (fn, ms) => { const id = setTimeout(fn, ms); T.push(id) }
     if (tier === 'H') {
-      const durs = { 2: 2700, 3: 3200, 4: 1400 }
-      const dur  = durs[level] ?? 2500
+      const durs = { 2: 4000, 3: 5000, 4: 3500 }
+      const dur  = durs[level] ?? 4000
       t(() => setPhase('out'), dur - 450)
       t(onDone, dur)
     }
     if (tier === 'S') {
       if (level === 3) t(() => setShaking(true), 350)
       if (level < 4) {
-        const durs = { 1: 3800, 2: 4500, 3: 5200 }
+        const durs = { 1: 5500, 2: 6500, 3: 7500 }
         t(() => setPhase('out'), durs[level] - 500)
         t(onDone, durs[level])
       }
@@ -470,8 +470,8 @@ function DefaultOverlay({ anim, settings, onDone }) {
       t(() => setRevealN(4), 1500)
       t(() => setStamp(true), 2300)
       const big = total >= 0.5
-      if (!big) { t(() => setPhase('out'), 3200); t(onDone, 3700) }
-      else       { t(() => setRevealN(5), 2800); t(() => setPhase('out'), 6000); t(onDone, 6500) }
+      if (!big) { t(() => setPhase('out'), 5000); t(onDone, 5500) }
+      else       { t(() => setRevealN(5), 2800); t(() => setPhase('out'), 8500); t(onDone, 9000) }
     }
     return () => T.forEach(clearTimeout)
   }, [])
@@ -602,7 +602,7 @@ export function BountyToast({ anim, settings, onDone }) {
   const [exiting, setExiting] = useState(false)
   const tk  = tierKey(anim.tier, anim.level)
   const cfg = settings[tk]
-  const dur = anim.level === 4 ? 2800 : 2200
+  const dur = anim.level === 4 ? 4500 : 3500
 
   useAudio(tk, settings, exiting ? 'out' : 'in')
 

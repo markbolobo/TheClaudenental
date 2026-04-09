@@ -1601,7 +1601,14 @@ export default function App() {
         />
       )}
       {showBountySettings && (
-        <BountySettings onClose={() => setShowBountySettings(false)} />
+        <BountySettings
+          onClose={() => setShowBountySettings(false)}
+          onPreview={tierStr => {
+            const t = tierStr === 'C' ? 'C' : tierStr[0]
+            const l = tierStr === 'C' ? null : parseInt(tierStr[1])
+            setAnimQueue(q => [...q, { tier: t, level: l, delta: 0.18, total: 2.34, sessionName: 'Preview' }])
+          }}
+        />
       )}
 
       {/* ── Top bar — desktop only ── */}

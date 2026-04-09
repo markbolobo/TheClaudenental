@@ -322,42 +322,52 @@ function TierEditor({ tier, settings, onSave, onBack }) {
 
 // ─── TierCard ─────────────────────────────────────────────────────────────────
 
-function TierCard({ tier, settings, hasMedia, hasAudio, onClick }) {
+function TierCard({ tier, settings, hasMedia, hasAudio, onClick, onPreview }) {
   const meta = TIER_META[tier]
   const cfg  = settings[tier] ?? {}
   const typeLabel = cfg.mediaType === 'video' ? '▶' : cfg.mediaType === 'image' ? '◼' : '✦'
 
   return (
-    <button onClick={onClick}
-      className="flex flex-col gap-1.5 p-2.5 rounded border border-[var(--border)] hover:border-[var(--gold-border)]
-        bg-[var(--surface-2)] hover:bg-[var(--surface)] transition-all text-left group"
-      style={{ boxShadow: hasMedia || hasAudio ? `0 0 0 1px ${meta.color}22` : undefined }}>
-      {/* Preview thumbnail or default glyph */}
-      <div className="w-full h-10 rounded overflow-hidden flex items-center justify-center bg-[var(--bg)] relative">
-        {hasMedia
-          ? (cfg.mediaType === 'video'
-              ? <video src={`/api/bounty/asset/${tier}/media`} muted loop
-                  className="absolute inset-0 w-full h-full object-cover" />
-              : <img src={`/api/bounty/asset/${tier}/media`} alt=""
-                  className="absolute inset-0 w-full h-full object-cover" />
-            )
-          : <span className="text-lg" style={{ color: meta.color }}>{typeLabel}</span>
-        }
-      </div>
-      <div className="text-[8px] font-semibold uppercase tracking-wider leading-none"
-        style={{ color: meta.color }}>{meta.label}</div>
-      <div className="text-[7px] text-[var(--text-muted)] leading-none truncate">{meta.desc}</div>
-      <div className="flex gap-1 mt-0.5">
-        {hasMedia && <span className="text-[6px] px-1 rounded bg-[var(--border)] text-[var(--text-muted)] uppercase">{cfg.mediaType}</span>}
-        {hasAudio && <span className="text-[6px] px-1 rounded bg-[var(--border)] text-[var(--text-muted)] uppercase">♪</span>}
-      </div>
-    </button>
+    <div className="flex flex-col gap-1 relative">
+      <button onClick={onClick}
+        className="flex flex-col gap-1.5 p-2.5 rounded border border-[var(--border)] hover:border-[var(--gold-border)]
+          bg-[var(--surface-2)] hover:bg-[var(--surface)] transition-all text-left group"
+        style={{ boxShadow: hasMedia || hasAudio ? `0 0 0 1px ${meta.color}22` : undefined }}>
+        {/* Preview thumbnail or default glyph */}
+        <div className="w-full h-10 rounded overflow-hidden flex items-center justify-center bg-[var(--bg)] relative">
+          {hasMedia
+            ? (cfg.mediaType === 'video'
+                ? <video src={`/api/bounty/asset/${tier}/media`} muted loop
+                    className="absolute inset-0 w-full h-full object-cover" />
+                : <img src={`/api/bounty/asset/${tier}/media`} alt=""
+                    className="absolute inset-0 w-full h-full object-cover" />
+              )
+            : <span className="text-lg" style={{ color: meta.color }}>{typeLabel}</span>
+          }
+        </div>
+        <div className="text-[8px] font-semibold uppercase tracking-wider leading-none"
+          style={{ color: meta.color }}>{meta.label}</div>
+        <div className="text-[7px] text-[var(--text-muted)] leading-none truncate">{meta.desc}</div>
+        <div className="flex gap-1 mt-0.5">
+          {hasMedia && <span className="text-[6px] px-1 rounded bg-[var(--border)] text-[var(--text-muted)] uppercase">{cfg.mediaType}</span>}
+          {hasAudio && <span className="text-[6px] px-1 rounded bg-[var(--border)] text-[var(--text-muted)] uppercase">♪</span>}
+        </div>
+      </button>
+      {/* Preview button */}
+      <button
+        onClick={e => { e.stopPropagation(); onPreview?.(tier) }}
+        title="預覽演出"
+        className="w-full py-0.5 rounded border border-[var(--border)] hover:border-[var(--gold-border)]
+          text-[7px] uppercase tracking-wider text-[var(--text-muted)] hover:text-[var(--gold)]
+          bg-[var(--surface-2)] hover:bg-[var(--surface)] transition-colors"
+      >▶ 預覽</button>
+    </div>
   )
 }
 
 // ─── BountySettings Modal ─────────────────────────────────────────────────────
 
-export default function BountySettings({ onClose }) {
+export default function BountySettings({ onClose, onPreview }) {
   const [settings, setSettings]   = useState({})
   const [assetMap, setAssetMap]   = useState({}) // { [tier]: { hasMedia, mediaIsVideo, hasAudio } }
   const [editTier, setEditTier]   = useState(null)
@@ -434,7 +444,8 @@ export default function BountySettings({ onClose }) {
                       <TierCard key={t} tier={t} settings={settings}
                         hasMedia={assetMap[t]?.hasMedia ?? false}
                         hasAudio={assetMap[t]?.hasAudio ?? false}
-                        onClick={() => setEditTier(t)} />
+                        onClick={() => setEditTier(t)}
+                        onPreview={onPreview} />
                     ))}
                   </div>
                 </div>
