@@ -43,34 +43,94 @@ function StatusDot({ status }) {
   return <span className={`text-xs ${cls}`}>{STATUS_ICON[status] ?? '?'}</span>
 }
 
-function SessionItem({ session, isSelected, onClick, onDoubleClick, liveCost, onCostClick, autoResumeArmed }) {
+function SessionItem({ session, isSelected, onClick, onDoubleClick, liveCost, onCostClick, autoResumeArmed, onToggleAutoResume }) {
   const base = 'flex items-center gap-2 px-3 py-2 rounded cursor-pointer transition-all'
-  const selected = isSelected
+  const selectedCls = isSelected
     ? 'bg-[var(--surface-2)] session-active-glow'
     : 'hover:bg-[var(--surface-2)]'
-  const displayCost = liveCost ?? session.costUsd ?? null
+
+  // ── Cost delta animation ─────────────────────────────────────────────────
+  const rawCost = liveCost ?? session.costUsd ?? null
+  const [displayedCost, setDisplayedCost] = useState(rawCost)
+  const [deltaAmt, setDeltaAmt]           = useState(null)   // number | null
+  const [deltaPhase, setDeltaPhase]       = useState('idle') // 'idle'|'show'|'fade'
+  const prevRawRef = useRef(rawCost)
+  const t1Ref = useRef(null)
+  const t2Ref = useRef(null)
+
+  useEffect(() => {
+    if (rawCost == null) { setDisplayedCost(null); prevRawRef.current = null; return }
+    const prev = prevRawRef.current
+    prevRawRef.current = rawCost
+
+    if (prev == null || rawCost - prev <= 0.000001) {
+      setDisplayedCost(rawCost)
+      return
+    }
+
+    const d = rawCost - prev
+    // Phase 2: keep showing OLD cost + "+delta" for 0.2 s
+    setDeltaAmt(d)
+    setDeltaPhase('show')
+
+    clearTimeout(t1Ref.current)
+    clearTimeout(t2Ref.current)
+
+    t1Ref.current = setTimeout(() => {
+      // Phase 3: switch to new total, delta fades out
+      setDisplayedCost(rawCost)
+      setDeltaPhase('fade')
+      t2Ref.current = setTimeout(() => { setDeltaAmt(null); setDeltaPhase('idle') }, 550)
+    }, 200)
+
+    return () => { clearTimeout(t1Ref.current); clearTimeout(t2Ref.current) }
+  }, [rawCost])
+
   return (
-    <div className={`${base} ${selected}`} onClick={onClick} onDoubleClick={onDoubleClick}>
+    <div className={`${base} ${selectedCls}`} onClick={onClick} onDoubleClick={onDoubleClick}>
       <StatusDot status={session.status} />
       <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-1 truncate">
-          <span className="truncate text-[var(--text-h)] text-xs leading-tight">
-            {session.displayName}
-          </span>
-          {autoResumeArmed && (
-            <span className="shrink-0 text-[9px] text-amber-400 pulse-amber" title="自動繼續已設定">⏰</span>
-          )}
+        <div className="truncate text-[var(--text-h)] text-xs leading-tight">
+          {session.displayName}
         </div>
         <div className="flex items-center gap-1.5 text-[10px] text-[var(--text-muted)]">
           <span>{elapsed(session.startedAt)} ago</span>
-          {displayCost != null && (
-            <button
-              onClick={e => { e.stopPropagation(); onCostClick?.() }}
-              className="ml-auto shrink-0 tabular-nums text-[var(--gold)]/80 hover:text-[var(--gold)] transition-colors
-                border-b border-[var(--gold)]/20 hover:border-[var(--gold)]/60 leading-tight text-[9px]">
-              {fmtCost(displayCost)}
-            </button>
-          )}
+
+          <div className="ml-auto flex items-center gap-1 shrink-0">
+            {/* Auto-resume toggle — only visible when sleeping */}
+            {session.status === 'sleeping' && (
+              <button
+                onClick={e => { e.stopPropagation(); onToggleAutoResume?.() }}
+                title={autoResumeArmed ? '自動繼續 ON — 點擊取消' : '設定整點自動繼續'}
+                className={`text-[9px] px-1 leading-none rounded border transition-colors ${
+                  autoResumeArmed
+                    ? 'border-amber-500/80 text-amber-400 pulse-amber'
+                    : 'border-gray-600/40 text-gray-600 hover:border-gray-500 hover:text-gray-400'
+                }`}
+              >⏰</button>
+            )}
+
+            {/* Cost badge + delta overlay */}
+            {displayedCost != null && (
+              <div className="relative">
+                <button
+                  onClick={e => { e.stopPropagation(); onCostClick?.() }}
+                  className="tabular-nums text-[var(--gold)]/80 hover:text-[var(--gold)] transition-colors
+                    border-b border-[var(--gold)]/20 hover:border-[var(--gold)]/60 leading-tight text-[9px]">
+                  {fmtCost(displayedCost)}
+                </button>
+                {deltaAmt != null && (
+                  <span
+                    className={`absolute left-full pl-1 top-0 tabular-nums text-green-400 text-[9px] whitespace-nowrap pointer-events-none transition-opacity duration-500 ${
+                      deltaPhase === 'fade' ? 'opacity-0' : 'opacity-100'
+                    }`}
+                  >
+                    +{fmtCost(deltaAmt)}
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>
@@ -171,91 +231,12 @@ function TaskNode({ task, depth = 0, onGateAction }) {
 
 const SESSION_LIMIT_MS = 5 * 60 * 60 * 1000 // 5 hours
 
-// ─── AutoResumePanel ──────────────────────────────────────────────────────────
-
-function AutoResumePanel({ session, autoResume, onSetAutoResume, onCancelAutoResume }) {
-  const [msg, setMsg] = useState(autoResume?.message ?? '請繼續')
-  const [armed, setArmed] = useState(autoResume?.enabled ?? false)
-  const [remaining, setRemaining] = useState(null)
-  const [fired, setFired] = useState(false)
-
-  // Sync msg/armed from external changes (prop changes or global timer fires)
-  useEffect(() => {
-    setMsg(autoResume?.message ?? '請繼續')
-    setArmed(autoResume?.enabled ?? false)
-    setFired(autoResume?.fired ?? false)
-  }, [session.id, autoResume?.enabled, autoResume?.fired])
-
-  // Countdown from sleepingAt
-  useEffect(() => {
-    if (!session.sleepingAt) { setRemaining(null); return }
-    function tick() {
-      const left = Math.max(0, SESSION_LIMIT_MS - (Date.now() - session.sleepingAt))
-      setRemaining(left)
-    }
-    tick()
-    const id = setInterval(tick, 1000)
-    return () => clearInterval(id)
-  }, [session.sleepingAt])
-
-  const fireAt = session.sleepingAt ? session.sleepingAt + SESSION_LIMIT_MS : null
-  const isReady = remaining === 0
-
-  function handleArm() {
-    const newArmed = !armed
-    setArmed(newArmed)
-    if (newArmed) {
-      onSetAutoResume({ enabled: true, message: msg, fireAt })
-    } else {
-      onCancelAutoResume()
-    }
-  }
-
-  function handleMsgChange(e) {
-    setMsg(e.target.value)
-    if (armed) onSetAutoResume({ enabled: true, message: e.target.value, fireAt })
-  }
-
-  if (fired) return (
-    <div className="mt-2 text-[10px] text-green-400">✓ 已自動送出：{autoResume?.message}</div>
-  )
-
-  return (
-    <div className="mt-2 border-t border-gray-700/50 pt-2">
-      <div className="flex items-center gap-1.5 mb-1.5">
-        <button
-          onClick={handleArm}
-          className={`text-[9px] px-2 py-0.5 rounded border transition-colors ${
-            armed
-              ? 'bg-amber-900/40 border-amber-600 text-amber-300 hover:bg-amber-800/50'
-              : 'bg-gray-800/60 border-gray-600 text-gray-400 hover:border-gray-500 hover:text-gray-300'
-          }`}
-        >
-          {armed ? '⏰ 自動繼續 ON' : '⏰ 自動繼續'}
-        </button>
-        {armed && isReady && (
-          <span className="text-[9px] text-green-400 pulse-amber">● 就緒</span>
-        )}
-      </div>
-      {armed && (
-        <input
-          value={msg}
-          onChange={handleMsgChange}
-          placeholder="訊息內容..."
-          className="w-full bg-[var(--surface)] border border-[var(--border)] focus:border-amber-600/60 rounded px-2 py-1 text-[10px] text-[var(--text)] focus:outline-none mb-1"
-        />
-      )}
-      {armed && !isReady && remaining !== null && (
-        <div className="text-[9px] text-[var(--text-muted)]">
-          冷卻結束後自動送出 · 剩{' '}
-          {`${Math.floor(remaining/3600000)}h ${String(Math.floor((remaining%3600000)/60000)).padStart(2,'0')}m ${String(Math.floor((remaining%60000)/1000)).padStart(2,'0')}s`}
-        </div>
-      )}
-      {armed && isReady && (
-        <div className="text-[9px] text-amber-300 pulse-amber">即將自動送出…</div>
-      )}
-    </div>
-  )
+// 冷卻到期後，下一個整點 :00:01 (瀏覽器本地時區)
+function nextWholeHourAfter(ms) {
+  const d = new Date(ms)
+  d.setMinutes(0, 1, 0)
+  if (d.getTime() <= ms) d.setHours(d.getHours() + 1)
+  return d.getTime()
 }
 
 function CooldownTimer({ sleepingAt }) {
@@ -1174,14 +1155,20 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessions])
 
-  function setAutoResume(sessionId, config) {
-    setAutoResumeMap(prev => ({ ...prev, [sessionId]: config }))
-  }
-  function cancelAutoResume(sessionId) {
+  function toggleAutoResume(sessionId) {
     setAutoResumeMap(prev => {
-      const next = { ...prev }
-      delete next[sessionId]
-      return next
+      const cur = prev[sessionId]
+      if (cur?.enabled) {
+        // Disarm
+        const next = { ...prev }
+        delete next[sessionId]
+        return next
+      }
+      // Arm: compute 整點 fire time
+      const sess = sessions.find(s => s.id === sessionId)
+      const cooldownExpiry = (sess?.sleepingAt ?? Date.now()) + SESSION_LIMIT_MS
+      const fireAt = nextWholeHourAfter(cooldownExpiry)
+      return { ...prev, [sessionId]: { enabled: true, message: '請繼續', fireAt } }
     })
   }
 
@@ -1453,6 +1440,7 @@ export default function App() {
                       }
                     }}
                     autoResumeArmed={autoResumeMap[s.id]?.enabled === true}
+                    onToggleAutoResume={() => toggleAutoResume(s.id)}
                   />
                 )
             ))}
@@ -1579,16 +1567,13 @@ export default function App() {
           {/* Sleeping notification */}
           {selected?.status === 'sleeping' && (
             <div className="mx-2 mb-2 border border-gray-600 rounded p-2 bg-gray-900/20">
-              <div className="text-[10px] text-gray-400 shimmer">
-                💤 Token 用量已達上限
+              <div className="flex items-center justify-between">
+                <div className="text-[10px] text-gray-400 shimmer">💤 Token 用量已達上限</div>
+                {autoResumeMap[selected.id]?.enabled && (
+                  <div className="text-[9px] text-amber-400 pulse-amber shrink-0 ml-2">⏰ 整點自動繼續</div>
+                )}
               </div>
               <CooldownTimer sleepingAt={selected.sleepingAt ?? null} />
-              <AutoResumePanel
-                session={selected}
-                autoResume={autoResumeMap[selected.id]}
-                onSetAutoResume={cfg => setAutoResume(selected.id, cfg)}
-                onCancelAutoResume={() => cancelAutoResume(selected.id)}
-              />
             </div>
           )}
 
