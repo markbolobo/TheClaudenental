@@ -643,7 +643,20 @@ function parseNewLines(filePath, fromLine) {
         } else if (obj.type === 'assistant') {
           const c = obj.message?.content
           const text = Array.isArray(c) ? c.filter(x => x.type === 'text').map(x => x.text).join('') : ''
-          if (text.trim()) messages.push({ role: 'assistant', text: text.trim(), ts: obj.timestamp })
+          if (text.trim() || obj.message?.usage) {
+            // Include both display fields (role/text for ChatPanel)
+            // and raw fields (type/message for useCostEngine usage tracking)
+            messages.push({
+              type: 'assistant',
+              role: 'assistant',
+              text: text.trim(),
+              message: {
+                model: obj.message?.model,
+                usage: obj.message?.usage,
+              },
+              ts: obj.timestamp,
+            })
+          }
         }
       } catch {}
     }
