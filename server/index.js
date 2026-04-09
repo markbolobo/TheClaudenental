@@ -131,22 +131,25 @@ function handleClientMessage(msg) {
     if (sx) { sx.pendingPermission = null }
     setStatus(p.sessionId, 'active')
     emitLog(p.sessionId, `[Permission] ${label}`, allow ? 'hook' : 'permission')
-    // Persist to settings.json when "Allow Always"
-    if (isAlwaysAllow && p.toolName) {
-      try {
-        const settingsPath = path.join(CLAUDE_DIR, 'settings.json')
-        const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
-        settings.permissions = settings.permissions ?? {}
-        settings.permissions.allow = settings.permissions.allow ?? []
-        const entry = p.toolName === 'Bash' ? 'Bash(*)' : p.toolName
-        if (!settings.permissions.allow.includes(entry)) {
-          settings.permissions.allow.push(entry)
-          atomicWriteJson(settingsPath, settings)
-          emitLog(p.sessionId, `[Permission] ${entry} 已加入永久白名單`, 'hook')
-        }
-      } catch {}
-    }
+    // Resolve FIRST so Claude Code resumes immediately — settings write happens after
     p.resolve({ hookSpecificOutput: { hookEventName: 'PermissionRequest', permissionDecision: allow ? 'allow' : 'deny' } })
+    // Persist to settings.json when "Allow Always" (done async to avoid race with Claude Code file watcher)
+    if (isAlwaysAllow && p.toolName) {
+      setImmediate(() => {
+        try {
+          const settingsPath = path.join(CLAUDE_DIR, 'settings.json')
+          const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+          settings.permissions = settings.permissions ?? {}
+          settings.permissions.allow = settings.permissions.allow ?? []
+          const entry = p.toolName === 'Bash' ? 'Bash(*)' : p.toolName
+          if (!settings.permissions.allow.includes(entry)) {
+            settings.permissions.allow.push(entry)
+            atomicWriteJson(settingsPath, settings)
+            emitLog(p.sessionId, `[Permission] ${entry} 已加入永久白名單`, 'hook')
+          }
+        } catch {}
+      })
+    }
   }
 }
 
@@ -997,11 +1000,36 @@ function spawnClaude(projectPath, prompt, sessionId = null) {
 }
 
 app.post('/api/claude/run', async (request) => {
-  const { projectPath: rawPath, prompt, sessionId } = request.body
-  if (!prompt) return { ok: false, error: 'missing prompt' }
+  const { projectPath: rawPath, prompt, sessionId, attachments } = request.body
+  if (!prompt && !(attachments?.length)) return { ok: false, error: 'missing prompt' }
   const projectPath = rawPath?.replace(/\//g, path.sep) // normalize to OS path sep
   if (!isSafeCwd(projectPath)) return { ok: false, error: 'invalid projectPath' }
-  const entry = spawnClaude(projectPath, prompt, sessionId ?? null)
+
+  // Save base64 attachments to temp files and append their paths to the prompt
+  const tempFiles = []
+  let fullPrompt = prompt ?? ''
+  if (Array.isArray(attachments) && attachments.length) {
+    for (const att of attachments) {
+      if (!att.dataUrl || !att.name) continue
+      const m = att.dataUrl.match(/^data:([^;]+);base64,(.+)$/)
+      if (!m) continue
+      const ext = path.extname(att.name) || '.bin'
+      const tmpPath = path.join(os.tmpdir(), `claud_att_${crypto.randomBytes(6).toString('hex')}${ext}`)
+      fs.writeFileSync(tmpPath, Buffer.from(m[2], 'base64'))
+      tempFiles.push(tmpPath)
+      fullPrompt += `\n${tmpPath}`
+    }
+  }
+
+  const entry = spawnClaude(projectPath, fullPrompt, sessionId ?? null)
+
+  // Clean up temp files after subprocess closes
+  if (tempFiles.length) {
+    entry.proc.on('close', () => {
+      for (const f of tempFiles) try { fs.unlinkSync(f) } catch {}
+    })
+  }
+
   return { ok: true, projectPath: normalizePath(projectPath), sessionId: entry.sessionId }
 })
 

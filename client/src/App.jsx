@@ -30,6 +30,13 @@ function elapsed(ts) {
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`
 }
 
+function fmtHour(ms) {
+  if (!ms) return ''
+  const d = new Date(ms)
+  const h = d.getHours()
+  return `${h % 12 || 12}${h >= 12 ? 'pm' : 'am'}`
+}
+
 // ─── Sub-components ───────────────────────────────────────────────────────────
 
 function StatusDot({ status }) {
@@ -108,7 +115,7 @@ function ActivityHeat() {
   )
 }
 
-function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick, autoResumeArmed, onToggleAutoResume, hitLimit }) {
+function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick, autoResumeArmed, autoResumeFireAt, onToggleAutoResume, hitLimit, isChatSession, onPermissionResponse }) {
   const base = 'flex items-center gap-2 px-3 py-2 rounded cursor-pointer transition-all'
   const selectedCls = isSelected
     ? 'bg-[var(--surface-2)] session-active-glow'
@@ -191,14 +198,38 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick,
             <button
               onClick={e => { e.stopPropagation(); onToggleAutoResume?.() }}
               title={autoResumeArmed ? '自動繼續 ON — 點擊取消' : '設定整點自動繼續'}
-              className={`text-[9px] px-1 leading-none rounded border transition-colors ${
+              className={`flex items-center gap-0.5 text-[9px] px-1 leading-none rounded border transition-colors ${
                 autoResumeArmed
                   ? 'border-amber-500/80 text-amber-400 pulse-amber'
                   : 'border-gray-600/40 text-gray-600 hover:border-gray-500 hover:text-gray-400'
               }`}
-            >⏰</button>
+            >
+              <span>⏰</span>
+              <span>{autoResumeArmed ? (fmtHour(autoResumeFireAt) || '已設定') : '預約'}</span>
+            </button>
           )}
         </div>
+        {/* Row 4: pending permission (non-chat sessions) */}
+        {session.pendingPermission && !isChatSession && (
+          <div className="mt-1 rounded border border-amber-600/40 bg-amber-900/10 px-1.5 py-1">
+            <div className="text-[8px] text-amber-400 font-semibold tracking-wide mb-0.5">⚠ 需要授權</div>
+            <div className="text-[9px] text-[var(--text)] font-mono truncate mb-1">{session.pendingPermission.toolName}</div>
+            <div className="flex gap-1">
+              <button
+                onClick={e => { e.stopPropagation(); onPermissionResponse?.(session.pendingPermission.permissionId, 'approve') }}
+                className="flex-1 py-0.5 rounded bg-green-900/40 border border-green-700 text-green-300 text-[8px]"
+              >✓</button>
+              <button
+                onClick={e => { e.stopPropagation(); onPermissionResponse?.(session.pendingPermission.permissionId, 'allow_always') }}
+                className="flex-1 py-0.5 rounded bg-yellow-900/40 border border-yellow-600 text-yellow-300 text-[8px]"
+              >⭐</button>
+              <button
+                onClick={e => { e.stopPropagation(); onPermissionResponse?.(session.pendingPermission.permissionId, 'block') }}
+                className="flex-1 py-0.5 rounded bg-red-900/40 border border-red-700 text-red-300 text-[8px]"
+              >✕</button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )
@@ -767,6 +798,14 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
   const [messages, setMessages] = useState([])
   const bottomRef = useRef(null)
   const prevChatInitRef = useRef(null)
+  // Live streaming block (rAF-batched to avoid per-token re-renders)
+  const liveBlockRef = useRef(null)  // { type: 'thinking'|'text', text: string } | null
+  const [, setLiveTick] = useState(0)
+  const rafRef = useRef(null)
+  function scheduleLiveUpdate() {
+    if (rafRef.current) return
+    rafRef.current = requestAnimationFrame(() => { rafRef.current = null; setLiveTick(t => t + 1) })
+  }
 
   // Apply chatInit when it changes (from History "Continue in Chat" or session click)
   useEffect(() => {
@@ -807,7 +846,22 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
 
     if (event.type === 'system' && event.subtype === 'init') {
       setSessionId(event.session_id)
+    } else if (event.type === 'content_block_start') {
+      const t = event.content_block?.type
+      if (t === 'thinking') { liveBlockRef.current = { type: 'thinking', text: '' }; scheduleLiveUpdate() }
+      else if (t === 'text') { liveBlockRef.current = { type: 'text', text: '' }; scheduleLiveUpdate() }
+      else liveBlockRef.current = null
+    } else if (event.type === 'content_block_delta') {
+      const d = event.delta
+      if (liveBlockRef.current && (d?.type === 'thinking_delta' || d?.type === 'text_delta')) {
+        liveBlockRef.current = { ...liveBlockRef.current, text: liveBlockRef.current.text + (d.thinking ?? d.text ?? '') }
+        scheduleLiveUpdate()
+      }
+    } else if (event.type === 'content_block_stop') {
+      liveBlockRef.current = null
+      scheduleLiveUpdate()
     } else if (event.type === 'assistant') {
+      liveBlockRef.current = null
       const blocks = event.message?.content ?? []
       const newMsgs = []
       for (const b of blocks) {
@@ -863,21 +917,18 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
       return
     }
 
-    let prompt = text
-    // Append attachment references to prompt
-    if (attachments.length > 0) {
-      const refs = attachments.map(a => `[Attached: ${a.name}]`).join('\n')
-      prompt = prompt ? `${prompt}\n${refs}` : refs
-    }
+    const prompt = text || (attachments.length ? '請查看附件' : '')
 
     setInput('')
+    const sentAttachments = attachments
     setAttachments([])
     setRunning(true)
-    setMessages(m => [...m, { role: 'user', text: prompt, ts: Date.now() }])
+    const displayText = prompt + (sentAttachments.length ? `\n${sentAttachments.map(a => `[${a.name}]`).join(' ')}` : '')
+    setMessages(m => [...m, { role: 'user', text: displayText, attachments: sentAttachments, ts: Date.now() }])
     await fetch('/api/claude/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ projectPath, prompt, sessionId }),
+      body: JSON.stringify({ projectPath, prompt, sessionId, attachments: sentAttachments }),
     })
   }
 
@@ -961,6 +1012,10 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
               <div className="text-[var(--gold)]">
                 <span className="opacity-50 mr-1">›</span>
                 <span style={{ whiteSpace: 'pre-wrap' }}>{m.text}</span>
+                {m.attachments?.filter(a => a.type?.startsWith('image/')).map((a, ai) => (
+                  <img key={ai} src={a.dataUrl} alt={a.name}
+                    className="mt-1 max-h-32 max-w-full rounded border border-[var(--border)] block" />
+                ))}
               </div>
             )}
             {/* Assistant text */}
@@ -997,7 +1052,24 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
             )}
           </div>
         ))}
-        {running && (
+        {/* Live streaming block */}
+        {liveBlockRef.current && (
+          <div className={`text-[11px] leading-relaxed ${liveBlockRef.current.type === 'thinking' ? '' : ''}`}>
+            {liveBlockRef.current.type === 'thinking' ? (
+              <details open className="border border-purple-700/40 rounded bg-purple-900/10 px-2 py-1">
+                <summary className="text-[9px] text-purple-400 cursor-pointer select-none uppercase tracking-widest">💭 Thinking…</summary>
+                <div className="mt-1 text-[10px] text-purple-300/70 font-mono" style={{ whiteSpace: 'pre-wrap' }}>
+                  {liveBlockRef.current.text}<span className="animate-pulse">▍</span>
+                </div>
+              </details>
+            ) : (
+              <div className="text-[var(--text)]" style={{ whiteSpace: 'pre-wrap' }}>
+                {liveBlockRef.current.text}<span className="animate-pulse">▍</span>
+              </div>
+            )}
+          </div>
+        )}
+        {running && !liveBlockRef.current && (
           <div className="text-[10px] text-[var(--text-muted)] animate-pulse">Claude 思考中…</div>
         )}
 
@@ -1175,7 +1247,7 @@ function MobileTabBar({ activeTab, setActiveTab }) {
   )
 }
 
-function MobileSessionsPanel({ sessions, selectedId, setSelectedId, setActiveTab, onContinue, autoResumeMap, onToggleAutoResume, hitLimitSessions, historyCosts }) {
+function MobileSessionsPanel({ sessions, selectedId, setSelectedId, setActiveTab, onContinue, autoResumeMap, onToggleAutoResume, hitLimitSessions, historyCosts, onCostClick, onPermissionResponse }) {
   return (
     <div className="flex flex-col h-full">
       <div className="px-3 py-2 text-[10px] uppercase tracking-widest text-[var(--text-muted)] border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
@@ -1194,9 +1266,13 @@ function MobileSessionsPanel({ sessions, selectedId, setSelectedId, setActiveTab
               if (s.cwd) onContinue?.({ sessionId: s.id, projectPath: s.cwd })
             }}
             onDoubleClick={() => {}}
+            onCostClick={() => onCostClick?.(s)}
             autoResumeArmed={autoResumeMap?.[s.id]?.enabled === true}
+            autoResumeFireAt={autoResumeMap?.[s.id]?.fireAt ?? null}
             onToggleAutoResume={() => onToggleAutoResume?.(s.id)}
             hitLimit={hitLimitSessions?.has(s.id) ?? false}
+            isChatSession={s.id === selectedId}
+            onPermissionResponse={onPermissionResponse}
           />
         ))}
         {sessions.length === 0 && <div className="text-[10px] text-[var(--text-muted)] text-center mt-8">No sessions yet</div>}
@@ -1610,8 +1686,11 @@ export default function App() {
                       }
                     }}
                     autoResumeArmed={autoResumeMap[s.id]?.enabled === true}
+                    autoResumeFireAt={autoResumeMap[s.id]?.fireAt ?? null}
                     onToggleAutoResume={() => toggleAutoResume(s.id)}
                     hitLimit={hitLimitSessions.has(s.id)}
+                    isChatSession={s.id === selectedId}
+                    onPermissionResponse={(permId, action) => send({ type: 'permission_response', permissionId: permId, action })}
                   />
                 )
             ))}
@@ -1669,7 +1748,18 @@ export default function App() {
             {activeTab === 'agents'    && <AgentsPanel />}
             {activeTab === 'mcp'       && <McpPanel />}
             {/* Mobile-only tabs */}
-            {activeTab === 'sessions'  && <MobileSessionsPanel sessions={sessions} selectedId={selectedId} setSelectedId={setSelectedId} setActiveTab={setActiveTab} onContinue={handleContinueInChat} autoResumeMap={autoResumeMap} onToggleAutoResume={toggleAutoResume} hitLimitSessions={hitLimitSessions} historyCosts={historyCosts} />}
+            {activeTab === 'sessions'  && <MobileSessionsPanel sessions={sessions} selectedId={selectedId} setSelectedId={setSelectedId} setActiveTab={setActiveTab} onContinue={handleContinueInChat} autoResumeMap={autoResumeMap} onToggleAutoResume={toggleAutoResume} hitLimitSessions={hitLimitSessions} historyCosts={historyCosts}
+              onCostClick={async s => {
+                const live = costSnap[`session:${s.id}`] ?? costSnap[normPath(s.cwd)]
+                if (live) {
+                  setContractModal({ sessionName: s.displayName, costData: live })
+                } else {
+                  const d = await fetch(`/api/history/${s.id}`).then(r => r.json()).catch(() => ({}))
+                  setContractModal({ sessionName: s.displayName, costData: { total: d.costUsd ?? 0, byType: d.byType ?? {}, byModel: d.byModel ?? {} } })
+                }
+              }}
+              onPermissionResponse={(permId, action) => send({ type: 'permission_response', permissionId: permId, action })}
+            />}
             {activeTab === 'more'      && <MobileMorePanel selected={selected} send={send} logs={logs} sessions={sessions} />}
           </div>
 
