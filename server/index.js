@@ -700,25 +700,39 @@ function parseNewLines(filePath, fromLine) {
         const obj = JSON.parse(l)
         if (obj.type === 'user') {
           const c = obj.message?.content
-          const text = typeof c === 'string' ? c : c?.[0]?.text ?? ''
-          const clean = text.replace(/^(\s*<[^>]+>[\s\S]*?<\/[^>]+>\s*)+/, '').trim()
-          if (clean) messages.push({ role: 'user', text: clean, ts: obj.timestamp })
+          if (Array.isArray(c)) {
+            // Tool results — emit each as tool_result
+            for (const b of c) {
+              if (b.type !== 'tool_result') continue
+              const out = Array.isArray(b.content)
+                ? b.content.filter(x => x.type === 'text').map(x => x.text).join('').slice(0, 300)
+                : String(b.content ?? '').slice(0, 300)
+              if (out.trim()) messages.push({ role: 'tool_result', toolId: b.tool_use_id, output: out, ts: obj.timestamp })
+            }
+            // Also push plain user text if any
+            const text = c.filter(x => x.type === 'text').map(x => x.text).join('')
+            const clean = text.replace(/^(\s*<[^>]+>[\s\S]*?<\/[^>]+>\s*)+/, '').trim()
+            if (clean) messages.push({ role: 'user', text: clean, ts: obj.timestamp })
+          } else {
+            const text = typeof c === 'string' ? c : ''
+            const clean = text.replace(/^(\s*<[^>]+>[\s\S]*?<\/[^>]+>\s*)+/, '').trim()
+            if (clean) messages.push({ role: 'user', text: clean, ts: obj.timestamp })
+          }
         } else if (obj.type === 'assistant') {
-          const c = obj.message?.content
-          const text = Array.isArray(c) ? c.filter(x => x.type === 'text').map(x => x.text).join('') : ''
-          if (text.trim() || obj.message?.usage) {
-            // Include both display fields (role/text for ChatPanel)
-            // and raw fields (type/message for useCostEngine usage tracking)
-            messages.push({
-              type: 'assistant',
-              role: 'assistant',
-              text: text.trim(),
-              message: {
-                model: obj.message?.model,
-                usage: obj.message?.usage,
-              },
-              ts: obj.timestamp,
-            })
+          const c = obj.message?.content ?? []
+          const ts = obj.timestamp
+          for (const b of (Array.isArray(c) ? c : [])) {
+            if (b.type === 'thinking' && b.thinking?.trim())
+              messages.push({ role: 'thinking', text: b.thinking.trim(), ts })
+            else if (b.type === 'text' && b.text?.trim())
+              messages.push({ role: 'assistant', text: b.text.trim(), ts })
+            else if (b.type === 'tool_use')
+              messages.push({ role: 'tool_use', toolName: b.name, input: b.input ?? {}, toolId: b.id, ts })
+          }
+          // Include usage for cost tracking (preserve on first assistant msg of this block)
+          if (obj.message?.usage) {
+            const last = messages[messages.length - 1]
+            if (last) last._usage = { model: obj.message.model, usage: obj.message.usage }
           }
         }
       } catch {}

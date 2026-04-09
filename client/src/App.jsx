@@ -850,9 +850,20 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
   useEffect(() => {
     if (!streamEvents.length) return
     const ev = streamEvents[streamEvents.length - 1]
-    // session_live: VS Code live tail messages
+    // session_live: VS Code live tail messages — pair tool_results with their tool_uses
     if (ev.type === 'session_live' && ev.sessionId === sessionId) {
-      setMessages(prev => [...prev, ...ev.messages.map(m => ({ ...m, live: true }))])
+      setMessages(prev => {
+        let next = [...prev]
+        for (const m of ev.messages ?? []) {
+          const msg = { ...m, live: true }
+          if (msg.role === 'tool_result') {
+            const idx = next.map(x => x.toolId).lastIndexOf(msg.toolId)
+            if (idx >= 0) { next = [...next.slice(0, idx + 1), msg, ...next.slice(idx + 1)]; continue }
+          }
+          next = [...next, msg]
+        }
+        return next
+      })
       return
     }
     if (normPath(ev.projectPath) !== normPath(projectPath)) return
@@ -890,15 +901,23 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
     } else if (event.type === 'user') {
       // Tool results
       const blocks = event.message?.content ?? []
-      for (const b of blocks) {
-        if (b.type === 'tool_result') {
+      // Insert each tool_result immediately after its matching tool_use (by tool_use_id)
+      setMessages(prev => {
+        let next = [...prev]
+        for (const b of blocks) {
+          if (b.type !== 'tool_result') continue
           const output = Array.isArray(b.content)
             ? b.content.filter(x => x.type === 'text').map(x => x.text).join('').slice(0, 300)
             : String(b.content ?? '').slice(0, 300)
-          if (output.trim())
-            setMessages(m => [...m, { role: 'tool_result', toolId: b.tool_use_id, output, ts: Date.now() }])
+          if (!output.trim()) continue
+          const resultMsg = { role: 'tool_result', toolId: b.tool_use_id, output, ts: Date.now() }
+          // Find the tool_use with matching id and insert right after it
+          const idx = next.map(m => m.toolId).lastIndexOf(b.tool_use_id)
+          if (idx >= 0) next = [...next.slice(0, idx + 1), resultMsg, ...next.slice(idx + 1)]
+          else next = [...next, resultMsg]
         }
-      }
+        return next
+      })
     } else if (event.type === 'result') {
       setRunning(false)
       const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : ''
@@ -1360,13 +1379,16 @@ function Stage4Anim({ baseline, chatRunning, onDone }) {
   // phase 0→1: chat total 金→綠 (0.8s)
   // phase 1→2: baseline 灰→金 (1.8s)
   // phase 2→3: show merged total (3.0s)
+  // auto-dismiss after 5s
   useEffect(() => {
     const T = [
       setTimeout(() => setPhase(1), 800),
       setTimeout(() => setPhase(2), 1800),
       setTimeout(() => setPhase(3), 3000),
+      setTimeout(() => onDone?.(), 5000),
     ]
     return () => T.forEach(clearTimeout)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
   return (
     <div className="flex flex-col items-center gap-3 text-center px-6">
@@ -1584,7 +1606,10 @@ export default function App() {
       const activeSession = sessions.find(s => s.id === selectedId)
       if (!activeSession?.cwd || normPath(ev.projectPath) !== normPath(activeSession.cwd)) return
       const { event } = ev
-      if (event?.type === 'assistant' && event.message?.usage) {
+      if (event?.type === 'system' && event?.subtype === 'init') {
+        // New run starting — reset stage so Stage 2 can fire again
+        setChatStage(1)
+      } else if (event?.type === 'assistant' && event.message?.usage) {
         const d = computeDeltaCost(event.message?.model ?? '', event.message.usage)
         setChatRunning(r => r + d)
         setChatLastDelta(d)
