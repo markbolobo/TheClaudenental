@@ -43,7 +43,7 @@ function StatusDot({ status }) {
   return <span className={`text-xs ${cls}`}>{STATUS_ICON[status] ?? '?'}</span>
 }
 
-function SessionItem({ session, isSelected, onClick, onDoubleClick, liveCost, onCostClick }) {
+function SessionItem({ session, isSelected, onClick, onDoubleClick, liveCost, onCostClick, autoResumeArmed }) {
   const base = 'flex items-center gap-2 px-3 py-2 rounded cursor-pointer transition-all'
   const selected = isSelected
     ? 'bg-[var(--surface-2)] session-active-glow'
@@ -53,8 +53,13 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick, liveCost, on
     <div className={`${base} ${selected}`} onClick={onClick} onDoubleClick={onDoubleClick}>
       <StatusDot status={session.status} />
       <div className="flex-1 min-w-0">
-        <div className="truncate text-[var(--text-h)] text-xs leading-tight">
-          {session.displayName}
+        <div className="flex items-center gap-1 truncate">
+          <span className="truncate text-[var(--text-h)] text-xs leading-tight">
+            {session.displayName}
+          </span>
+          {autoResumeArmed && (
+            <span className="shrink-0 text-[9px] text-amber-400 pulse-amber" title="自動繼續已設定">⏰</span>
+          )}
         </div>
         <div className="flex items-center gap-1.5 text-[10px] text-[var(--text-muted)]">
           <span>{elapsed(session.startedAt)} ago</span>
@@ -165,6 +170,93 @@ function TaskNode({ task, depth = 0, onGateAction }) {
 }
 
 const SESSION_LIMIT_MS = 5 * 60 * 60 * 1000 // 5 hours
+
+// ─── AutoResumePanel ──────────────────────────────────────────────────────────
+
+function AutoResumePanel({ session, autoResume, onSetAutoResume, onCancelAutoResume }) {
+  const [msg, setMsg] = useState(autoResume?.message ?? '請繼續')
+  const [armed, setArmed] = useState(autoResume?.enabled ?? false)
+  const [remaining, setRemaining] = useState(null)
+  const [fired, setFired] = useState(false)
+
+  // Sync msg/armed from external changes (prop changes or global timer fires)
+  useEffect(() => {
+    setMsg(autoResume?.message ?? '請繼續')
+    setArmed(autoResume?.enabled ?? false)
+    setFired(autoResume?.fired ?? false)
+  }, [session.id, autoResume?.enabled, autoResume?.fired])
+
+  // Countdown from sleepingAt
+  useEffect(() => {
+    if (!session.sleepingAt) { setRemaining(null); return }
+    function tick() {
+      const left = Math.max(0, SESSION_LIMIT_MS - (Date.now() - session.sleepingAt))
+      setRemaining(left)
+    }
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
+  }, [session.sleepingAt])
+
+  const fireAt = session.sleepingAt ? session.sleepingAt + SESSION_LIMIT_MS : null
+  const isReady = remaining === 0
+
+  function handleArm() {
+    const newArmed = !armed
+    setArmed(newArmed)
+    if (newArmed) {
+      onSetAutoResume({ enabled: true, message: msg, fireAt })
+    } else {
+      onCancelAutoResume()
+    }
+  }
+
+  function handleMsgChange(e) {
+    setMsg(e.target.value)
+    if (armed) onSetAutoResume({ enabled: true, message: e.target.value, fireAt })
+  }
+
+  if (fired) return (
+    <div className="mt-2 text-[10px] text-green-400">✓ 已自動送出：{autoResume?.message}</div>
+  )
+
+  return (
+    <div className="mt-2 border-t border-gray-700/50 pt-2">
+      <div className="flex items-center gap-1.5 mb-1.5">
+        <button
+          onClick={handleArm}
+          className={`text-[9px] px-2 py-0.5 rounded border transition-colors ${
+            armed
+              ? 'bg-amber-900/40 border-amber-600 text-amber-300 hover:bg-amber-800/50'
+              : 'bg-gray-800/60 border-gray-600 text-gray-400 hover:border-gray-500 hover:text-gray-300'
+          }`}
+        >
+          {armed ? '⏰ 自動繼續 ON' : '⏰ 自動繼續'}
+        </button>
+        {armed && isReady && (
+          <span className="text-[9px] text-green-400 pulse-amber">● 就緒</span>
+        )}
+      </div>
+      {armed && (
+        <input
+          value={msg}
+          onChange={handleMsgChange}
+          placeholder="訊息內容..."
+          className="w-full bg-[var(--surface)] border border-[var(--border)] focus:border-amber-600/60 rounded px-2 py-1 text-[10px] text-[var(--text)] focus:outline-none mb-1"
+        />
+      )}
+      {armed && !isReady && remaining !== null && (
+        <div className="text-[9px] text-[var(--text-muted)]">
+          冷卻結束後自動送出 · 剩{' '}
+          {`${Math.floor(remaining/3600000)}h ${String(Math.floor((remaining%3600000)/60000)).padStart(2,'0')}m ${String(Math.floor((remaining%60000)/1000)).padStart(2,'0')}s`}
+        </div>
+      )}
+      {armed && isReady && (
+        <div className="text-[9px] text-amber-300 pulse-amber">即將自動送出…</div>
+      )}
+    </div>
+  )
+}
 
 function CooldownTimer({ sleepingAt }) {
   const [remaining, setRemaining] = useState(null)
@@ -1049,6 +1141,50 @@ export default function App() {
     }).catch(() => {})
   }, [])
 
+  // ── Auto-resume per-session state ────────────────────────────────────────
+  // { [sessionId]: { enabled, message, fireAt } }
+  const [autoResumeMap, setAutoResumeMap] = useState({})
+
+  // Global timer: fire any armed resumes when cooldown expires
+  useEffect(() => {
+    const id = setInterval(() => {
+      const now = Date.now()
+      setAutoResumeMap(prev => {
+        let changed = false
+        const next = { ...prev }
+        for (const [sid, ar] of Object.entries(prev)) {
+          if (!ar.enabled || !ar.fireAt) continue
+          if (now < ar.fireAt) continue
+          // Time to fire — find session cwd
+          const sess = sessions.find(s => s.id === sid)
+          if (sess?.cwd && sess.status === 'sleeping') {
+            fetch('/api/claude/run', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ projectPath: sess.cwd, prompt: ar.message || '請繼續', sessionId: sid }),
+            }).catch(() => {})
+          }
+          next[sid] = { ...ar, enabled: false, fired: true }
+          changed = true
+        }
+        return changed ? next : prev
+      })
+    }, 1000)
+    return () => clearInterval(id)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessions])
+
+  function setAutoResume(sessionId, config) {
+    setAutoResumeMap(prev => ({ ...prev, [sessionId]: config }))
+  }
+  function cancelAutoResume(sessionId) {
+    setAutoResumeMap(prev => {
+      const next = { ...prev }
+      delete next[sessionId]
+      return next
+    })
+  }
+
   // Cost engine — receives stream events and fires animation triggers
   const costSnap = useCostEngine(streamEvents, (anim) => {
     const { key, total } = anim
@@ -1316,6 +1452,7 @@ export default function App() {
                         })
                       }
                     }}
+                    autoResumeArmed={autoResumeMap[s.id]?.enabled === true}
                   />
                 )
             ))}
@@ -1446,6 +1583,12 @@ export default function App() {
                 💤 Token 用量已達上限
               </div>
               <CooldownTimer sleepingAt={selected.sleepingAt ?? null} />
+              <AutoResumePanel
+                session={selected}
+                autoResume={autoResumeMap[selected.id]}
+                onSetAutoResume={cfg => setAutoResume(selected.id, cfg)}
+                onCancelAutoResume={() => cancelAutoResume(selected.id)}
+              />
             </div>
           )}
 
