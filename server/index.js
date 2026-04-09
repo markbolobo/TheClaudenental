@@ -10,6 +10,12 @@ import crypto from 'crypto'
 const PORT = 3001
 const CLAUDIA_URL = 'http://localhost:48901'
 
+const PRICING = {
+  'claude-sonnet-4-6':         { input: 3,  output: 15, cacheRead: 0.30, cacheWrite: 3.75 },
+  'claude-opus-4-6':           { input: 5,  output: 25, cacheRead: 0.50, cacheWrite: 6.25 },
+  'claude-haiku-4-5-20251001': { input: 1,  output: 5,  cacheRead: 0.10, cacheWrite: 1.25 },
+}
+
 const app = Fastify({ logger: false })
 await app.register(wsPlugin)
 await app.register(multipart, { limits: { fileSize: 100 * 1024 * 1024 } }) // 100 MB
@@ -487,29 +493,31 @@ app.get('/api/history', async () => {
         let title = null, firstMsg = null, cwd = null, costUsd = null
         try {
           const lines = fs.readFileSync(fullPath, 'utf-8').split('\n').filter(Boolean)
-          let totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0
+          const byModelCost = {}
           for (const l of lines) {
             try {
               const obj = JSON.parse(l)
               if (!cwd && obj.cwd) cwd = obj.cwd
               if (obj.type === 'ai-title' && obj.aiTitle) title = obj.aiTitle
-              // Subprocess sessions: result event has total_cost_usd
               if (obj.type === 'result' && typeof obj.total_cost_usd === 'number') {
                 costUsd = (costUsd ?? 0) + obj.total_cost_usd
               }
-              // VS Code sessions: sum token usage from assistant events
               if (obj.type === 'assistant' && obj.message?.usage) {
-                const u = obj.message.usage
-                totalInput += u.input_tokens ?? 0
-                totalOutput += u.output_tokens ?? 0
-                totalCacheRead += u.cache_read_input_tokens ?? 0
-                totalCacheWrite += u.cache_creation_input_tokens ?? 0
+                const u  = obj.message.usage
+                const mn = obj.message.model ?? 'claude-sonnet-4-6'
+                const p  = PRICING[mn] ?? PRICING['claude-sonnet-4-6']
+                byModelCost[mn] = (byModelCost[mn] ?? 0) + (
+                  (u.input_tokens ?? 0) * p.input +
+                  (u.output_tokens ?? 0) * p.output +
+                  (u.cache_read_input_tokens ?? 0) * p.cacheRead +
+                  (u.cache_creation_input_tokens ?? 0) * p.cacheWrite
+                ) / 1e6
               }
             } catch {}
           }
-          // If no result event found, estimate from token usage (Sonnet 4.6 pricing)
-          if (costUsd === null && (totalInput + totalOutput + totalCacheRead) > 0) {
-            costUsd = (totalInput * 3 + totalOutput * 15 + totalCacheRead * 0.3 + totalCacheWrite * 3.75) / 1e6
+          if (costUsd === null) {
+            const est = Object.values(byModelCost).reduce((s, v) => s + v, 0)
+            if (est > 0) costUsd = est
           }
           for (const l of lines) {
             try {
@@ -546,11 +554,6 @@ app.get('/api/history/:sessionId', async (request) => {
   let costUsd = null
   const byType   = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
   const byModel  = {}   // { [model]: { input, output, cacheRead, cacheWrite, cost } }
-  const PRICING  = {
-    'claude-sonnet-4-6':         { input: 3,  output: 15, cacheRead: 0.30, cacheWrite: 3.75 },
-    'claude-opus-4-6':           { input: 5,  output: 25, cacheRead: 0.50, cacheWrite: 6.25 },
-    'claude-haiku-4-5-20251001': { input: 1,  output: 5,  cacheRead: 0.10, cacheWrite: 1.25 },
-  }
   const DEFAULT_P = PRICING['claude-sonnet-4-6']
   try {
     const lines = fs.readFileSync(filePath, 'utf-8').split('\n').filter(Boolean)
