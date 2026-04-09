@@ -1110,9 +1110,11 @@ function scanJsonlSessions() {
           const looksActive = recentlyWritten && lastType !== 'result'
           const status = looksActive ? 'active' : 'done'
           const displayName = aiTitle ?? firstUser ?? sid.slice(0, 8)
-          // Upsert — don't downgrade active→done for hooks that already set active
+          // Upsert — only protect active→done downgrade when file is very recent
+          // (race: hook fired but Claude hasn't written output yet).
+          // recentlyWritten = < 3 min; if older, allow downgrade.
           const cur = sessions.get(sid)
-          if (cur && cur.status === 'active' && status === 'done') continue
+          if (cur && cur.status === 'active' && status === 'done' && recentlyWritten) continue
           const s = upsertSession(sid, { displayName, cwd: cwd ?? cur?.cwd, status, startedAt: st.birthtimeMs ?? st.mtimeMs })
           broadcast({ type: 'session', session: s })
           schedulePersist()
@@ -1137,6 +1139,26 @@ function scanJsonlSessions() {
       }
     }
   } catch {}
+
+  // ── Expire stale active sessions ─────────────────────────────────────────
+  // Sessions outside the scan window (> 30 min old file) can never be picked
+  // up by the file loop above. Check them separately: if the JSONL hasn't been
+  // modified in > 15 min and the session is still marked active, downgrade it.
+  const STALE_MS = 15 * 60 * 1000
+  for (const [sid, s] of sessions) {
+    if (s.status !== 'active' && s.status !== 'sleeping') continue
+    const fp = findJsonlPath(sid)
+    if (!fp) continue
+    try {
+      const mt = fs.statSync(fp).mtimeMs
+      if (now - mt > STALE_MS) {
+        s.status = 'done'
+        sessions.set(sid, s)
+        broadcast({ type: 'session', session: s })
+        schedulePersist()
+      }
+    } catch {}
+  }
 }
 
 // ─── Start ────────────────────────────────────────────────────────────────────
