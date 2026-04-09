@@ -460,11 +460,9 @@ function DefaultOverlay({ anim, settings, onDone }) {
     }
     if (tier === 'S') {
       if (level === 3) t(() => setShaking(true), 350)
-      if (level < 4) {
-        const durs = { 1: 5500, 2: 6500, 3: 7500 }
-        t(() => setPhase('out'), durs[level] - 500)
-        t(onDone, durs[level])
-      }
+      const durs = { 1: 5500, 2: 6500, 3: 7500, 4: 10000 }
+      t(() => setPhase('out'), durs[level] - 500)
+      t(onDone, durs[level])
     }
     if (tier === 'C') {
       t(() => setRevealN(1), 250)
@@ -480,6 +478,16 @@ function DefaultOverlay({ anim, settings, onDone }) {
   }, [])
 
   const fade = `transition-opacity duration-500 ${phase === 'out' ? 'opacity-0 pointer-events-none' : 'opacity-100'}`
+
+  if (tier === 'H' && level === 1) return (
+    <div className={`fixed top-4 right-4 z-[85] flex items-center gap-2 px-3 py-1.5
+      bg-[var(--surface)] border border-[var(--gold-border)]/50 rounded-sm
+      shadow-[0_2px_12px_rgba(201,162,39,0.15)] pointer-events-none
+      transition-opacity duration-500 ${fade}`}>
+      <span className="text-[7px] text-[var(--text-muted)] tracking-[0.2em] uppercase">Contract ▲</span>
+      <span className="text-sm font-semibold text-[var(--gold)] tabular-nums">+{fmtCost(delta)}</span>
+    </div>
+  )
 
   if (tier === 'H' && level === 2) return (
     <div className={`fixed top-0 left-0 right-0 z-[85] flex items-center justify-center gap-6 px-4 py-3

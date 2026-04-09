@@ -115,7 +115,7 @@ function ActivityHeat() {
   )
 }
 
-function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick, autoResumeArmed, autoResumeFireAt, onToggleAutoResume, hitLimit, isChatSession, onPermissionResponse }) {
+function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick, autoResumeArmed, autoResumeFireAt, onToggleAutoResume, hitLimit, isChatSession, chatStage = 1, chatRunning = 0, chatLastDelta = null, chatBaseline = 0, onPermissionResponse }) {
   const base = 'flex items-center gap-2 px-3 py-2 rounded cursor-pointer transition-all'
   const selectedCls = isSelected
     ? 'bg-[var(--surface-2)] session-active-glow'
@@ -172,8 +172,22 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick,
         </div>
         {/* Row 3: cost + auto-resume toggle */}
         <div className="flex items-center gap-1 mt-0.5">
-          {/* Cost badge + delta overlay */}
-          {displayedCost != null && (
+          {/* Cost display — 5-stage for active chat, simple badge otherwise */}
+          {isChatSession && (chatStage === 2 || chatStage === 3) ? (
+            // Stage 2: baseline(gray) | running(gold) | +delta(green)
+            // Stage 3: baseline(gray) | running(gold)
+            <button onClick={e => { e.stopPropagation(); onCostClick?.() }}
+              className="flex items-center gap-1 tabular-nums text-[9px] font-mono">
+              <span className={`transition-colors duration-700 ${chatStage === 2 ? 'text-gray-600' : 'text-gray-500'}`}>
+                {fmtCost(chatBaseline)}
+              </span>
+              <span className="text-[var(--gold)]">{fmtCost(chatRunning)}</span>
+              {chatStage === 2 && chatLastDelta != null && (
+                <span className="text-green-400">+{fmtCost(chatLastDelta)}</span>
+              )}
+            </button>
+          ) : displayedCost != null ? (
+            // Stage 1 / 4 / 5 (or non-chat session): single total badge
             <div className="relative">
               <button
                 onClick={e => { e.stopPropagation(); onCostClick?.() }}
@@ -191,7 +205,7 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick,
                 </span>
               )}
             </div>
-          )}
+          ) : null}
 
           {/* Auto-resume toggle — visible when sleeping OR when usage limit hit */}
           {(session.status === 'sleeping' || hitLimit) && (
@@ -786,47 +800,7 @@ function CheckpointsPanel({ selected }) {
 
 function normPath(p) { return (p ?? '').replace(/\\/g, '/').toLowerCase().replace(/\/$/, '') }
 
-function Stage4Anim({ baseline, chatRunning, onDone }) {
-  const newTotal = baseline + chatRunning
-  const [phase, setPhase] = useState(0)
-  // phase 0 → 1: chat total turns green (0.8s)
-  // phase 1 → 2: baseline turns white (1.5s)
-  // phase 2 → 3: show merged total (2.8s)
-  useEffect(() => {
-    const T = [
-      setTimeout(() => setPhase(1), 800),
-      setTimeout(() => setPhase(2), 1800),
-      setTimeout(() => setPhase(3), 3000),
-    ]
-    return () => T.forEach(clearTimeout)
-  }, [])
-  return (
-    <div className="flex flex-col items-center gap-3 text-center px-6">
-      <div className="flex items-baseline gap-3">
-        <span className={`text-4xl font-bold tabular-nums transition-colors duration-700 ${
-          phase >= 1 ? 'text-green-400' : 'text-[var(--text)]'
-        }`}>+{fmtCost(chatRunning)}</span>
-        <span className="text-[var(--text-muted)] text-xl">+</span>
-        <span className={`text-2xl tabular-nums transition-colors duration-700 ${
-          phase >= 2 ? 'text-[var(--text)]' : 'text-gray-600'
-        }`}>{fmtCost(baseline)}</span>
-      </div>
-      {phase >= 3 && (
-        <>
-          <div className="text-[8px] text-[var(--gold)]/50 tracking-[0.3em] uppercase mt-2">New Session Total</div>
-          <div className="text-5xl font-bold text-[var(--gold)] tabular-nums">{fmtCost(newTotal)}</div>
-        </>
-      )}
-      <button onClick={onDone}
-        className="mt-4 text-[9px] text-[var(--text-muted)] hover:text-[var(--gold)] tracking-[0.2em] uppercase
-          border-b border-transparent hover:border-[var(--gold)]/50 transition-colors">
-        Dismiss
-      </button>
-    </div>
-  )
-}
-
-function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated, costBaseline = 0, isHitLimit = false }) {
+function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) {
   const [projectPath, setProjectPath] = useState('C:/Project/RomanPrototype')
   const [input, setInput] = useState('')
   const [running, setRunning] = useState(false)
@@ -838,34 +812,6 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated, co
   const [messages, setMessages] = useState([])
   const bottomRef = useRef(null)
   const prevChatInitRef = useRef(null)
-  // ── Chat cost stages ──────────────────────────────────────────────────────
-  // Stage 1: idle — show baseline total
-  // Stage 2: first delta — 3-column flash (baseline→gray | running | +delta green)
-  // Stage 3: running — 2-column (baseline gray | running white)
-  // Stage 4: done — full-screen summary overlay
-  // Stage 5: dismissed → same as stage 1 (total = baseline + running)
-  const [costStage, setCostStage]   = useState(1)
-  const [chatRunning, setChatRunning] = useState(0)
-  const [lastDelta, setLastDelta]   = useState(null)
-  const baselineRef = useRef(costBaseline)  // snapshot at chat start, doesn't change mid-chat
-  useEffect(() => { if (costStage === 1) baselineRef.current = costBaseline }, [costBaseline, costStage])
-
-  // Stage 2 → 3 transition timeout
-  useEffect(() => {
-    if (costStage !== 2) return
-    const t = setTimeout(() => setCostStage(3), 2500)
-    return () => clearTimeout(t)
-  }, [costStage])
-
-  // Reset cost state when a new chat loads
-  useEffect(() => {
-    if (!chatInit) return
-    baselineRef.current = costBaseline
-    setChatRunning(0)
-    setLastDelta(null)
-    setCostStage(1)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chatInit])
   // Live streaming block (rAF-batched to avoid per-token re-renders)
   const liveBlockRef = useRef(null)  // { type: 'thinking'|'text', text: string } | null
   const [, setLiveTick] = useState(0)
@@ -930,15 +876,6 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated, co
       scheduleLiveUpdate()
     } else if (event.type === 'assistant') {
       liveBlockRef.current = null
-      // Track cost delta for chat cost stages
-      const model = event.message?.model
-      const usage = event.message?.usage
-      if (usage) {
-        const d = computeDeltaCost(model ?? '', usage)
-        setChatRunning(r => r + d)
-        setLastDelta(d)
-        setCostStage(s => s === 1 ? 2 : s)  // 1→2 on first token; stay 2/3 otherwise
-      }
       const blocks = event.message?.content ?? []
       const newMsgs = []
       for (const b of blocks) {
@@ -966,8 +903,6 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated, co
       setRunning(false)
       const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : ''
       setMessages(m => [...m, { role: 'result', text: `完成${cost}`, ts: Date.now() }])
-      // Stage 4 only if not a usage-limit interruption
-      if (!isHitLimit) setCostStage(s => (s === 2 || s === 3) ? 4 : s)
     } else if (event.type === 'done') {
       setRunning(false)
     }
@@ -1057,22 +992,8 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated, co
 
   function clearChat() { setMessages([]); setSessionId(null) }
 
-  const baseline = baselineRef.current
-  const currentTotal = baseline + chatRunning
-
   return (
     <div className="flex flex-col h-full">
-
-      {/* Stage 4 — full-screen chat-session summary */}
-      {costStage === 4 && (
-        <div className="fixed inset-0 z-[75] flex flex-col items-center justify-center gap-4 overlay-in"
-          style={{ background: 'rgba(0,0,0,0.96)' }}>
-          <div className="text-[7px] text-[var(--gold)]/40 tracking-[0.35em] uppercase">─── The Continental ───</div>
-          <div className="text-[10px] text-[var(--gold)]/70 tracking-widest uppercase mb-2">Chat Session Settled</div>
-          <Stage4Anim baseline={baseline} chatRunning={chatRunning}
-            onDone={() => setCostStage(1)} />
-        </div>
-      )}
 
       {/* Project path bar */}
       <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--border)] shrink-0">
@@ -1086,31 +1007,6 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated, co
           <span className="text-[9px] text-[var(--text-muted)] font-mono shrink-0">{sessionId.slice(0,8)}</span>
         )}
         <button onClick={clearChat} className="text-[9px] text-[var(--text-muted)] hover:text-[var(--text)] shrink-0">✕ clear</button>
-      </div>
-
-      {/* Cost bar — stages 1/2/3/5 */}
-      <div className={`flex items-center px-3 py-1 border-b border-[var(--border)]/40 shrink-0 min-h-[22px] transition-all duration-500 ${
-        costStage === 1 ? 'justify-end' :
-        costStage === 2 ? 'justify-between' :
-        costStage === 3 ? 'justify-between' : 'justify-end'
-      }`}>
-        {(costStage === 2 || costStage === 3) && (
-          <span className={`text-[9px] tabular-nums font-mono transition-colors duration-700 ${
-            costStage === 2 ? 'text-gray-600' : 'text-gray-500'
-          }`}>{fmtCost(baseline)}</span>
-        )}
-        {costStage === 2 && lastDelta != null && (
-          <span className="text-[9px] tabular-nums font-mono text-[var(--text)]">{fmtCost(chatRunning)}</span>
-        )}
-        {costStage === 2 && lastDelta != null && (
-          <span className="text-[9px] tabular-nums font-mono text-green-400">+{fmtCost(lastDelta)}</span>
-        )}
-        {(costStage === 3) && (
-          <span className="text-[9px] tabular-nums font-mono text-[var(--text)]">{fmtCost(chatRunning)}</span>
-        )}
-        {(costStage === 1 || costStage === 5) && (
-          <span className="text-[9px] tabular-nums font-mono text-[var(--gold)]/70">{fmtCost(currentTotal)}</span>
-        )}
       </div>
 
       {/* Messages */}
@@ -1366,7 +1262,7 @@ function MobileTabBar({ activeTab, setActiveTab }) {
   )
 }
 
-function MobileSessionsPanel({ sessions, selectedId, setSelectedId, setActiveTab, onContinue, autoResumeMap, onToggleAutoResume, hitLimitSessions, historyCosts, onCostClick, onPermissionResponse }) {
+function MobileSessionsPanel({ sessions, selectedId, setSelectedId, setActiveTab, onContinue, autoResumeMap, onToggleAutoResume, hitLimitSessions, historyCosts, onCostClick, onPermissionResponse, chatStage, chatRunning, chatLastDelta, chatBaseline }) {
   return (
     <div className="flex flex-col h-full">
       <div className="px-3 py-2 text-[10px] uppercase tracking-widest text-[var(--text-muted)] border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
@@ -1391,6 +1287,10 @@ function MobileSessionsPanel({ sessions, selectedId, setSelectedId, setActiveTab
             onToggleAutoResume={() => onToggleAutoResume?.(s.id)}
             hitLimit={hitLimitSessions?.has(s.id) ?? false}
             isChatSession={s.id === selectedId}
+            chatStage={s.id === selectedId ? chatStage : 1}
+            chatRunning={s.id === selectedId ? chatRunning : 0}
+            chatLastDelta={s.id === selectedId ? chatLastDelta : null}
+            chatBaseline={s.id === selectedId ? chatBaseline : 0}
             onPermissionResponse={onPermissionResponse}
           />
         ))}
@@ -1452,6 +1352,48 @@ function MobileMorePanel({ selected, send, logs, sessions }) {
   )
 }
 
+// ─── Stage 4 full-screen summary overlay ─────────────────────────────────────
+
+function Stage4Anim({ baseline, chatRunning, onDone }) {
+  const newTotal = baseline + chatRunning
+  const [phase, setPhase] = useState(0)
+  // phase 0→1: chat total 金→綠 (0.8s)
+  // phase 1→2: baseline 灰→金 (1.8s)
+  // phase 2→3: show merged total (3.0s)
+  useEffect(() => {
+    const T = [
+      setTimeout(() => setPhase(1), 800),
+      setTimeout(() => setPhase(2), 1800),
+      setTimeout(() => setPhase(3), 3000),
+    ]
+    return () => T.forEach(clearTimeout)
+  }, [])
+  return (
+    <div className="flex flex-col items-center gap-3 text-center px-6">
+      <div className="flex items-baseline gap-3">
+        <span className={`text-4xl font-bold tabular-nums transition-colors duration-700 ${
+          phase >= 1 ? 'text-green-400' : 'text-[var(--gold)]'
+        }`}>+{fmtCost(chatRunning)}</span>
+        <span className="text-[var(--text-muted)] text-xl">+</span>
+        <span className={`text-2xl tabular-nums transition-colors duration-700 ${
+          phase >= 2 ? 'text-[var(--gold)]' : 'text-gray-600'
+        }`}>{fmtCost(baseline)}</span>
+      </div>
+      {phase >= 3 && (
+        <>
+          <div className="text-[8px] text-[var(--gold)]/50 tracking-[0.3em] uppercase mt-2">New Session Total</div>
+          <div className="text-5xl font-bold text-[var(--gold)] tabular-nums">{fmtCost(newTotal)}</div>
+        </>
+      )}
+      <button onClick={onDone}
+        className="mt-4 text-[9px] text-[var(--text-muted)] hover:text-[var(--gold)] tracking-[0.2em] uppercase
+          border-b border-transparent hover:border-[var(--gold)]/50 transition-colors">
+        Dismiss
+      </button>
+    </div>
+  )
+}
+
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -1472,12 +1414,19 @@ export default function App() {
   const [contractModal, setContractModal]       = useState(null)
   const [historyCosts, setHistoryCosts]         = useState({})   // { [sessionId]: costUsd }
   const [chatBaseline, setChatBaseline]         = useState(0)    // historyCosts snapshot when chatInit last fired
+  // ── 5-Stage chat cost display (lives in SessionItem Row 3) ──────────────
+  const [chatStage, setChatStage]       = useState(1)   // 1=idle 2=flash 3=running 4=done
+  const [chatRunning, setChatRunning]   = useState(0)   // cost accumulated this chat
+  const [chatLastDelta, setChatLastDelta] = useState(null)
+
 
   // Track which session is currently open in Chat (for animation gating)
-  const activeChatSessionRef = useRef(null)
-  const activeTabRef          = useRef('chat')
+  const activeChatSessionRef  = useRef(null)
+  const activeTabRef           = useRef('chat')
+  // Timestamp of last session switch — used to skip session_live replay batches
+  const sessionLiveStartRef    = useRef(0)
 
-  useEffect(() => { activeChatSessionRef.current = chatInit?.sessionId ?? null }, [chatInit])
+  useEffect(() => { activeChatSessionRef.current = selectedId }, [selectedId])
   useEffect(() => { activeTabRef.current = activeTab }, [activeTab])
 
   // Load bounty settings + seed historyCosts from history API once
@@ -1584,17 +1533,90 @@ export default function App() {
   // Determine anim component type
   const animTier  = currentAnim?.tier
   const animLevel = currentAnim?.level
-  const isToast   = animTier === 'L' && (animLevel === 3 || animLevel === 4)
-  const isOverlay = (animTier === 'L' && animLevel && animLevel < 3)
-    ? false
-    : animTier != null && !(animTier === 'L' && animLevel < 3)
-  // L1/L2 = badge flash only (no overlay)
+  const isPreview = !!currentAnim?._uid
+  // L3/L4 = toast; L1/L2 = badge-only (preview exception: show as toast)
+  const isToast   = animTier === 'L' && ((animLevel === 3 || animLevel === 4) || (animLevel <= 2 && isPreview))
+  // H/S/C always overlay; L tiers never overlay
+  const isOverlay = animTier != null && animTier !== 'L'
 
   function handleContinueInChat({ sessionId, projectPath }) {
     setChatBaseline(historyCosts[sessionId] ?? 0)
+    setChatRunning(0)
+    setChatLastDelta(null)
+    setChatStage(1)
     setChatInit({ sessionId, projectPath })
     setActiveTab('chat')
   }
+
+  // Reset stage state whenever the selected session changes
+  useEffect(() => {
+    if (!selectedId) return
+    setChatBaseline(historyCosts[selectedId] ?? 0)
+    setChatRunning(0)
+    setChatLastDelta(null)
+    setChatStage(1)
+    // Give replays 3s to flush before we start processing session_live cost events
+    sessionLiveStartRef.current = Date.now() + 3000
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId])
+
+  // Keep chatBaseline in sync when historyCosts loads (covers async API + auto-selected sessions)
+  const selectedCost = selectedId ? (historyCosts[selectedId] ?? 0) : 0
+  useEffect(() => {
+    if (selectedId && chatStage === 1) setChatBaseline(selectedCost)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedCost])
+
+  // Stage 2 → 3 auto-transition (2.5s after first token)
+  useEffect(() => {
+    if (chatStage !== 2) return
+    const t = setTimeout(() => setChatStage(3), 2500)
+    return () => clearTimeout(t)
+  }, [chatStage])
+
+  // Watch streamEvents to drive chat cost stages (both dashboard chat and external VS Code)
+  useEffect(() => {
+    if (!streamEvents.length || !selectedId) return
+    const ev = streamEvents[streamEvents.length - 1]
+
+    // ── claude_stream: subprocess events from dashboard ChatPanel ─────────
+    if (ev.type === 'claude_stream') {
+      const activeSession = sessions.find(s => s.id === selectedId)
+      if (!activeSession?.cwd || normPath(ev.projectPath) !== normPath(activeSession.cwd)) return
+      const { event } = ev
+      if (event?.type === 'assistant' && event.message?.usage) {
+        const d = computeDeltaCost(event.message?.model ?? '', event.message.usage)
+        setChatRunning(r => r + d)
+        setChatLastDelta(d)
+        setChatStage(s => s === 1 ? 2 : s)
+      } else if (event?.type === 'result') {
+        if (!hitLimitSessions.has(selectedId)) {
+          setChatStage(s => (s === 2 || s === 3) ? 4 : s)
+        }
+      }
+      return
+    }
+
+    // ── session_live: VS Code external session live tail ─────────────────
+    if (ev.type === 'session_live' && ev.sessionId === selectedId) {
+      // Skip replay batches arriving within 3s of session switch
+      if ((ev._arrivalTs ?? 0) < sessionLiveStartRef.current) return
+      for (const msg of ev.messages ?? []) {
+        if (msg.type === 'assistant' && msg.message?.usage) {
+          const d = computeDeltaCost(msg.message?.model ?? '', msg.message.usage)
+          setChatRunning(r => r + d)
+          setChatLastDelta(d)
+          setChatStage(s => s === 1 ? 2 : s)
+        }
+        if (msg.type === 'result') {
+          if (!hitLimitSessions.has(selectedId)) {
+            setChatStage(s => (s === 2 || s === 3) ? 4 : s)
+          }
+        }
+      }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streamEvents])
   // Auto-watch active sessions so session_live events flow into cost engine
   const watchedRef = useRef(new Set())
   function autoWatch(sessionId) {
@@ -1654,7 +1676,7 @@ export default function App() {
       setSelectedId(prev => prev === msg.sessionId ? null : prev)
     }
     if (msg.type === 'claude_stream' || msg.type === 'session_live') {
-      setStreamEvents(prev => [...prev.slice(-200), msg])
+      setStreamEvents(prev => [...prev.slice(-200), { ...msg, _arrivalTs: Date.now() }])
 
       // Detect usage limit hit — auto-arm ⏰ button
       const isLimit = (() => {
@@ -1710,10 +1732,20 @@ export default function App() {
 
       {/* ── Bounty overlays ── */}
       {isToast && currentAnim && (
-        <BountyToast anim={currentAnim} settings={bountySettings} onDone={handleAnimDone} />
+        <BountyToast key={currentAnim._uid ?? 'toast'} anim={currentAnim} settings={bountySettings} onDone={handleAnimDone} />
       )}
       {isOverlay && currentAnim && (
-        <BountyOverlay anim={currentAnim} settings={bountySettings} onDone={handleAnimDone} />
+        <BountyOverlay key={currentAnim._uid ?? 'overlay'} anim={currentAnim} settings={bountySettings} onDone={handleAnimDone} />
+      )}
+      {/* Stage 4 — full-screen chat session summary */}
+      {chatStage === 4 && (
+        <div className="fixed inset-0 z-[75] flex flex-col items-center justify-center gap-4 overlay-in"
+          style={{ background: 'rgba(0,0,0,0.96)' }}>
+          <div className="text-[7px] text-[var(--gold)]/40 tracking-[0.35em] uppercase">─── The Continental ───</div>
+          <div className="text-[10px] text-[var(--gold)]/70 tracking-widest uppercase mb-2">Chat Session Settled</div>
+          <Stage4Anim baseline={chatBaseline} chatRunning={chatRunning}
+            onDone={() => setChatStage(1)} />
+        </div>
       )}
       {contractModal && (
         <ContractModal
@@ -1729,7 +1761,8 @@ export default function App() {
             setShowBountySettings(false)
             const t = tierStr === 'C' ? 'C' : tierStr[0]
             const l = tierStr === 'C' ? null : parseInt(tierStr[1])
-            setAnimQueue(q => [...q, { tier: t, level: l, delta: 0.18, total: 2.34, sessionName: 'Preview' }])
+            // _uid forces BountyOverlay/BountyToast to remount even if same tier
+            setCurrentAnim({ tier: t, level: l, delta: 0.18, total: 2.34, sessionName: 'Preview', _uid: Date.now() })
           }}
         />
       )}
@@ -1805,21 +1838,22 @@ export default function App() {
                     onDoubleClick={() => { setRenamingId(s.id); setRenameVal(s.displayName) }}
                     onCostClick={async () => {
                       const live = costSnap[`session:${s.id}`] ?? costSnap[normPath(s.cwd)]
-                      if (live) {
-                        setContractModal({ sessionName: s.displayName, costData: live })
-                      } else {
-                        const d = await fetch(`/api/history/${s.id}`).then(r => r.json()).catch(() => ({}))
-                        setContractModal({
-                          sessionName: s.displayName,
-                          costData: { total: d.costUsd ?? 0, byType: d.byType ?? {}, byModel: d.byModel ?? {} },
-                        })
-                      }
+                      const d = await fetch(`/api/history/${s.id}`).then(r => r.json()).catch(() => ({}))
+                      const total = historyCosts[s.id] ?? live?.total ?? d.costUsd ?? 0
+                      setContractModal({
+                        sessionName: s.displayName,
+                        costData: { total, byType: live?.byType ?? d.byType ?? {}, byModel: live?.byModel ?? d.byModel ?? {} },
+                      })
                     }}
                     autoResumeArmed={autoResumeMap[s.id]?.enabled === true}
                     autoResumeFireAt={autoResumeMap[s.id]?.fireAt ?? null}
                     onToggleAutoResume={() => toggleAutoResume(s.id)}
                     hitLimit={hitLimitSessions.has(s.id)}
                     isChatSession={s.id === selectedId}
+                    chatStage={s.id === selectedId ? chatStage : 1}
+                    chatRunning={s.id === selectedId ? chatRunning : 0}
+                    chatLastDelta={s.id === selectedId ? chatLastDelta : null}
+                    chatBaseline={s.id === selectedId ? chatBaseline : 0}
                     onPermissionResponse={(permId, action) => send({ type: 'permission_response', permissionId: permId, action })}
                   />
                 )
@@ -1860,9 +1894,7 @@ export default function App() {
           <div className="flex-1 overflow-hidden min-h-0 flex flex-col">
             {activeTab === 'chat' && (
               <ChatPanel streamEvents={streamEvents} chatInit={chatInit} logs={logs} selectedId={selectedId}
-                onTaskCreated={() => setActiveTab('tasks')}
-                costBaseline={chatBaseline}
-                isHitLimit={hitLimitSessions.has(selectedId ?? '')} />
+                onTaskCreated={() => setActiveTab('tasks')} />
             )}
             {activeTab === 'tasks' && (
               <div className="py-2 px-2 h-full">
@@ -1883,14 +1915,12 @@ export default function App() {
             {activeTab === 'sessions'  && <MobileSessionsPanel sessions={sessions} selectedId={selectedId} setSelectedId={setSelectedId} setActiveTab={setActiveTab} onContinue={handleContinueInChat} autoResumeMap={autoResumeMap} onToggleAutoResume={toggleAutoResume} hitLimitSessions={hitLimitSessions} historyCosts={historyCosts}
               onCostClick={async s => {
                 const live = costSnap[`session:${s.id}`] ?? costSnap[normPath(s.cwd)]
-                if (live) {
-                  setContractModal({ sessionName: s.displayName, costData: live })
-                } else {
-                  const d = await fetch(`/api/history/${s.id}`).then(r => r.json()).catch(() => ({}))
-                  setContractModal({ sessionName: s.displayName, costData: { total: d.costUsd ?? 0, byType: d.byType ?? {}, byModel: d.byModel ?? {} } })
-                }
+                const d = await fetch(`/api/history/${s.id}`).then(r => r.json()).catch(() => ({}))
+                const total = historyCosts[s.id] ?? live?.total ?? d.costUsd ?? 0
+                setContractModal({ sessionName: s.displayName, costData: { total, byType: live?.byType ?? d.byType ?? {}, byModel: live?.byModel ?? d.byModel ?? {} } })
               }}
               onPermissionResponse={(permId, action) => send({ type: 'permission_response', permissionId: permId, action })}
+              chatStage={chatStage} chatRunning={chatRunning} chatLastDelta={chatLastDelta} chatBaseline={chatBaseline}
             />}
             {activeTab === 'more'      && <MobileMorePanel selected={selected} send={send} logs={logs} sessions={sessions} />}
           </div>
