@@ -1439,6 +1439,8 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('chat')
   const [streamEvents, setStreamEvents] = useState([])
   const [chatInit, setChatInit] = useState(null)
+  // Ref tracking current chat projectPath for stream watcher (avoids stale sessions lookup)
+  const chatProjectPathRef = useRef('')
 
   // ── Bounty system ────────────────────────────────────────────────────────
   const [bountySettings, setBountySettings]     = useState({})
@@ -1574,6 +1576,7 @@ export default function App() {
   const isOverlay = animTier != null && animTier !== 'L'
 
   function handleContinueInChat({ sessionId, projectPath }) {
+    chatProjectPathRef.current = projectPath ?? ''
     setChatBaseline(historyCosts[sessionId] ?? 0)
     setChatRunning(0)
     setChatLastDelta(null)
@@ -1615,8 +1618,11 @@ export default function App() {
 
     // ── claude_stream: subprocess events from dashboard ChatPanel ─────────
     if (ev.type === 'claude_stream') {
+      // Match against chatProjectPathRef (reliable) OR active session cwd (fallback)
+      const chatPath = chatProjectPathRef.current
       const activeSession = sessions.find(s => s.id === selectedId)
-      if (!activeSession?.cwd || normPath(ev.projectPath) !== normPath(activeSession.cwd)) return
+      const expectedPath = chatPath || activeSession?.cwd || ''
+      if (!expectedPath || normPath(ev.projectPath) !== normPath(expectedPath)) return
       const { event } = ev
       if (event?.type === 'system' && event?.subtype === 'init') {
         // New run starting — reset stage so Stage 2 can fire again
