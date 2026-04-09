@@ -60,7 +60,10 @@ function ActivityHeat() {
 
   useEffect(() => {
     function load() {
-      fetch('/api/usage/heat').then(r => r.json()).then(setHeat).catch(() => {})
+      fetch('/api/usage/heat')
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (d?.session5h && d?.weekly7d) setHeat(d) })
+        .catch(() => {})
     }
     load()
     const id = setInterval(load, 30_000)
