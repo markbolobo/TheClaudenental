@@ -90,33 +90,25 @@ export function useCostEngine(streamEvents, onAnimate) {
     if (ev === lastEv.current) return
     lastEv.current = ev
 
-    if (ev.type !== 'claude_stream') return
-    const { event, projectPath } = ev
-
-    // Cost from assistant messages
-    if (event?.type === 'assistant') {
+    // ── Helper: process a single assistant event object ──────────────────
+    function processAssistant(event, key) {
       const model = event.message?.model
       const usage = event.message?.usage
       if (!usage) return
-
-      const key = normPath(projectPath)
       if (!data.current[key]) {
         data.current[key] = {
-          total: 0,
-          byModel: {},
+          total: 0, byModel: {},
           byType: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           milestonesFired: new Set(),
         }
       }
       const d     = data.current[key]
       const delta = computeDeltaCost(model ?? '', usage)
-
       d.total            += delta
       d.byType.input     += usage.input_tokens                ?? 0
       d.byType.output    += usage.output_tokens               ?? 0
       d.byType.cacheRead += usage.cache_read_input_tokens     ?? 0
       d.byType.cacheWrite+= usage.cache_creation_input_tokens ?? 0
-
       const mn = model ?? 'unknown'
       if (!d.byModel[mn]) d.byModel[mn] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
       d.byModel[mn].input      += usage.input_tokens                ?? 0
@@ -125,7 +117,6 @@ export function useCostEngine(streamEvents, onAnimate) {
       d.byModel[mn].cacheWrite += usage.cache_creation_input_tokens ?? 0
       d.byModel[mn].cost       += delta
 
-      // S milestone check
       let sTiered = false
       for (let i = S_MILESTONES.length - 1; i >= 0; i--) {
         const m = S_MILESTONES[i]
@@ -140,18 +131,29 @@ export function useCostEngine(streamEvents, onAnimate) {
         const t = classifyTier(delta)
         cbRef.current({ ...t, delta, total: d.total, key })
       }
-
       setSnap(prev => ({
         ...prev,
         [key]: { total: d.total, byModel: { ...d.byModel }, byType: { ...d.byType } },
       }))
     }
 
-    // Session done → C tier
-    if (event?.type === 'result') {
+    // ── claude_stream (subprocess / Chat panel) ──────────────────────────
+    if (ev.type === 'claude_stream') {
+      const { event, projectPath } = ev
       const key = normPath(projectPath)
-      const d   = data.current[key]
-      if (d && d.total > 0) cbRef.current({ tier: 'C', level: null, delta: 0, total: d.total, key })
+      if (event?.type === 'assistant') processAssistant(event, key)
+      if (event?.type === 'result') {
+        const d = data.current[key]
+        if (d?.total > 0) cbRef.current({ tier: 'C', level: null, delta: 0, total: d.total, key })
+      }
+    }
+
+    // ── session_live (VS Code live tail) ─────────────────────────────────
+    if (ev.type === 'session_live') {
+      const key = `session:${ev.sessionId}`   // keyed by sessionId
+      for (const msg of ev.messages ?? []) {
+        if (msg.type === 'assistant') processAssistant(msg, key)
+      }
     }
   }, [streamEvents])
 

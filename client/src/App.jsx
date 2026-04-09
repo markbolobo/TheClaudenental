@@ -1044,11 +1044,21 @@ export default function App() {
 
   // Cost engine — receives stream events and fires animation triggers
   const costSnap = useCostEngine(streamEvents, (anim) => {
-    // Attach session name for C tier
-    const normCwd = anim.key
-    const sess = sessions.find(s => normPath(s.cwd) === normCwd)
+    const { key, total } = anim
+    // Find session name: key is either normPath(cwd) or 'session:<id>'
+    const sessById  = key.startsWith('session:') ? sessions.find(s => s.id === key.slice(8)) : null
+    const sessByCwd = !sessById ? sessions.find(s => normPath(s.cwd) === key) : null
+    const sess = sessById ?? sessByCwd
     setAnimQueue(q => [...q, { ...anim, sessionName: sess?.displayName ?? '' }])
-    setLiveCosts(prev => ({ ...prev, [normCwd]: anim.total }))
+    setLiveCosts(prev => {
+      const next = { ...prev, [key]: total }
+      // Also index by the other key so lookups work both ways
+      if (sess) {
+        next[normPath(sess.cwd)] = total
+        next[`session:${sess.id}`] = total
+      }
+      return next
+    })
   })
 
   // Drain animation queue one at a time
@@ -1093,14 +1103,31 @@ export default function App() {
     isAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
   }
 
+  // Auto-watch active sessions so session_live events flow into cost engine
+  const watchedRef = useRef(new Set())
+  function autoWatch(sessionId) {
+    if (!sessionId || watchedRef.current.has(sessionId)) return
+    watchedRef.current.add(sessionId)
+    fetch('/api/session/watch', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId }),
+    }).catch(() => {})
+  }
+
   const { connected, send } = useWebSocket(WS_URL, msg => {
     if (msg.type === 'state') {
       setSessions(msg.sessions)
       setSelectedId(prev => prev ?? msg.sessions[0]?.id ?? null)
       if (msg.logs) setLogs(msg.logs)  // replace on reconnect, not append
+      // Auto-watch all active sessions on reconnect
+      for (const s of msg.sessions ?? []) {
+        if (s.status === 'active') autoWatch(s.id)
+      }
     }
     if (msg.type === 'log') setLogs(prev => [...prev.slice(-200), msg])
     if (msg.type === 'session') {
+      // Auto-watch when a session becomes active
+      if (msg.session?.status === 'active') autoWatch(msg.session.id)
       setSessions(prev => {
         const exists = prev.some(s => s.id === msg.session.id)
         const next = exists
@@ -1243,15 +1270,14 @@ export default function App() {
                     key={s.id}
                     session={{ ...s, costUsd: historyCosts[s.id] ?? s.costUsd ?? null }}
                     isSelected={s.id === selectedId}
-                    liveCost={liveCosts[normPath(s.cwd)] ?? null}
+                    liveCost={liveCosts[`session:${s.id}`] ?? liveCosts[normPath(s.cwd)] ?? null}
                     onClick={() => {
                       setSelectedId(s.id)
                       if (s.cwd) handleContinueInChat({ sessionId: s.id, projectPath: s.cwd })
                     }}
                     onDoubleClick={() => { setRenamingId(s.id); setRenameVal(s.displayName) }}
                     onCostClick={async () => {
-                      // Prefer live cost engine data; fall back to fetching history detail
-                      const live = costSnap[normPath(s.cwd)]
+                      const live = costSnap[`session:${s.id}`] ?? costSnap[normPath(s.cwd)]
                       if (live) {
                         setContractModal({ sessionName: s.displayName, costData: live })
                       } else {
