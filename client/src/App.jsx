@@ -1023,14 +1023,21 @@ export default function App() {
 
   // ── Bounty system ────────────────────────────────────────────────────────
   const [bountySettings, setBountySettings]     = useState({})
-  const [animQueue, setAnimQueue]               = useState([])   // [{tier,level,delta,total,key,sessionName}]
+  const [animQueue, setAnimQueue]               = useState([])
   const [currentAnim, setCurrentAnim]           = useState(null)
   const [showBountySettings, setShowBountySettings] = useState(false)
-  const [contractModal, setContractModal]       = useState(null) // { sessionName, costData }
-  const [liveCosts, setLiveCosts]               = useState({})   // { [normPath]: total }
+  const [contractModal, setContractModal]       = useState(null)
+  const [liveCosts, setLiveCosts]               = useState({})   // { 'session:<id>' | normPath: total }
   const [historyCosts, setHistoryCosts]         = useState({})   // { [sessionId]: costUsd }
 
-  // Load bounty settings + historical costs once
+  // Track which session is currently open in Chat (for animation gating)
+  const activeChatSessionRef = useRef(null)
+  const activeTabRef          = useRef('chat')
+
+  useEffect(() => { activeChatSessionRef.current = chatInit?.sessionId ?? null }, [chatInit])
+  useEffect(() => { activeTabRef.current = activeTab }, [activeTab])
+
+  // Load bounty settings + seed historyCosts from history API once
   useEffect(() => {
     fetch('/api/bounty/settings').then(r => r.json()).then(setBountySettings).catch(() => {})
     fetch('/api/history').then(r => r.json()).then(d => {
@@ -1045,20 +1052,34 @@ export default function App() {
   // Cost engine — receives stream events and fires animation triggers
   const costSnap = useCostEngine(streamEvents, (anim) => {
     const { key, total } = anim
-    // Find session name: key is either normPath(cwd) or 'session:<id>'
+    // Resolve session from key
     const sessById  = key.startsWith('session:') ? sessions.find(s => s.id === key.slice(8)) : null
     const sessByCwd = !sessById ? sessions.find(s => normPath(s.cwd) === key) : null
     const sess = sessById ?? sessByCwd
-    setAnimQueue(q => [...q, { ...anim, sessionName: sess?.displayName ?? '' }])
+
+    // Always update live cost display (both keys for safe lookup)
     setLiveCosts(prev => {
       const next = { ...prev, [key]: total }
-      // Also index by the other key so lookups work both ways
       if (sess) {
-        next[normPath(sess.cwd)] = total
+        next[normPath(sess.cwd)]    = total
         next[`session:${sess.id}`] = total
       }
       return next
     })
+
+    // Keep historyCosts in sync — no re-fetch needed
+    if (sess) {
+      setHistoryCosts(prev => ({ ...prev, [sess.id]: total }))
+    }
+
+    // Fire animation only when Chat tab is active AND this is the currently open session
+    const activeSid = activeChatSessionRef.current
+    const isCurrentChat = sess
+      ? sess.id === activeSid
+      : key === normPath('') // fallback: never match
+    if (activeTabRef.current === 'chat' && isCurrentChat) {
+      setAnimQueue(q => [...q, { ...anim, sessionName: sess?.displayName ?? '' }])
+    }
   })
 
   // Drain animation queue one at a time
@@ -1128,6 +1149,13 @@ export default function App() {
     if (msg.type === 'session') {
       // Auto-watch when a session becomes active
       if (msg.session?.status === 'active') autoWatch(msg.session.id)
+      // When session finishes, pull final cost from server (covers externally-ended sessions)
+      if (msg.session?.status === 'done') {
+        fetch(`/api/history/${msg.session.id}`).then(r => r.json()).then(d => {
+          if (d.costUsd != null)
+            setHistoryCosts(prev => ({ ...prev, [msg.session.id]: d.costUsd }))
+        }).catch(() => {})
+      }
       setSessions(prev => {
         const exists = prev.some(s => s.id === msg.session.id)
         const next = exists
