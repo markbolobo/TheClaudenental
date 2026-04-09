@@ -90,47 +90,49 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick, liveCost, on
     <div className={`${base} ${selectedCls}`} onClick={onClick} onDoubleClick={onDoubleClick}>
       <StatusDot status={session.status} />
       <div className="flex-1 min-w-0">
-        <div className="truncate text-[var(--text-h)] text-xs leading-tight">
+        {/* Row 1: session name */}
+        <div className="truncate text-[var(--text-h)] text-xs leading-tight mb-0.5">
           {session.displayName}
         </div>
-        <div className="flex items-center gap-1.5 text-[10px] text-[var(--text-muted)]">
-          <span>{elapsed(session.startedAt)} ago</span>
-
-          <div className="ml-auto flex items-center gap-1 shrink-0">
-            {/* Auto-resume toggle — only visible when sleeping */}
-            {session.status === 'sleeping' && (
+        {/* Row 2: time */}
+        <div className="text-[10px] text-[var(--text-muted)]">
+          {elapsed(session.startedAt)} ago
+        </div>
+        {/* Row 3: cost + auto-resume toggle */}
+        <div className="flex items-center gap-1 mt-0.5">
+          {/* Cost badge + delta overlay */}
+          {displayedCost != null && (
+            <div className="relative">
               <button
-                onClick={e => { e.stopPropagation(); onToggleAutoResume?.() }}
-                title={autoResumeArmed ? '自動繼續 ON — 點擊取消' : '設定整點自動繼續'}
-                className={`text-[9px] px-1 leading-none rounded border transition-colors ${
-                  autoResumeArmed
-                    ? 'border-amber-500/80 text-amber-400 pulse-amber'
-                    : 'border-gray-600/40 text-gray-600 hover:border-gray-500 hover:text-gray-400'
-                }`}
-              >⏰</button>
-            )}
+                onClick={e => { e.stopPropagation(); onCostClick?.() }}
+                className="tabular-nums text-[var(--gold)]/80 hover:text-[var(--gold)] transition-colors
+                  border-b border-[var(--gold)]/20 hover:border-[var(--gold)]/60 leading-tight text-[9px]">
+                {fmtCost(displayedCost)}
+              </button>
+              {deltaAmt != null && (
+                <span
+                  className={`absolute left-full pl-1 top-0 tabular-nums text-green-400 text-[9px] whitespace-nowrap pointer-events-none transition-opacity duration-500 ${
+                    deltaPhase === 'fade' ? 'opacity-0' : 'opacity-100'
+                  }`}
+                >
+                  +{fmtCost(deltaAmt)}
+                </span>
+              )}
+            </div>
+          )}
 
-            {/* Cost badge + delta overlay */}
-            {displayedCost != null && (
-              <div className="relative">
-                <button
-                  onClick={e => { e.stopPropagation(); onCostClick?.() }}
-                  className="tabular-nums text-[var(--gold)]/80 hover:text-[var(--gold)] transition-colors
-                    border-b border-[var(--gold)]/20 hover:border-[var(--gold)]/60 leading-tight text-[9px]">
-                  {fmtCost(displayedCost)}
-                </button>
-                {deltaAmt != null && (
-                  <span
-                    className={`absolute left-full pl-1 top-0 tabular-nums text-green-400 text-[9px] whitespace-nowrap pointer-events-none transition-opacity duration-500 ${
-                      deltaPhase === 'fade' ? 'opacity-0' : 'opacity-100'
-                    }`}
-                  >
-                    +{fmtCost(deltaAmt)}
-                  </span>
-                )}
-              </div>
-            )}
-          </div>
+          {/* Auto-resume toggle — only visible when sleeping */}
+          {session.status === 'sleeping' && (
+            <button
+              onClick={e => { e.stopPropagation(); onToggleAutoResume?.() }}
+              title={autoResumeArmed ? '自動繼續 ON — 點擊取消' : '設定整點自動繼續'}
+              className={`text-[9px] px-1 leading-none rounded border transition-colors ${
+                autoResumeArmed
+                  ? 'border-amber-500/80 text-amber-400 pulse-amber'
+                  : 'border-gray-600/40 text-gray-600 hover:border-gray-500 hover:text-gray-400'
+              }`}
+            >⏰</button>
+          )}
         </div>
       </div>
     </div>
