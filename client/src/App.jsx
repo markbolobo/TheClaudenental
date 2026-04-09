@@ -821,49 +821,61 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
     rafRef.current = requestAnimationFrame(() => { rafRef.current = null; setLiveTick(t => t + 1) })
   }
 
+  // Tracks whether the initial session_live replay has been received (first batch = replace, rest = append)
+  const replayDoneRef = useRef(false)
+
   // Apply chatInit when it changes (from History "Continue in Chat" or session click)
   useEffect(() => {
     if (!chatInit) return
     if (chatInit === prevChatInitRef.current) return
     prevChatInitRef.current = chatInit
+    replayDoneRef.current = false
     setProjectPath(chatInit.projectPath)
     setSessionId(chatInit.sessionId)
-    setMessages([{ role: 'system', text: '載入歷史紀錄…', ts: Date.now() }])
-    // Start live-tailing VS Code session
+    setMessages([])
+    // Start live-tailing — first session_live broadcast will carry full replay
     fetch('/api/session/watch', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionId: chatInit.sessionId }),
     }).catch(() => {})
-    fetch(`/api/history/${chatInit.sessionId}`)
-      .then(r => r.json())
-      .then(d => {
-        const hist = (d.messages ?? []).map(m => ({ ...m, historical: true }))
-        setMessages(prev => {
-          const newStream = prev.filter(m => !m.historical && m.role !== 'system')
-          return [...hist, { role: 'system', text: '─── 以上為歷史紀錄，從此繼續 ───', ts: Date.now() }, ...newStream]
-        })
-      })
-      .catch(() => setMessages([{ role: 'system', text: '歷史紀錄載入失敗', ts: Date.now() }]))
   }, [chatInit])
 
   // Process incoming stream events (subprocess)
   useEffect(() => {
     if (!streamEvents.length) return
     const ev = streamEvents[streamEvents.length - 1]
-    // session_live: VS Code live tail messages — pair tool_results with their tool_uses
+    // session_live: VS Code live tail messages
     if (ev.type === 'session_live' && ev.sessionId === sessionId) {
-      setMessages(prev => {
-        let next = [...prev]
-        for (const m of ev.messages ?? []) {
-          const msg = { ...m, live: true }
+      const incoming = ev.messages ?? []
+      if (!replayDoneRef.current) {
+        // First batch = full history replay → replace messages entirely (no divider)
+        replayDoneRef.current = true
+        // Pair tool_results with tool_uses inside the replay
+        const next = []
+        for (const m of incoming) {
+          const msg = { ...m, historical: true }
           if (msg.role === 'tool_result') {
             const idx = next.map(x => x.toolId).lastIndexOf(msg.toolId)
-            if (idx >= 0) { next = [...next.slice(0, idx + 1), msg, ...next.slice(idx + 1)]; continue }
+            if (idx >= 0) { next.splice(idx + 1, 0, msg); continue }
           }
-          next = [...next, msg]
+          next.push(msg)
         }
-        return next
-      })
+        setMessages(next)
+      } else {
+        // Subsequent batches = live new messages → append with pairing
+        setMessages(prev => {
+          let next = [...prev]
+          for (const m of incoming) {
+            const msg = { ...m, live: true }
+            if (msg.role === 'tool_result') {
+              const idx = next.map(x => x.toolId).lastIndexOf(msg.toolId)
+              if (idx >= 0) { next = [...next.slice(0, idx + 1), msg, ...next.slice(idx + 1)]; continue }
+            }
+            next = [...next, msg]
+          }
+          return next
+        })
+      }
       return
     }
     if (normPath(ev.projectPath) !== normPath(projectPath)) return
