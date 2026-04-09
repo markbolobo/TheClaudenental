@@ -205,7 +205,7 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick,
               }`}
             >
               <span>⏰</span>
-              <span>{autoResumeArmed ? (fmtHour(autoResumeFireAt) || '已設定') : '預約'}</span>
+              <span>{autoResumeArmed ? `${fmtHour(autoResumeFireAt) || '?'} 自動發送訊息` : '尚未預約'}</span>
             </button>
           )}
         </div>
