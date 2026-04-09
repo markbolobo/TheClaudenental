@@ -321,10 +321,17 @@ function HistoryMessage({ message: m }) {
   )
 }
 
+function fmtCost(usd) {
+  if (usd == null) return null
+  if (usd < 0.01) return `$${(usd * 100).toFixed(2)}¢`
+  return `$${usd.toFixed(3)}`
+}
+
 function HistoryPanel({ onContinue }) {
   const [list, setList] = useState([])
   const [active, setActive] = useState(null)
   const [messages, setMessages] = useState([])
+  const [activeCost, setActiveCost] = useState(null)
   const [loading, setLoading] = useState(false)
 
   useEffect(() => {
@@ -332,9 +339,11 @@ function HistoryPanel({ onContinue }) {
   }, [])
 
   async function open(s) {
-    setActive(s); setLoading(true)
+    setActive(s); setLoading(true); setActiveCost(null)
     const d = await fetch(`/api/history/${s.sessionId}`).then(r => r.json())
-    setMessages(d.messages ?? []); setLoading(false)
+    setMessages(d.messages ?? [])
+    setActiveCost(d.costUsd ?? s.costUsd ?? null)
+    setLoading(false)
   }
 
   if (active) return (
@@ -342,6 +351,9 @@ function HistoryPanel({ onContinue }) {
       <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--border)] shrink-0">
         <button onClick={() => setActive(null)} className="text-[var(--text-muted)] hover:text-[var(--text)] text-xs">← Back</button>
         <span className="flex-1 text-xs text-[var(--text-h)] truncate">{active.title}</span>
+        {activeCost != null && (
+          <span className="shrink-0 text-[10px] text-[var(--gold)]/80">{fmtCost(activeCost)}</span>
+        )}
         {active.cwd && (
           <button
             onClick={() => onContinue({ sessionId: active.sessionId, projectPath: active.cwd })}
@@ -367,7 +379,10 @@ function HistoryPanel({ onContinue }) {
         <div key={s.sessionId} onClick={() => open(s)}
           className="px-3 py-2 rounded hover:bg-[var(--surface-2)] cursor-pointer mb-1">
           <div className="text-xs text-[var(--text-h)] truncate">{s.title}</div>
-          <div className="text-[10px] text-[var(--text-muted)]">{s.project.replace('c--', '').replace(/-/g,'/')} · {new Date(s.mtime).toLocaleDateString()}</div>
+          <div className="flex items-center gap-1.5 text-[10px] text-[var(--text-muted)]">
+            <span className="truncate">{s.project.replace('c--', '').replace(/-/g,'/')} · {new Date(s.mtime).toLocaleDateString()}</span>
+            {s.costUsd != null && <span className="shrink-0 text-[var(--gold)]/70">{fmtCost(s.costUsd)}</span>}
+          </div>
         </div>
       ))}
     </div>
@@ -632,7 +647,9 @@ function CheckpointsPanel({ selected }) {
 
 // ─── Chat Panel ───────────────────────────────────────────────────────────────
 
-function ChatPanel({ send, streamEvents, chatInit }) {
+function normPath(p) { return (p ?? '').replace(/\\/g, '/').toLowerCase().replace(/\/$/, '') }
+
+function ChatPanel({ streamEvents, chatInit }) {
   const [projectPath, setProjectPath] = useState('C:/Project/RomanPrototype')
   const [input, setInput] = useState('')
   const [running, setRunning] = useState(false)
@@ -641,7 +658,7 @@ function ChatPanel({ send, streamEvents, chatInit }) {
   const bottomRef = useRef(null)
   const prevChatInitRef = useRef(null)
 
-  // Apply chatInit when it changes (from History "Continue in Chat")
+  // Apply chatInit when it changes (from History "Continue in Chat" or session click)
   useEffect(() => {
     if (!chatInit) return
     if (chatInit === prevChatInitRef.current) return
@@ -649,23 +666,33 @@ function ChatPanel({ send, streamEvents, chatInit }) {
     setProjectPath(chatInit.projectPath)
     setSessionId(chatInit.sessionId)
     setMessages([{ role: 'system', text: '載入歷史紀錄…', ts: Date.now() }])
+    // Start live-tailing VS Code session
+    fetch('/api/session/watch', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: chatInit.sessionId }),
+    }).catch(() => {})
     fetch(`/api/history/${chatInit.sessionId}`)
       .then(r => r.json())
       .then(d => {
         const hist = (d.messages ?? []).map(m => ({ ...m, historical: true }))
-        setMessages([
-          ...hist,
-          { role: 'system', text: `─── 以上為歷史紀錄，從此繼續 ───`, ts: Date.now() },
-        ])
+        setMessages(prev => {
+          const newStream = prev.filter(m => !m.historical && m.role !== 'system')
+          return [...hist, { role: 'system', text: '─── 以上為歷史紀錄，從此繼續 ───', ts: Date.now() }, ...newStream]
+        })
       })
       .catch(() => setMessages([{ role: 'system', text: '歷史紀錄載入失敗', ts: Date.now() }]))
   }, [chatInit])
 
-  // Process incoming stream events
+  // Process incoming stream events (subprocess)
   useEffect(() => {
     if (!streamEvents.length) return
     const ev = streamEvents[streamEvents.length - 1]
-    if (ev.projectPath !== projectPath) return
+    // session_live: VS Code live tail messages
+    if (ev.type === 'session_live' && ev.sessionId === sessionId) {
+      setMessages(prev => [...prev, ...ev.messages.map(m => ({ ...m, live: true }))])
+      return
+    }
+    if (normPath(ev.projectPath) !== normPath(projectPath)) return
     const { event } = ev
 
     if (event.type === 'system' && event.subtype === 'init') {
@@ -701,7 +728,7 @@ function ChatPanel({ send, streamEvents, chatInit }) {
     } else if (event.type === 'done') {
       setRunning(false)
     }
-  }, [streamEvents, projectPath])
+  }, [streamEvents, projectPath, sessionId])
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
 
@@ -910,7 +937,11 @@ function MobileSessionsPanel({ sessions, selectedId, setSelectedId, setActiveTab
       <div className="flex-1 overflow-y-auto py-1 px-1">
         {sessions.map(s => (
           <SessionItem key={s.id} session={s} isSelected={s.id === selectedId}
-            onClick={() => { setSelectedId(s.id); setActiveTab('chat') }}
+            onClick={() => {
+              setSelectedId(s.id)
+              setActiveTab('chat')
+              if (s.cwd) onContinue({ sessionId: s.id, projectPath: s.cwd })
+            }}
             onDoubleClick={() => {}}
           />
         ))}
@@ -1026,7 +1057,7 @@ export default function App() {
       setSessions(prev => prev.filter(s => s.id !== msg.sessionId))
       setSelectedId(prev => prev === msg.sessionId ? null : prev)
     }
-    if (msg.type === 'claude_stream') {
+    if (msg.type === 'claude_stream' || msg.type === 'session_live') {
       setStreamEvents(prev => [...prev.slice(-200), msg])
     }
   })
@@ -1131,7 +1162,10 @@ export default function App() {
                     key={s.id}
                     session={s}
                     isSelected={s.id === selectedId}
-                    onClick={() => setSelectedId(s.id)}
+                    onClick={() => {
+                      setSelectedId(s.id)
+                      if (s.cwd) handleContinueInChat({ sessionId: s.id, projectPath: s.cwd })
+                    }}
                     onDoubleClick={() => { setRenamingId(s.id); setRenameVal(s.displayName) }}
                   />
                 )
@@ -1171,7 +1205,7 @@ export default function App() {
           {/* Tab content */}
           <div className="flex-1 overflow-hidden min-h-0 flex flex-col">
             {activeTab === 'chat' && (
-              <ChatPanel send={send} streamEvents={streamEvents} chatInit={chatInit} />
+              <ChatPanel streamEvents={streamEvents} chatInit={chatInit} />
             )}
             {activeTab === 'tasks' && (
               <div className="py-2 px-2 h-full">

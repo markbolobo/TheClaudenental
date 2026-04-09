@@ -482,25 +482,46 @@ app.get('/api/history', async () => {
         const fullPath = path.join(projPath, file)
         const stat = fs.statSync(fullPath)
         // Read ai-title, cwd, and first user message
-        let title = null, firstMsg = null, cwd = null
+        let title = null, firstMsg = null, cwd = null, costUsd = null
         try {
           const lines = fs.readFileSync(fullPath, 'utf-8').split('\n').filter(Boolean)
+          let totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0
           for (const l of lines) {
-            const obj = JSON.parse(l)
-            if (!cwd && obj.cwd) cwd = obj.cwd
-            if (obj.type === 'ai-title' && obj.aiTitle) { title = obj.aiTitle }
+            try {
+              const obj = JSON.parse(l)
+              if (!cwd && obj.cwd) cwd = obj.cwd
+              if (obj.type === 'ai-title' && obj.aiTitle) title = obj.aiTitle
+              // Subprocess sessions: result event has total_cost_usd
+              if (obj.type === 'result' && typeof obj.total_cost_usd === 'number') {
+                costUsd = (costUsd ?? 0) + obj.total_cost_usd
+              }
+              // VS Code sessions: sum token usage from assistant events
+              if (obj.type === 'assistant' && obj.message?.usage) {
+                const u = obj.message.usage
+                totalInput += u.input_tokens ?? 0
+                totalOutput += u.output_tokens ?? 0
+                totalCacheRead += u.cache_read_input_tokens ?? 0
+                totalCacheWrite += u.cache_creation_input_tokens ?? 0
+              }
+            } catch {}
+          }
+          // If no result event found, estimate from token usage (Sonnet 4.6 pricing)
+          if (costUsd === null && (totalInput + totalOutput + totalCacheRead) > 0) {
+            costUsd = (totalInput * 3 + totalOutput * 15 + totalCacheRead * 0.3 + totalCacheWrite * 3.75) / 1e6
           }
           for (const l of lines) {
-            const obj = JSON.parse(l)
-            if (obj.type === 'user') {
-              const c = obj.message?.content
-              const text = typeof c === 'string' ? c : c?.[0]?.text ?? ''
-              const clean = text.replace(/^(\s*<[^>]+>[\s\S]*?<\/[^>]+>\s*)+/, '').trim()
-              if (clean) { firstMsg = clean.slice(0, 60); break }
-            }
+            try {
+              const obj = JSON.parse(l)
+              if (obj.type === 'user') {
+                const c = obj.message?.content
+                const text = typeof c === 'string' ? c : c?.[0]?.text ?? ''
+                const clean = text.replace(/^(\s*<[^>]+>[\s\S]*?<\/[^>]+>\s*)+/, '').trim()
+                if (clean) { firstMsg = clean.slice(0, 60); break }
+              }
+            } catch {}
           }
         } catch {}
-        result.push({ sessionId, project: proj, cwd, title: title ?? firstMsg ?? sessionId.slice(0,8), mtime: stat.mtimeMs, size: stat.size })
+        result.push({ sessionId, project: proj, cwd, title: title ?? firstMsg ?? sessionId.slice(0,8), mtime: stat.mtimeMs, size: stat.size, costUsd })
       }
     }
   } catch {}
@@ -520,24 +541,112 @@ app.get('/api/history/:sessionId', async (request) => {
   } catch {}
   if (!filePath) return { ok: false, messages: [] }
   const messages = []
+  let costUsd = null
+  let totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0
   try {
     const lines = fs.readFileSync(filePath, 'utf-8').split('\n').filter(Boolean)
     for (const l of lines) {
-      const obj = JSON.parse(l)
-      if (obj.type === 'user') {
-        const c = obj.message?.content
-        const text = typeof c === 'string' ? c : (Array.isArray(c) ? c.filter(x=>x.type==='text').map(x=>x.text).join('') : '')
-        const clean = text.replace(/^(\s*<[^>]+>[\s\S]*?<\/[^>]+>\s*)+/, '').trim()
-        if (clean) messages.push({ role: 'user', text: clean, ts: obj.timestamp })
-      }
-      if (obj.type === 'assistant') {
-        const c = obj.message?.content
-        const text = Array.isArray(c) ? c.filter(x=>x.type==='text').map(x=>x.text).join('') : ''
-        if (text.trim()) messages.push({ role: 'assistant', text: text.trim(), ts: obj.timestamp })
-      }
+      try {
+        const obj = JSON.parse(l)
+        if (obj.type === 'user') {
+          const c = obj.message?.content
+          const text = typeof c === 'string' ? c : (Array.isArray(c) ? c.filter(x=>x.type==='text').map(x=>x.text).join('') : '')
+          const clean = text.replace(/^(\s*<[^>]+>[\s\S]*?<\/[^>]+>\s*)+/, '').trim()
+          if (clean) messages.push({ role: 'user', text: clean, ts: obj.timestamp })
+        }
+        if (obj.type === 'assistant') {
+          const c = obj.message?.content
+          const text = Array.isArray(c) ? c.filter(x=>x.type==='text').map(x=>x.text).join('') : ''
+          if (text.trim()) messages.push({ role: 'assistant', text: text.trim(), ts: obj.timestamp })
+          if (obj.message?.usage) {
+            const u = obj.message.usage
+            totalInput += u.input_tokens ?? 0
+            totalOutput += u.output_tokens ?? 0
+            totalCacheRead += u.cache_read_input_tokens ?? 0
+            totalCacheWrite += u.cache_creation_input_tokens ?? 0
+          }
+        }
+        if (obj.type === 'result' && typeof obj.total_cost_usd === 'number') {
+          costUsd = (costUsd ?? 0) + obj.total_cost_usd
+        }
+      } catch {}
+    }
+    if (costUsd === null && (totalInput + totalOutput + totalCacheRead) > 0) {
+      costUsd = (totalInput * 3 + totalOutput * 15 + totalCacheRead * 0.3 + totalCacheWrite * 3.75) / 1e6
     }
   } catch {}
-  return { ok: true, messages: messages.slice(-500) }
+  return { ok: true, messages: messages.slice(-500), costUsd }
+})
+
+// ─── VS Code session live tail ────────────────────────────────────────────────
+
+const watchedSessions = new Map() // sessionId → { watcher, filePath, lineCount }
+
+function findJsonlPath(sessionId) {
+  const projectsDir = path.join(CLAUDE_DIR, 'projects')
+  try {
+    for (const proj of fs.readdirSync(projectsDir)) {
+      const candidate = path.join(projectsDir, proj, `${sessionId}.jsonl`)
+      if (fs.existsSync(candidate)) return candidate
+    }
+  } catch {}
+  return null
+}
+
+function parseNewLines(filePath, fromLine) {
+  try {
+    const lines = fs.readFileSync(filePath, 'utf-8').split('\n').filter(Boolean)
+    const newLines = lines.slice(fromLine)
+    const messages = []
+    for (const l of newLines) {
+      try {
+        const obj = JSON.parse(l)
+        if (obj.type === 'user') {
+          const c = obj.message?.content
+          const text = typeof c === 'string' ? c : c?.[0]?.text ?? ''
+          const clean = text.replace(/^(\s*<[^>]+>[\s\S]*?<\/[^>]+>\s*)+/, '').trim()
+          if (clean) messages.push({ role: 'user', text: clean, ts: obj.timestamp })
+        } else if (obj.type === 'assistant') {
+          const c = obj.message?.content
+          const text = Array.isArray(c) ? c.filter(x => x.type === 'text').map(x => x.text).join('') : ''
+          if (text.trim()) messages.push({ role: 'assistant', text: text.trim(), ts: obj.timestamp })
+        }
+      } catch {}
+    }
+    return { lineCount: lines.length, messages }
+  } catch {}
+  return null
+}
+
+app.post('/api/session/watch', async (request) => {
+  const { sessionId } = request.body
+  if (!sessionId) return { ok: false }
+  // Stop watching previous session if different
+  for (const [id, w] of watchedSessions) {
+    if (id !== sessionId) { try { w.watcher.close() } catch {}; watchedSessions.delete(id) }
+  }
+  if (watchedSessions.has(sessionId)) return { ok: true }
+  const filePath = findJsonlPath(sessionId)
+  if (!filePath) return { ok: false, error: 'not found' }
+  const initial = parseNewLines(filePath, 0)
+  const lineCount = initial?.lineCount ?? 0
+  const watcher = fs.watchFile(filePath, { interval: 1500 }, () => {
+    const entry = watchedSessions.get(sessionId)
+    if (!entry) return
+    const result = parseNewLines(filePath, entry.lineCount)
+    if (!result || !result.messages.length) return
+    entry.lineCount = result.lineCount
+    broadcast({ type: 'session_live', sessionId, messages: result.messages })
+  })
+  watchedSessions.set(sessionId, { watcher, filePath, lineCount })
+  return { ok: true }
+})
+
+app.post('/api/session/unwatch', async (request) => {
+  const { sessionId } = request.body
+  const entry = watchedSessions.get(sessionId)
+  if (entry) { try { fs.unwatchFile(entry.filePath) } catch {}; watchedSessions.delete(sessionId) }
+  return { ok: true }
 })
 
 // ─── CLAUDE.md API ────────────────────────────────────────────────────────────
@@ -580,10 +689,15 @@ app.post('/api/claudemd', async (request) => {
 // Validate hash: only hex, 7-40 chars
 const SAFE_HASH = /^[0-9a-f]{7,40}$/i
 
-// Validate cwd is an existing directory
+// Validate cwd is an existing directory (normalize slashes for Windows)
 function isSafeCwd(cwd) {
   if (!cwd || typeof cwd !== 'string') return false
-  try { return fs.statSync(cwd).isDirectory() } catch { return false }
+  const normalized = cwd.replace(/\//g, path.sep)
+  try { return fs.statSync(normalized).isDirectory() } catch { return false }
+}
+
+function normalizePath(p) {
+  return (p ?? '').replace(/\\/g, '/').toLowerCase().replace(/\/$/, '')
 }
 
 // Atomic JSON write — prevents race with Claudia
@@ -756,19 +870,19 @@ function spawnClaude(projectPath, prompt, sessionId = null) {
         }
         // Skip hook noise
         if (event.type === 'system' && (event.subtype === 'hook_started' || event.subtype === 'hook_response')) continue
-        broadcast({ type: 'claude_stream', projectPath, event })
+        broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath), event })
       } catch {}
     }
   })
 
   proc.stderr.on('data', chunk => {
     const text = chunk.toString().trim()
-    if (text) broadcast({ type: 'claude_stream', projectPath, event: { type: 'stderr', text } })
+    if (text) broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath), event: { type: 'stderr', text } })
   })
 
   proc.on('close', code => {
     entry.status = 'done'
-    broadcast({ type: 'claude_stream', projectPath, event: { type: 'done', exitCode: code } })
+    broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath), event: { type: 'done', exitCode: code } })
     setTimeout(() => { if (claudeProcs.get(projectPath) === entry) claudeProcs.delete(projectPath) }, 10_000)
   })
 
@@ -776,11 +890,12 @@ function spawnClaude(projectPath, prompt, sessionId = null) {
 }
 
 app.post('/api/claude/run', async (request) => {
-  const { projectPath, prompt, sessionId } = request.body
+  const { projectPath: rawPath, prompt, sessionId } = request.body
   if (!prompt) return { ok: false, error: 'missing prompt' }
+  const projectPath = rawPath?.replace(/\//g, path.sep) // normalize to OS path sep
   if (!isSafeCwd(projectPath)) return { ok: false, error: 'invalid projectPath' }
   const entry = spawnClaude(projectPath, prompt, sessionId ?? null)
-  return { ok: true, projectPath, sessionId: entry.sessionId }
+  return { ok: true, projectPath: normalizePath(projectPath), sessionId: entry.sessionId }
 })
 
 app.post('/api/claude/stop', async (request) => {
