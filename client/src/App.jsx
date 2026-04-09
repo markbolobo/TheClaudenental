@@ -1272,6 +1272,15 @@ export default function App() {
     if (msg.type === 'session') {
       // Auto-watch when a session becomes active
       if (msg.session?.status === 'active') autoWatch(msg.session.id)
+      // Cancel armed auto-resume if session woke up on its own (credits added / account switched)
+      if (msg.session?.status !== 'sleeping') {
+        setAutoResumeMap(prev => {
+          if (!prev[msg.session.id]?.enabled) return prev
+          const next = { ...prev }
+          delete next[msg.session.id]
+          return next
+        })
+      }
       // When session finishes, pull final cost from server (covers externally-ended sessions)
       if (msg.session?.status === 'done') {
         fetch(`/api/history/${msg.session.id}`).then(r => r.json()).then(d => {
