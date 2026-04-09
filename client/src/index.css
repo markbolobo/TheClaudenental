@@ -85,3 +85,51 @@ body {
   100% { opacity: 0.3; }
 }
 .shimmer { animation: shimmer 3s ease-in-out infinite; }
+
+/* ── Bounty overlay fade-in ── */
+@keyframes overlay-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.overlay-in { animation: overlay-fade-in 0.35s ease forwards; }
+
+/* ── Toast slide-in from right ── */
+@keyframes toast-enter-kf {
+  from { opacity: 0; transform: translateX(120%); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.toast-enter { animation: toast-enter-kf 0.35s cubic-bezier(0.22,1,0.36,1) forwards; }
+
+/* ── Banner drop from top ── */
+@keyframes banner-drop-kf {
+  from { opacity: 0; transform: translateY(-110%); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.banner-drop { animation: banner-drop-kf 0.4s cubic-bezier(0.22,1,0.36,1) forwards; }
+
+/* ── Gold coin stamp ── */
+@keyframes stamp-in-kf {
+  0%   { opacity: 0; transform: scale(1.8) rotate(-12deg); }
+  60%  { opacity: 1; transform: scale(0.92) rotate(2deg); }
+  80%  { transform: scale(1.04) rotate(-1deg); }
+  100% { transform: scale(1) rotate(0deg); }
+}
+.stamp-in { animation: stamp-in-kf 0.5s cubic-bezier(0.22,1,0.36,1) forwards; }
+
+/* ── Screen shake for S3 ── */
+@keyframes screen-shake-kf {
+  0%,100% { transform: translate(0,0); }
+  15%  { transform: translate(-5px, 3px); }
+  30%  { transform: translate(5px, -3px); }
+  45%  { transform: translate(-4px, 2px); }
+  60%  { transform: translate(4px, -2px); }
+  75%  { transform: translate(-3px, 1px); }
+  90%  { transform: translate(2px, -1px); }
+}
+.screen-shake { animation: screen-shake-kf 0.55s ease both; }
+
+/* ── Gold particle fall ── */
+@keyframes gold-particle-fall {
+  0%   { transform: translateY(0) rotate(0deg); opacity: var(--op, 0.7); }
+  100% { transform: translateY(100vh) rotate(360deg); opacity: 0; }
+}

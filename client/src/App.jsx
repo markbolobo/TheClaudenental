@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { useCostEngine, BountyOverlay, BountyToast, ContractModal, fmtCost, tierKey } from './BountySystem.jsx'
+import BountySettings from './BountySettings.jsx'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -41,11 +43,12 @@ function StatusDot({ status }) {
   return <span className={`text-xs ${cls}`}>{STATUS_ICON[status] ?? '?'}</span>
 }
 
-function SessionItem({ session, isSelected, onClick, onDoubleClick }) {
+function SessionItem({ session, isSelected, onClick, onDoubleClick, liveCost, onCostClick }) {
   const base = 'flex items-center gap-2 px-3 py-2 rounded cursor-pointer transition-all'
   const selected = isSelected
     ? 'bg-[var(--surface-2)] session-active-glow'
     : 'hover:bg-[var(--surface-2)]'
+  const displayCost = liveCost ?? session.costUsd ?? null
   return (
     <div className={`${base} ${selected}`} onClick={onClick} onDoubleClick={onDoubleClick}>
       <StatusDot status={session.status} />
@@ -53,8 +56,16 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick }) {
         <div className="truncate text-[var(--text-h)] text-xs leading-tight">
           {session.displayName}
         </div>
-        <div className="truncate text-[var(--text-muted)] text-[10px]">
-          {elapsed(session.startedAt)} ago
+        <div className="flex items-center gap-1.5 text-[10px] text-[var(--text-muted)]">
+          <span>{elapsed(session.startedAt)} ago</span>
+          {displayCost != null && (
+            <button
+              onClick={e => { e.stopPropagation(); onCostClick?.() }}
+              className="ml-auto shrink-0 tabular-nums text-[var(--gold)]/80 hover:text-[var(--gold)] transition-colors
+                border-b border-[var(--gold)]/20 hover:border-[var(--gold)]/60 leading-tight text-[9px]">
+              {fmtCost(displayCost)}
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -321,11 +332,6 @@ function HistoryMessage({ message: m }) {
   )
 }
 
-function fmtCost(usd) {
-  if (usd == null) return null
-  if (usd < 0.01) return `$${(usd * 100).toFixed(2)}¢`
-  return `$${usd.toFixed(3)}`
-}
 
 function HistoryPanel({ onContinue }) {
   const [list, setList] = useState([])
@@ -1015,6 +1021,49 @@ export default function App() {
   const [streamEvents, setStreamEvents] = useState([])
   const [chatInit, setChatInit] = useState(null)
 
+  // ── Bounty system ────────────────────────────────────────────────────────
+  const [bountySettings, setBountySettings]     = useState({})
+  const [animQueue, setAnimQueue]               = useState([])   // [{tier,level,delta,total,key,sessionName}]
+  const [currentAnim, setCurrentAnim]           = useState(null)
+  const [showBountySettings, setShowBountySettings] = useState(false)
+  const [contractModal, setContractModal]       = useState(null) // { sessionName, costData }
+  const [liveCosts, setLiveCosts]               = useState({})   // { [normPath]: total }
+
+  // Load bounty settings once
+  useEffect(() => {
+    fetch('/api/bounty/settings').then(r => r.json()).then(setBountySettings).catch(() => {})
+  }, [])
+
+  // Cost engine — receives stream events and fires animation triggers
+  const costSnap = useCostEngine(streamEvents, (anim) => {
+    // Attach session name for C tier
+    const normCwd = anim.key
+    const sess = sessions.find(s => normPath(s.cwd) === normCwd)
+    setAnimQueue(q => [...q, { ...anim, sessionName: sess?.displayName ?? '' }])
+    setLiveCosts(prev => ({ ...prev, [normCwd]: anim.total }))
+  })
+
+  // Drain animation queue one at a time
+  useEffect(() => {
+    if (currentAnim || animQueue.length === 0) return
+    const [next, ...rest] = animQueue
+    setAnimQueue(rest)
+    setCurrentAnim(next)
+  }, [animQueue, currentAnim])
+
+  function handleAnimDone() { setCurrentAnim(null) }
+
+  function normPath(p) { return (p ?? '').replace(/\\/g, '/').toLowerCase().replace(/\/$/, '') }
+
+  // Determine anim component type
+  const animTier  = currentAnim?.tier
+  const animLevel = currentAnim?.level
+  const isToast   = animTier === 'L' && (animLevel === 3 || animLevel === 4)
+  const isOverlay = (animTier === 'L' && animLevel && animLevel < 3)
+    ? false
+    : animTier != null && !(animTier === 'L' && animLevel < 3)
+  // L1/L2 = badge flash only (handled inline in SessionItem via liveCosts)
+
   function handleContinueInChat({ sessionId, projectPath }) {
     setChatInit({ sessionId, projectPath })
     setActiveTab('chat')
@@ -1105,6 +1154,24 @@ export default function App() {
   return (
     <div className="flex flex-col h-full bg-[var(--bg)] text-[var(--text)]">
 
+      {/* ── Bounty overlays ── */}
+      {isToast && currentAnim && (
+        <BountyToast anim={currentAnim} settings={bountySettings} onDone={handleAnimDone} />
+      )}
+      {isOverlay && currentAnim && (
+        <BountyOverlay anim={currentAnim} settings={bountySettings} onDone={handleAnimDone} />
+      )}
+      {contractModal && (
+        <ContractModal
+          sessionName={contractModal.sessionName}
+          costData={contractModal.costData}
+          onClose={() => setContractModal(null)}
+        />
+      )}
+      {showBountySettings && (
+        <BountySettings onClose={() => setShowBountySettings(false)} />
+      )}
+
       {/* ── Top bar ── */}
       <header className="flex items-center gap-3 px-4 py-2 border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
         <span className="text-[var(--gold)] font-semibold tracking-widest text-xs uppercase">
@@ -1119,6 +1186,12 @@ export default function App() {
         <span className="text-[10px] text-[var(--text-muted)]">
           {sessions.filter(s => s.status === 'active').length} active · {sessions.length} sessions
         </span>
+        <button
+          onClick={() => setShowBountySettings(true)}
+          title="Bounty Announcement Settings"
+          className="text-[9px] text-[var(--text-muted)] hover:text-[var(--gold)] border border-[var(--border)] hover:border-[var(--gold-border)] rounded-sm px-1.5 py-0.5 transition-colors tracking-wide uppercase">
+          ⚙ Bounty
+        </button>
       </header>
 
       {/* ── Main layout ── */}
@@ -1162,11 +1235,16 @@ export default function App() {
                     key={s.id}
                     session={s}
                     isSelected={s.id === selectedId}
+                    liveCost={liveCosts[normPath(s.cwd)] ?? null}
                     onClick={() => {
                       setSelectedId(s.id)
                       if (s.cwd) handleContinueInChat({ sessionId: s.id, projectPath: s.cwd })
                     }}
                     onDoubleClick={() => { setRenamingId(s.id); setRenameVal(s.displayName) }}
+                    onCostClick={() => {
+                      const costData = costSnap[normPath(s.cwd)] ?? null
+                      setContractModal({ sessionName: s.displayName, costData })
+                    }}
                   />
                 )
             ))}

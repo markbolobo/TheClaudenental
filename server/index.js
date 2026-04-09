@@ -1,5 +1,6 @@
 import Fastify from 'fastify'
 import wsPlugin from '@fastify/websocket'
+import multipart from '@fastify/multipart'
 import fs from 'fs'
 import path from 'path'
 import { spawnSync, spawn } from 'child_process'
@@ -11,6 +12,7 @@ const CLAUDIA_URL = 'http://localhost:48901'
 
 const app = Fastify({ logger: false })
 await app.register(wsPlugin)
+await app.register(multipart, { limits: { fileSize: 100 * 1024 * 1024 } }) // 100 MB
 
 // ─── Claude Binary Auto-detect ───────────────────────────────────────────────
 
@@ -910,6 +912,87 @@ app.get('/api/claude/processes', async () => ({
     projectPath: p, sessionId: e.sessionId, status: e.status,
   }))
 }))
+
+// ─── Bounty Assets ────────────────────────────────────────────────────────────
+
+const BOUNTY_DIR      = path.join(os.homedir(), '.claude', 'theclaudenental-bounty')
+const BOUNTY_ASSETS   = path.join(BOUNTY_DIR, 'assets')
+const BOUNTY_SETTINGS = path.join(BOUNTY_DIR, 'settings.json')
+
+if (!fs.existsSync(BOUNTY_ASSETS)) fs.mkdirSync(BOUNTY_ASSETS, { recursive: true })
+
+const MEDIA_EXTS = { image: ['.jpg','.jpeg','.png','.webp','.gif'], video: ['.mp4','.webm'], audio: ['.mp3','.ogg','.wav','.m4a'] }
+function assetFilename(tier, assetType) {
+  // Find existing file with any supported extension
+  const exts = MEDIA_EXTS[assetType] ?? []
+  for (const ext of exts) {
+    const p = path.join(BOUNTY_ASSETS, `${tier}-${assetType}${ext}`)
+    if (fs.existsSync(p)) return p
+  }
+  return null
+}
+
+// GET settings
+app.get('/api/bounty/settings', async () => {
+  try { return JSON.parse(fs.readFileSync(BOUNTY_SETTINGS, 'utf-8')) } catch { return {} }
+})
+
+// POST settings
+app.post('/api/bounty/settings', async (request) => {
+  fs.writeFileSync(BOUNTY_SETTINGS, JSON.stringify(request.body, null, 2))
+  return { ok: true }
+})
+
+// GET asset file
+app.get('/api/bounty/asset/:tier/:type', async (request, reply) => {
+  const { tier, type } = request.params
+  const fp = assetFilename(tier, type)
+  if (!fp) return reply.status(404).send({ error: 'not found' })
+  const ext  = path.extname(fp).toLowerCase()
+  const mime = {
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+    '.webp': 'image/webp', '.gif': 'image/gif',
+    '.mp4': 'video/mp4', '.webm': 'video/webm',
+    '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg', '.wav': 'audio/wav', '.m4a': 'audio/mp4',
+  }[ext] ?? 'application/octet-stream'
+  reply.header('Content-Type', mime)
+  reply.header('Cache-Control', 'no-cache')
+  return reply.send(fs.createReadStream(fp))
+})
+
+// POST upload asset
+app.post('/api/bounty/upload', async (request, reply) => {
+  const data     = await request.file()
+  if (!data) return reply.status(400).send({ error: 'no file' })
+  const tier      = data.fields?.tier?.value
+  const assetType = data.fields?.assetType?.value   // 'media' | 'audio'
+  if (!tier || !assetType) return reply.status(400).send({ error: 'missing tier or assetType' })
+
+  const ext = path.extname(data.filename).toLowerCase()
+  const allowed = [...MEDIA_EXTS.image, ...MEDIA_EXTS.video, ...MEDIA_EXTS.audio]
+  if (!allowed.includes(ext)) return reply.status(400).send({ error: 'unsupported file type' })
+
+  // Remove existing asset of same tier+type (any ext)
+  const existing = assetFilename(tier, assetType)
+  if (existing) try { fs.unlinkSync(existing) } catch {}
+
+  const dest = path.join(BOUNTY_ASSETS, `${tier}-${assetType}${ext}`)
+  const buf  = await data.toBuffer()
+  fs.writeFileSync(dest, buf)
+
+  // Detect category: image / video / audio
+  const category = MEDIA_EXTS.image.includes(ext) ? 'image'
+    : MEDIA_EXTS.video.includes(ext) ? 'video' : 'audio'
+  return { ok: true, filename: `${tier}-${assetType}${ext}`, category }
+})
+
+// DELETE asset
+app.delete('/api/bounty/asset/:tier/:type', async (request) => {
+  const { tier, type } = request.params
+  const fp = assetFilename(tier, type)
+  if (fp) try { fs.unlinkSync(fp) } catch {}
+  return { ok: true }
+})
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 
