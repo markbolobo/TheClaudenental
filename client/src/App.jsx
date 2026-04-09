@@ -43,7 +43,69 @@ function StatusDot({ status }) {
   return <span className={`text-xs ${cls}`}>{STATUS_ICON[status] ?? '?'}</span>
 }
 
-function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick, autoResumeArmed, onToggleAutoResume }) {
+// ─── Activity Heat ────────────────────────────────────────────────────────────
+// Heat thresholds (USD) — colour shifts cold→warm→hot→critical
+const HEAT_MAX_5H  = 10   // $10 in 5h  = full bar
+const HEAT_MAX_7D  = 50   // $50 in 7d  = full bar
+
+function heatColor(ratio) {
+  if (ratio < 0.25) return { bar: '#22d3ee', glow: 'rgba(34,211,238,0.4)' }   // cyan — cold
+  if (ratio < 0.55) return { bar: '#c9a227', glow: 'rgba(201,162,39,0.45)' }   // gold — warm
+  if (ratio < 0.80) return { bar: '#f97316', glow: 'rgba(249,115,22,0.50)' }   // orange — hot
+  return                  { bar: '#ef4444', glow: 'rgba(239,68,68,0.60)' }       // red — critical
+}
+
+function ActivityHeat() {
+  const [heat, setHeat] = useState(null)
+
+  useEffect(() => {
+    function load() {
+      fetch('/api/usage/heat').then(r => r.json()).then(setHeat).catch(() => {})
+    }
+    load()
+    const id = setInterval(load, 30_000)
+    return () => clearInterval(id)
+  }, [])
+
+  if (!heat) return null
+  const { session5h, weekly7d } = heat
+
+  function HeatBar({ label, window, cost, max }) {
+    const ratio = Math.min(cost / max, 1)
+    const pct   = (ratio * 100).toFixed(0)
+    const c     = heatColor(ratio)
+    return (
+      <div className="space-y-0.5">
+        <div className="flex items-center justify-between">
+          <span className="text-[8px] tracking-[0.18em] uppercase"
+            style={{ color: c.bar }}>{label}</span>
+          <span className="text-[8px] tabular-nums font-mono"
+            style={{ color: c.bar }}>{fmtCost(cost) ?? '$0.00'}</span>
+        </div>
+        <div className="h-[3px] rounded-full bg-[var(--border)] overflow-hidden">
+          <div className="h-full rounded-full transition-all duration-700"
+            style={{ width: `${pct}%`, background: c.bar, boxShadow: `0 0 6px ${c.glow}` }} />
+        </div>
+        <div className="text-[7px] text-[var(--text-muted)] tracking-wider">{window}</div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="mx-2 mt-2 mb-1 px-2.5 py-2 rounded-sm border border-[var(--border)]
+      bg-[var(--surface-2)]">
+      <div className="text-[7px] text-[var(--text-muted)] tracking-[0.3em] uppercase mb-2 text-center">
+        ── Activity Heat ──
+      </div>
+      <div className="space-y-2">
+        <HeatBar label="Session"  window="5 hr window" cost={session5h.cost} max={HEAT_MAX_5H} />
+        <HeatBar label="Profile"  window="7 day window" cost={weekly7d.cost}  max={HEAT_MAX_7D} />
+      </div>
+    </div>
+  )
+}
+
+function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick, autoResumeArmed, onToggleAutoResume, hitLimit }) {
   const base = 'flex items-center gap-2 px-3 py-2 rounded cursor-pointer transition-all'
   const selectedCls = isSelected
     ? 'bg-[var(--surface-2)] session-active-glow'
@@ -121,8 +183,8 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick,
             </div>
           )}
 
-          {/* Auto-resume toggle — only visible when sleeping */}
-          {session.status === 'sleeping' && (
+          {/* Auto-resume toggle — visible when sleeping OR when usage limit hit */}
+          {(session.status === 'sleeping' || hitLimit) && (
             <button
               onClick={e => { e.stopPropagation(); onToggleAutoResume?.() }}
               title={autoResumeArmed ? '自動繼續 ON — 點擊取消' : '設定整點自動繼續'}
@@ -299,46 +361,6 @@ function CharacterZone({ status }) {
       <div className={`text-5xl leading-none ${mood.color}`}>{mood.emoji}</div>
       <div className={`text-[10px] uppercase tracking-widest ${mood.color}`}>{mood.label}</div>
       <div className="text-[10px] text-[var(--text-muted)] mt-1">The Continental</div>
-    </div>
-  )
-}
-
-function InputBar({ onSend, className = '' }) {
-  const [value, setValue] = useState('')
-  const textRef = useRef(null)
-
-  function handleKey(e) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      submit()
-    }
-  }
-
-  function submit() {
-    const trimmed = value.trim()
-    if (!trimmed) return
-    onSend(trimmed)
-    setValue('')
-  }
-
-  return (
-    <div className={`flex items-end gap-2 px-3 py-2 border-t border-[var(--border)] bg-[var(--surface)] ${className}`}>
-      <textarea
-        ref={textRef}
-        value={value}
-        onChange={e => setValue(e.target.value)}
-        onKeyDown={handleKey}
-        placeholder="/task <標題> 新增任務　或直接輸入訊息 (Enter 送出)"
-        rows={1}
-        className="flex-1 resize-none bg-[var(--surface-2)] border border-[var(--border)] rounded px-3 py-2 text-xs text-[var(--text-h)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--gold)] min-h-[36px] max-h-[120px] overflow-y-auto"
-        style={{ fieldSizing: 'content' }}
-      />
-      <button
-        onClick={submit}
-        className="shrink-0 px-3 py-2 rounded bg-[var(--gold-dim)] border border-[var(--gold-border)] text-[var(--gold)] text-xs hover:bg-[var(--gold)] hover:text-black transition-colors"
-      >
-        Send
-      </button>
     </div>
   )
 }
@@ -730,10 +752,14 @@ function CheckpointsPanel({ selected }) {
 
 function normPath(p) { return (p ?? '').replace(/\\/g, '/').toLowerCase().replace(/\/$/, '') }
 
-function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
+function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) {
   const [projectPath, setProjectPath] = useState('C:/Project/RomanPrototype')
   const [input, setInput] = useState('')
   const [running, setRunning] = useState(false)
+  const [attachments, setAttachments] = useState([])  // [{ name, dataUrl, type }]
+  const [showAttachMenu, setShowAttachMenu] = useState(false)
+  const fileInputRef = useRef(null)
+  const attachMenuRef = useRef(null)
   const [sessionId, setSessionId] = useState(null)
   const [messages, setMessages] = useState([])
   const bottomRef = useRef(null)
@@ -814,9 +840,35 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
 
   async function handleSend() {
-    if (!input.trim() || running) return
-    const prompt = input.trim()
+    const text = input.trim()
+    if (!text && attachments.length === 0) return
+    if (running) return
+
+    // /task <title> — intercept, create task, show feedback in chat
+    if (text.startsWith('/task ') && attachments.length === 0) {
+      const title = text.slice(6).trim()
+      if (title && selectedId) {
+        await fetch(`/api/sessions/${selectedId}/tasks`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title, status: 'pending' }),
+        })
+        setMessages(m => [...m, { role: 'system', text: `✓ Task created: ${title}`, ts: Date.now() }])
+        onTaskCreated?.()
+      }
+      setInput('')
+      return
+    }
+
+    let prompt = text
+    // Append attachment references to prompt
+    if (attachments.length > 0) {
+      const refs = attachments.map(a => `[Attached: ${a.name}]`).join('\n')
+      prompt = prompt ? `${prompt}\n${refs}` : refs
+    }
+
     setInput('')
+    setAttachments([])
     setRunning(true)
     setMessages(m => [...m, { role: 'user', text: prompt, ts: Date.now() }])
     await fetch('/api/claude/run', {
@@ -836,8 +888,39 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
   }
 
   function handleKeyDown(e) {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) handleSend()
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
   }
+
+  function handlePaste(e) {
+    const items = Array.from(e.clipboardData?.items ?? [])
+    const imgItem = items.find(i => i.type.startsWith('image/'))
+    if (!imgItem) return
+    e.preventDefault()
+    const file = imgItem.getAsFile()
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = ev => setAttachments(prev => [...prev, { name: file.name || 'image.png', dataUrl: ev.target.result, type: file.type }])
+    reader.readAsDataURL(file)
+  }
+
+  function handleFileChange(e) {
+    const files = Array.from(e.target.files ?? [])
+    files.forEach(file => {
+      const reader = new FileReader()
+      reader.onload = ev => setAttachments(prev => [...prev, { name: file.name, dataUrl: ev.target.result, type: file.type }])
+      reader.readAsDataURL(file)
+    })
+    e.target.value = ''
+    setShowAttachMenu(false)
+  }
+
+  // Close attach menu on outside click
+  useEffect(() => {
+    if (!showAttachMenu) return
+    function handler(e) { if (!attachMenuRef.current?.contains(e.target)) setShowAttachMenu(false) }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [showAttachMenu])
 
   function clearChat() { setMessages([]); setSessionId(null) }
 
@@ -927,33 +1010,88 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
         <div ref={bottomRef} />
       </div>
 
-      {/* Input area — spawns Claude subprocess via /api/claude/run */}
-      <div className="shrink-0 border-t border-[var(--border)] p-2 flex gap-2">
-        <textarea
-          value={input}
-          onChange={e => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="輸入訊息… (Ctrl+Enter 送出)"
-          rows={3}
-          disabled={running}
-          className="flex-1 bg-[var(--surface)] border border-[var(--border)] rounded px-2 py-1.5 text-[11px] text-[var(--text)] resize-none outline-none placeholder:text-[var(--text-muted)] disabled:opacity-50"
-        />
-        <div className="flex flex-col gap-1">
-          <button
-            onClick={handleSend}
-            disabled={running || !input.trim()}
-            className="px-3 py-1.5 rounded bg-[var(--gold)]/20 border border-[var(--gold)]/50 text-[var(--gold)] text-[10px] hover:bg-[var(--gold)]/30 disabled:opacity-40"
-          >
-            送出
-          </button>
-          {running && (
+      {/* Input area */}
+      <div className="shrink-0 border-t border-[var(--border)] bg-[var(--surface)]">
+        {/* Attachment previews */}
+        {attachments.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 px-2 pt-2">
+            {attachments.map((a, i) => (
+              <div key={i} className="relative group">
+                {a.type.startsWith('image/') ? (
+                  <img src={a.dataUrl} alt={a.name}
+                    className="h-12 w-12 object-cover rounded border border-[var(--border)]" />
+                ) : (
+                  <div className="h-12 px-2 flex items-center rounded border border-[var(--border)] bg-[var(--surface-2)] text-[9px] text-[var(--text-muted)] max-w-[80px] truncate">
+                    {a.name}
+                  </div>
+                )}
+                <button onClick={() => setAttachments(prev => prev.filter((_, j) => j !== i))}
+                  className="absolute -top-1 -right-1 hidden group-hover:flex w-4 h-4 rounded-full bg-red-700 text-white text-[8px] items-center justify-center">✕</button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="p-2 flex gap-2 items-end">
+          {/* + button */}
+          <div className="relative" ref={attachMenuRef}>
             <button
-              onClick={handleStop}
-              className="px-3 py-1.5 rounded bg-red-900/30 border border-red-700/50 text-red-300 text-[10px] hover:bg-red-800/50"
-            >
-              停止
-            </button>
-          )}
+              onClick={() => setShowAttachMenu(v => !v)}
+              disabled={running}
+              className="w-7 h-7 flex items-center justify-center rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] hover:border-[var(--gold-border)] transition-colors text-sm disabled:opacity-40"
+              title="附加檔案 / 新增任務">+</button>
+            {showAttachMenu && (
+              <div className="absolute bottom-full left-0 mb-1 w-44 bg-[var(--surface-2)] border border-[var(--border)] rounded shadow-lg z-20 overflow-hidden">
+                <button onClick={() => { fileInputRef.current?.click() }}
+                  className="w-full text-left px-3 py-2 text-[10px] text-[var(--text)] hover:bg-[var(--surface)] flex items-center gap-2">
+                  <span>⬆</span> Upload from computer
+                </button>
+                <button onClick={() => {
+                  const title = window.prompt('Task title:')
+                  if (title?.trim() && selectedId) {
+                    fetch(`/api/sessions/${selectedId}/tasks`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ title: title.trim(), status: 'pending' }),
+                    }).then(() => {
+                      setMessages(m => [...m, { role: 'system', text: `✓ Task created: ${title.trim()}`, ts: Date.now() }])
+                      onTaskCreated?.()
+                    })
+                  }
+                  setShowAttachMenu(false)
+                }}
+                  className="w-full text-left px-3 py-2 text-[10px] text-[var(--text)] hover:bg-[var(--surface)] flex items-center gap-2 border-t border-[var(--border)]">
+                  <span>✓</span> Add task
+                </button>
+              </div>
+            )}
+            <input ref={fileInputRef} type="file" multiple accept="image/*,.pdf,.txt,.md,.json,.csv"
+              className="hidden" onChange={handleFileChange} />
+          </div>
+
+          <textarea
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
+            placeholder="輸入訊息… (Enter 送出，Shift+Enter 換行，/task <標題> 建任務)"
+            rows={3}
+            disabled={running}
+            className="flex-1 bg-[var(--surface)] border border-[var(--border)] rounded px-2 py-1.5 text-[11px] text-[var(--text)] resize-none outline-none placeholder:text-[var(--text-muted)] disabled:opacity-50"
+          />
+          <div className="flex flex-col gap-1 shrink-0">
+            <button
+              onClick={handleSend}
+              disabled={running || (!input.trim() && attachments.length === 0)}
+              className="px-3 py-1.5 rounded bg-[var(--gold)]/20 border border-[var(--gold)]/50 text-[var(--gold)] text-[10px] hover:bg-[var(--gold)]/30 disabled:opacity-40"
+            >送出</button>
+            {running && (
+              <button onClick={handleStop}
+                className="px-3 py-1.5 rounded bg-red-900/30 border border-red-700/50 text-red-300 text-[10px] hover:bg-red-800/50">
+                停止
+              </button>
+            )}
+          </div>
         </div>
       </div>
     </div>
@@ -1136,6 +1274,8 @@ export default function App() {
   // ── Auto-resume per-session state ────────────────────────────────────────
   // { [sessionId]: { enabled, message, fireAt } }
   const [autoResumeMap, setAutoResumeMap] = useState({})
+  // Sessions where usage limit was hit (shows ⏰ even if status != sleeping)
+  const [hitLimitSessions, setHitLimitSessions] = useState(new Set())
 
   // Global timer: fire any armed resumes when cooldown expires
   useEffect(() => {
@@ -1149,7 +1289,7 @@ export default function App() {
           if (now < ar.fireAt) continue
           // Time to fire — find session cwd
           const sess = sessions.find(s => s.id === sid)
-          if (sess?.cwd && sess.status === 'sleeping') {
+          if (sess?.cwd && (sess.status === 'sleeping' || hitLimitSessions.has(sid))) {
             fetch('/api/claude/run', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -1265,6 +1405,10 @@ export default function App() {
           delete next[msg.session.id]
           return next
         })
+        // Clear hit-limit flag once session becomes active again
+        if (msg.session?.status === 'active') {
+          setHitLimitSessions(prev => { const s = new Set(prev); s.delete(msg.session.id); return s })
+        }
       }
       // When session finishes, pull final cost from server (covers externally-ended sessions)
       if (msg.session?.status === 'done') {
@@ -1288,6 +1432,33 @@ export default function App() {
     }
     if (msg.type === 'claude_stream' || msg.type === 'session_live') {
       setStreamEvents(prev => [...prev.slice(-200), msg])
+
+      // Detect usage limit hit — auto-arm ⏰ button
+      const isLimit = (() => {
+        if (msg.type === 'session_live') {
+          return (msg.messages ?? []).some(m =>
+            typeof m.text === 'string' && m.text.includes("hit your limit")
+          )
+        }
+        if (msg.type === 'claude_stream') {
+          const ev = msg.event ?? msg
+          return typeof ev.text === 'string' && ev.text.includes("hit your limit")
+        }
+        return false
+      })()
+
+      if (isLimit) {
+        const sid = msg.sessionId
+        if (sid) {
+          setHitLimitSessions(prev => { const s = new Set(prev); s.add(sid); return s })
+          // Auto-arm auto-resume at next whole hour
+          setAutoResumeMap(prev => {
+            if (prev[sid]?.enabled) return prev  // already armed
+            const fireAt = nextWholeHourAfter(Date.now())
+            return { ...prev, [sid]: { enabled: true, message: '請繼續', fireAt, autoArmed: true } }
+          })
+        }
+      }
     }
   })
 
@@ -1309,26 +1480,6 @@ export default function App() {
       }
       return { ...s, tasks: updateTask(s.tasks) }
     }))
-  }
-
-  async function handleSend(text) {
-    if (!text.trim()) return
-    // /task <title> → create task via API
-    if (text.startsWith('/task ')) {
-      const title = text.slice(6).trim()
-      if (title && selectedId) {
-        await fetch(`/api/sessions/${selectedId}/tasks`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ title, status: 'pending' }),
-        })
-      }
-      return
-    }
-    send({ type: 'input', sessionId: selectedId, text })
-    setLogs(prev => [...prev.slice(-200), {
-      type: 'log', level: 'user', text: `> ${text}`, ts: Date.now(),
-    }])
   }
 
   return (
@@ -1389,6 +1540,7 @@ export default function App() {
               ✕
             </button>
           </div>
+          <ActivityHeat />
           <div className="flex-1 overflow-y-auto py-1 px-1">
             {sessions.map(s => (
               renamingId === s.id
@@ -1434,6 +1586,7 @@ export default function App() {
                     }}
                     autoResumeArmed={autoResumeMap[s.id]?.enabled === true}
                     onToggleAutoResume={() => toggleAutoResume(s.id)}
+                    hitLimit={hitLimitSessions.has(s.id)}
                   />
                 )
             ))}
@@ -1472,7 +1625,8 @@ export default function App() {
           {/* Tab content */}
           <div className="flex-1 overflow-hidden min-h-0 flex flex-col">
             {activeTab === 'chat' && (
-              <ChatPanel streamEvents={streamEvents} chatInit={chatInit} logs={logs} selectedId={selectedId} />
+              <ChatPanel streamEvents={streamEvents} chatInit={chatInit} logs={logs} selectedId={selectedId}
+                onTaskCreated={() => setActiveTab('tasks')} />
             )}
             {activeTab === 'tasks' && (
               <div className="py-2 px-2 h-full">
@@ -1494,7 +1648,6 @@ export default function App() {
             {activeTab === 'more'      && <MobileMorePanel selected={selected} send={send} logs={logs} sessions={sessions} />}
           </div>
 
-          <InputBar onSend={handleSend} className="hidden md:flex" />
         </main>
 
         {/* Right: Character + Gate summary — desktop only */}

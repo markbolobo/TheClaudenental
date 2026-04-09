@@ -415,6 +415,51 @@ app.post('/api/sessions/clear-inactive', async () => {
   return { ok: true, removed: removed.length }
 })
 
+// ── Activity Heat — time-windowed cost from JSONL files ──────────────────────
+app.get('/api/usage/heat', async () => {
+  const now    = Date.now()
+  const WIN_5H = 5  * 60 * 60 * 1000
+  const WIN_7D = 7  * 24 * 60 * 60 * 1000
+  let cost5h = 0, cost7d = 0, count5h = 0, count7d = 0
+
+  const claudeDir = path.join(os.homedir(), '.claude', 'projects')
+  if (!fs.existsSync(claudeDir)) return { session5h: { cost: 0, count: 0 }, weekly7d: { cost: 0, count: 0 }, updatedAt: now }
+
+  try {
+    for (const proj of fs.readdirSync(claudeDir)) {
+      const projDir = path.join(claudeDir, proj)
+      try { if (!fs.statSync(projDir).isDirectory()) continue } catch { continue }
+      for (const f of fs.readdirSync(projDir)) {
+        if (!f.endsWith('.jsonl')) continue
+        const fullPath = path.join(projDir, f)
+        try {
+          const age = now - fs.statSync(fullPath).mtimeMs
+          if (age > WIN_7D) continue
+          let cost = null
+          for (const line of fs.readFileSync(fullPath, 'utf-8').split('\n')) {
+            try {
+              const obj = JSON.parse(line)
+              if (obj.type === 'result' && typeof obj.total_cost_usd === 'number') {
+                cost = (cost ?? 0) + obj.total_cost_usd
+              }
+            } catch {}
+          }
+          if (cost != null && cost > 0) {
+            cost7d += cost; count7d++
+            if (age <= WIN_5H) { cost5h += cost; count5h++ }
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  return {
+    session5h: { cost: cost5h, count: count5h },
+    weekly7d:  { cost: cost7d, count: count7d },
+    updatedAt: now,
+  }
+})
+
 app.post('/api/sessions/:id/tasks', async (request) => {
   const s = upsertSession(request.params.id)
   const task = { id: `t${Date.now()}`, ...request.body, children: [] }
