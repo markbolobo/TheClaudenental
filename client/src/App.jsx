@@ -935,7 +935,7 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
         <input
           value={projectPath}
           onChange={e => { setProjectPath(e.target.value); setSessionId(null); setMessages([]) }}
-          className="flex-1 bg-transparent text-[10px] text-[var(--text)] font-mono outline-none border-b border-[var(--border)] pb-0.5"
+          className="flex-1 bg-transparent text-base md:text-[10px] text-[var(--text)] font-mono outline-none border-b border-[var(--border)] pb-0.5"
         />
         {sessionId && (
           <span className="text-[9px] text-[var(--text-muted)] font-mono shrink-0">{sessionId.slice(0,8)}</span>
@@ -1077,10 +1077,10 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
             onChange={e => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
-            placeholder="輸入訊息… (Enter 送出，Shift+Enter 換行，/task <標題> 建任務)"
-            rows={3}
+            placeholder="輸入訊息…"
+            rows={2}
             disabled={running}
-            className="flex-1 bg-[var(--surface)] border border-[var(--border)] rounded px-2 py-1.5 text-[11px] text-[var(--text)] resize-none outline-none placeholder:text-[var(--text-muted)] disabled:opacity-50"
+            className="flex-1 bg-[var(--surface)] border border-[var(--border)] rounded px-2 py-1.5 text-base md:text-[11px] text-[var(--text)] resize-none outline-none placeholder:text-[var(--text-muted)] disabled:opacity-50"
           />
           <div className="flex flex-col gap-1 shrink-0">
             <button
@@ -1121,20 +1121,35 @@ const MOBILE_TABS = [
 
 // ─── Mobile components ────────────────────────────────────────────────────────
 
-function MobileSessionBar({ sessions, selectedId, setActiveTab }) {
+function MobileSessionBar({ sessions, selectedId, setActiveTab, connected, onBountySettings }) {
   const sel = sessions.find(s => s.id === selectedId)
   return (
-    <div className="flex md:hidden items-center gap-2 px-3 h-9 border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
-      {sel
-        ? <><StatusDot status={sel.status} /><span className="text-[10px] text-[var(--text-h)] truncate flex-1">{sel.displayName}</span></>
-        : <span className="text-[10px] text-[var(--text-muted)] flex-1">No session selected</span>
-      }
+    <div className="flex md:hidden items-center gap-2 px-3 h-10 border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
+      {/* App title + connection dot */}
+      <span className="text-[var(--gold)] font-semibold tracking-widest text-[9px] uppercase shrink-0">
+        THE CLAUDENENTAL
+      </span>
+      <span className={`text-[8px] shrink-0 ${connected ? 'text-green-400' : 'text-red-400 pulse-amber'}`}>●</span>
+      {/* Active session name */}
+      {sel ? (
+        <span className="flex items-center gap-1 flex-1 min-w-0">
+          <StatusDot status={sel.status} />
+          <span className="text-[10px] text-[var(--text-h)] truncate">{sel.displayName}</span>
+        </span>
+      ) : (
+        <span className="flex-1" />
+      )}
+      {/* Sessions switcher */}
       <button
         onClick={() => setActiveTab('sessions')}
         className="text-[9px] px-2 py-1 rounded bg-[var(--surface-2)] border border-[var(--border)] text-[var(--text-muted)] shrink-0"
-      >
-        Sessions ▾
-      </button>
+      >◈</button>
+      {/* Bounty settings */}
+      <button
+        onClick={onBountySettings}
+        className="text-[var(--text-muted)] hover:text-[var(--gold)] text-xs shrink-0 px-1"
+        title="Bounty Settings"
+      >⚙</button>
     </div>
   )
 }
@@ -1160,21 +1175,28 @@ function MobileTabBar({ activeTab, setActiveTab }) {
   )
 }
 
-function MobileSessionsPanel({ sessions, selectedId, setSelectedId, setActiveTab }) {
+function MobileSessionsPanel({ sessions, selectedId, setSelectedId, setActiveTab, onContinue, autoResumeMap, onToggleAutoResume, hitLimitSessions, historyCosts }) {
   return (
     <div className="flex flex-col h-full">
       <div className="px-3 py-2 text-[10px] uppercase tracking-widest text-[var(--text-muted)] border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
         Sessions
       </div>
+      <ActivityHeat />
       <div className="flex-1 overflow-y-auto py-1 px-1">
         {sessions.map(s => (
-          <SessionItem key={s.id} session={s} isSelected={s.id === selectedId}
+          <SessionItem
+            key={s.id}
+            session={{ ...s, costUsd: historyCosts?.[s.id] ?? s.costUsd ?? null }}
+            isSelected={s.id === selectedId}
             onClick={() => {
               setSelectedId(s.id)
               setActiveTab('chat')
-              if (s.cwd) onContinue({ sessionId: s.id, projectPath: s.cwd })
+              if (s.cwd) onContinue?.({ sessionId: s.id, projectPath: s.cwd })
             }}
             onDoubleClick={() => {}}
+            autoResumeArmed={autoResumeMap?.[s.id]?.enabled === true}
+            onToggleAutoResume={() => onToggleAutoResume?.(s.id)}
+            hitLimit={hitLimitSessions?.has(s.id) ?? false}
           />
         ))}
         {sessions.length === 0 && <div className="text-[10px] text-[var(--text-muted)] text-center mt-8">No sessions yet</div>}
@@ -1506,8 +1528,8 @@ export default function App() {
         <BountySettings onClose={() => setShowBountySettings(false)} />
       )}
 
-      {/* ── Top bar ── */}
-      <header className="flex items-center gap-3 px-4 py-2 border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
+      {/* ── Top bar — desktop only ── */}
+      <header className="hidden md:flex items-center gap-3 px-4 py-2 border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
         <span className="text-[var(--gold)] font-semibold tracking-widest text-xs uppercase">
           The Claudenental
         </span>
@@ -1605,7 +1627,7 @@ export default function App() {
         <main className="flex-1 flex flex-col min-w-0">
 
           {/* Mobile: session indicator */}
-          <MobileSessionBar sessions={sessions} selectedId={selectedId} setActiveTab={setActiveTab} />
+          <MobileSessionBar sessions={sessions} selectedId={selectedId} setActiveTab={setActiveTab} connected={connected} onBountySettings={() => setShowBountySettings(true)} />
 
           {/* Tab bar — desktop only */}
           <div className="hidden md:flex items-center border-b border-[var(--border)] bg-[var(--surface)] shrink-0 overflow-x-auto">
@@ -1647,7 +1669,7 @@ export default function App() {
             {activeTab === 'agents'    && <AgentsPanel />}
             {activeTab === 'mcp'       && <McpPanel />}
             {/* Mobile-only tabs */}
-            {activeTab === 'sessions'  && <MobileSessionsPanel sessions={sessions} selectedId={selectedId} setSelectedId={setSelectedId} setActiveTab={setActiveTab} />}
+            {activeTab === 'sessions'  && <MobileSessionsPanel sessions={sessions} selectedId={selectedId} setSelectedId={setSelectedId} setActiveTab={setActiveTab} onContinue={handleContinueInChat} autoResumeMap={autoResumeMap} onToggleAutoResume={toggleAutoResume} hitLimitSessions={hitLimitSessions} historyCosts={historyCosts} />}
             {activeTab === 'more'      && <MobileMorePanel selected={selected} send={send} logs={logs} sessions={sessions} />}
           </div>
 
