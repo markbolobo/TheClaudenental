@@ -1029,7 +1029,7 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
                   </div>
                 )}
                 <button onClick={() => setAttachments(prev => prev.filter((_, j) => j !== i))}
-                  className="absolute -top-1 -right-1 hidden group-hover:flex w-4 h-4 rounded-full bg-red-700 text-white text-[8px] items-center justify-center">✕</button>
+                  className="absolute -top-1 -right-1 flex w-4 h-4 rounded-full bg-red-700/90 text-white text-[8px] items-center justify-center">✕</button>
               </div>
             ))}
           </div>
