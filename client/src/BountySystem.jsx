@@ -252,9 +252,9 @@ export function ContractModal({ sessionName, costData, onClose }) {
         {/* Pie charts */}
         <div className="flex gap-3 px-5 py-4">
           {[
-            { title: 'Usage Type', slices: typeSlices },
-            { title: 'By Model',   slices: modelSlices },
-          ].map(({ title, slices }) => (
+            { title: 'Usage Type', slices: typeSlices, fmt: v => fmtTok(v) },
+            { title: 'By Model',   slices: modelSlices, fmt: v => fmtCost(v) ?? '$0.0000' },
+          ].map(({ title, slices, fmt }) => (
             <div key={title} className="flex-1 min-w-0">
               <div className="text-[8px] text-[var(--text-muted)] uppercase tracking-wider mb-2 text-center">{title}</div>
               <div className="flex flex-col items-center gap-2">
@@ -264,7 +264,7 @@ export function ContractModal({ sessionName, costData, onClose }) {
                     <div key={s.label} className="flex items-center gap-1.5 text-[9px]">
                       <span className="w-1.5 h-1.5 rounded-sm shrink-0" style={{ background: s.color }} />
                       <span className="text-[var(--text-muted)] flex-1 truncate">{s.label}</span>
-                      <span className="tabular-nums text-[var(--gold)]">{fmtTok(s.value)}</span>
+                      <span className="tabular-nums text-[var(--gold)]">{fmt(s.value)}</span>
                     </div>
                   ))}
                   {slices.filter(s => s.value > 0).length === 0 && (
