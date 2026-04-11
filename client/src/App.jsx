@@ -1056,8 +1056,17 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
             {/* User message */}
             {m.role === 'user' && (
               <div className="text-[var(--gold)]">
-                <span className="opacity-50 mr-1">›</span>
-                <span style={{ whiteSpace: 'pre-wrap' }}>{m.text}</span>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1 min-w-0">
+                    <span className="opacity-50 mr-1">›</span>
+                    <span style={{ whiteSpace: 'pre-wrap' }}>{m.text}</span>
+                  </div>
+                  {m.ts && (
+                    <span className="shrink-0 text-[8px] text-[var(--gold)]/30 tabular-nums font-mono leading-tight pt-0.5 text-right">
+                      {new Date(m.ts).toLocaleString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })}
+                    </span>
+                  )}
+                </div>
                 {m.attachments?.filter(a => a.type?.startsWith('image/')).map((a, ai) => (
                   <img key={ai} src={a.dataUrl} alt={a.name}
                     className="mt-1 max-h-32 max-w-full rounded border border-[var(--border)] block" />
