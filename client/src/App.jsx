@@ -823,6 +823,10 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
 
   // Tracks whether the initial session_live replay has been received (first batch = replace, rest = append)
   const replayDoneRef = useRef(false)
+  // Tracks whether web-initiated stream events are active (skip session_live appends during run)
+  const runningRef = useRef(false)
+  // Guards against processing the same streamEvent twice (useEffect re-runs on dep change)
+  const lastEvTsRef = useRef(0)
 
   // Apply chatInit when it changes (from History "Continue in Chat" or session click)
   useEffect(() => {
@@ -844,13 +848,18 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
   useEffect(() => {
     if (!streamEvents.length) return
     const ev = streamEvents[streamEvents.length - 1]
-    // session_live: VS Code live tail messages
+
+    // Guard: skip if this is the same event re-processed due to dep change (projectPath/sessionId)
+    const evTs = ev._arrivalTs ?? 0
+    if (evTs && evTs <= lastEvTsRef.current) return
+    if (evTs) lastEvTsRef.current = evTs
+
+    // ── session_live: VS Code live tail OR initial replay ────────────────────
     if (ev.type === 'session_live' && ev.sessionId === sessionId) {
       const incoming = ev.messages ?? []
-      if (!replayDoneRef.current) {
-        // First batch = full history replay → replace messages entirely (no divider)
+      if (ev.isReplay || !replayDoneRef.current) {
+        // isReplay flag (from /api/session/watch) OR first batch → always REPLACE (authoritative)
         replayDoneRef.current = true
-        // Pair tool_results with tool_uses inside the replay
         const next = []
         for (const m of incoming) {
           const msg = { ...m, historical: true }
@@ -861,12 +870,19 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
           next.push(msg)
         }
         setMessages(next)
-      } else {
-        // Subsequent batches = live new messages → append with pairing
+      } else if (!runningRef.current) {
+        // Incremental update — only when NOT actively streaming (avoid duplicate with stream events)
         setMessages(prev => {
+          const existingToolKeys = new Set(prev.filter(m => m.toolId).map(m => `${m.role}:${m.toolId}`))
           let next = [...prev]
           for (const m of incoming) {
             const msg = { ...m, live: true }
+            // Deduplicate tool_use / tool_result by toolId
+            if (msg.toolId) {
+              const key = `${msg.role}:${msg.toolId}`
+              if (existingToolKeys.has(key)) continue
+              existingToolKeys.add(key)
+            }
             if (msg.role === 'tool_result') {
               const idx = next.map(x => x.toolId).lastIndexOf(msg.toolId)
               if (idx >= 0) { next = [...next.slice(0, idx + 1), msg, ...next.slice(idx + 1)]; continue }
@@ -878,6 +894,7 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
       }
       return
     }
+
     if (normPath(ev.projectPath) !== normPath(projectPath)) return
     const { event } = ev
 
@@ -911,9 +928,7 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
       }
       if (newMsgs.length) setMessages(m => [...m, ...newMsgs])
     } else if (event.type === 'user') {
-      // Tool results
       const blocks = event.message?.content ?? []
-      // Insert each tool_result immediately after its matching tool_use (by tool_use_id)
       setMessages(prev => {
         let next = [...prev]
         for (const b of blocks) {
@@ -923,7 +938,6 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
             : String(b.content ?? '').slice(0, 300)
           if (!output.trim()) continue
           const resultMsg = { role: 'tool_result', toolId: b.tool_use_id, output, ts: Date.now() }
-          // Find the tool_use with matching id and insert right after it
           const idx = next.map(m => m.toolId).lastIndexOf(b.tool_use_id)
           if (idx >= 0) next = [...next.slice(0, idx + 1), resultMsg, ...next.slice(idx + 1)]
           else next = [...next, resultMsg]
@@ -931,10 +945,12 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
         return next
       })
     } else if (event.type === 'result') {
+      runningRef.current = false
       setRunning(false)
       const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : ''
       setMessages(m => [...m, { role: 'result', text: `完成${cost}`, ts: Date.now() }])
     } else if (event.type === 'done') {
+      runningRef.current = false
       setRunning(false)
     }
   }, [streamEvents, projectPath, sessionId])
@@ -967,14 +983,26 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
     setInput('')
     const sentAttachments = attachments
     setAttachments([])
+    runningRef.current = true
     setRunning(true)
     const displayText = prompt + (sentAttachments.length ? `\n${sentAttachments.map(a => `[${a.name}]`).join(' ')}` : '')
     setMessages(m => [...m, { role: 'user', text: displayText, attachments: sentAttachments, ts: Date.now() }])
-    await fetch('/api/claude/run', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ projectPath, prompt, sessionId, attachments: sentAttachments }),
-    })
+    try {
+      const res = await fetch('/api/claude/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectPath, prompt, sessionId, attachments: sentAttachments }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || !data.ok) {
+        setRunning(false)
+        const reason = data.error ?? `HTTP ${res.status}`
+        setMessages(m => [...m, { role: 'result', text: `發送失敗：${reason}`, ts: Date.now() }])
+      }
+    } catch (err) {
+      setRunning(false)
+      setMessages(m => [...m, { role: 'result', text: `發送失敗：${err.message}`, ts: Date.now() }])
+    }
   }
 
   function handleStop() {
@@ -983,6 +1011,7 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ projectPath }),
     })
+    runningRef.current = false
     setRunning(false)
   }
 
@@ -1586,6 +1615,7 @@ export default function App() {
 
   function handleContinueInChat({ sessionId, projectPath }) {
     chatProjectPathRef.current = projectPath ?? ''
+    setSelectedId(sessionId)   // sync selected session so name + cost animations match chat
     setChatBaseline(historyCosts[sessionId] ?? 0)
     setChatRunning(0)
     setChatLastDelta(null)

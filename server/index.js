@@ -16,7 +16,7 @@ const PRICING = {
   'claude-haiku-4-5-20251001': { input: 1,  output: 5,  cacheRead: 0.10, cacheWrite: 1.25 },
 }
 
-const app = Fastify({ logger: false })
+const app = Fastify({ logger: false, bodyLimit: 50 * 1024 * 1024 }) // 50MB — supports large image base64 payloads
 await app.register(wsPlugin)
 await app.register(multipart, { limits: { fileSize: 100 * 1024 * 1024 } }) // 100 MB
 
@@ -266,6 +266,8 @@ app.post('/hook/Stop', async (request) => {
   setStatus(e.session_id, status)
   const tokens = e.usage ? `in=${e.usage.input_tokens} out=${e.usage.output_tokens}` : ''
   emitLog(e.session_id, `[Stop] ${reason} ${tokens}`.trim())
+  // Immediately flush JSONL so final thinking/text appear without waiting for watcher
+  flushSessionLive(e.session_id)
   return { ok: true }
 })
 
@@ -304,6 +306,8 @@ app.post('/hook/PreToolUse', async (request) => {
   else broadcast({ type: 'session', session: s })
   const detail = toolSummary(e.tool_name, e.tool_input)
   emitLog(e.session_id, `[${e.tool_name}] ${detail}`)
+  // Immediately flush JSONL so thinking/text appear before tool executes
+  flushSessionLive(e.session_id)
   return { ok: true }
 })
 
@@ -742,6 +746,16 @@ function parseNewLines(filePath, fromLine) {
   return null
 }
 
+// Immediately flush new JSONL lines for a session (called by hooks for real-time updates)
+function flushSessionLive(sessionId) {
+  const entry = watchedSessions.get(sessionId)
+  if (!entry) return
+  const result = parseNewLines(entry.filePath, entry.lineCount)
+  if (!result || !result.messages.length) return
+  entry.lineCount = result.lineCount
+  broadcast({ type: 'session_live', sessionId, messages: result.messages })
+}
+
 app.post('/api/session/watch', async (request) => {
   const { sessionId } = request.body
   if (!sessionId) return { ok: false }
@@ -753,15 +767,15 @@ app.post('/api/session/watch', async (request) => {
   if (!filePath) return { ok: false, error: 'not found' }
   const initial = parseNewLines(filePath, 0)
   const lineCount = initial?.lineCount ?? 0
-  // Always broadcast full replay so client can rebuild chronological history
+  // Broadcast full replay marked as isReplay so client always treats this as replace
   if (initial?.messages?.length) {
-    broadcast({ type: 'session_live', sessionId, messages: initial.messages })
+    broadcast({ type: 'session_live', sessionId, messages: initial.messages, isReplay: true })
   }
   if (watchedSessions.has(sessionId)) {
     watchedSessions.get(sessionId).lineCount = lineCount
     return { ok: true }
   }
-  const watcher = fs.watchFile(filePath, { interval: 1500 }, () => {
+  const watcher = fs.watchFile(filePath, { interval: 500 }, () => {
     const entry = watchedSessions.get(sessionId)
     if (!entry) return
     const result = parseNewLines(filePath, entry.lineCount)
@@ -1189,7 +1203,7 @@ function scanJsonlSessions() {
             if (fp2) {
               const initial   = parseNewLines(fp2, 0)
               const lineCount = initial?.lineCount ?? 0
-              const watcher   = fs.watchFile(fp2, { interval: 1500 }, () => {
+              const watcher   = fs.watchFile(fp2, { interval: 500 }, () => {
                 const entry = watchedSessions.get(sid)
                 if (!entry) return
                 const result = parseNewLines(fp2, entry.lineCount)
@@ -1246,7 +1260,7 @@ function scanJsonlSessions() {
             if (fp2) {
               const initial   = parseNewLines(fp2, 0)
               const lineCount = initial?.lineCount ?? 0
-              const watcher   = fs.watchFile(fp2, { interval: 1500 }, () => {
+              const watcher   = fs.watchFile(fp2, { interval: 500 }, () => {
                 const entry = watchedSessions.get(sid)
                 if (!entry) return
                 const result = parseNewLines(fp2, entry.lineCount)
