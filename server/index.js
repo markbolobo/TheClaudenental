@@ -764,18 +764,12 @@ app.post('/api/session/watch', async (request) => {
   for (const [id, w] of watchedSessions) {
     if (id !== sessionId) { try { w.watcher.close() } catch {}; watchedSessions.delete(id) }
   }
+  if (watchedSessions.has(sessionId)) return { ok: true }
   const filePath = findJsonlPath(sessionId)
   if (!filePath) return { ok: false, error: 'not found' }
+  // Start from current position — only broadcast NEW lines written after this point
   const initial = parseNewLines(filePath, 0)
   const lineCount = initial?.lineCount ?? 0
-  // Broadcast full replay marked as isReplay so client always treats this as replace
-  if (initial?.messages?.length) {
-    broadcast({ type: 'session_live', sessionId, messages: initial.messages, isReplay: true })
-  }
-  if (watchedSessions.has(sessionId)) {
-    watchedSessions.get(sessionId).lineCount = lineCount
-    return { ok: true }
-  }
   const watcher = fs.watchFile(filePath, { interval: 500 }, () => {
     const entry = watchedSessions.get(sessionId)
     if (!entry) return

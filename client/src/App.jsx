@@ -821,29 +821,35 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
     rafRef.current = requestAnimationFrame(() => { rafRef.current = null; setLiveTick(t => t + 1) })
   }
 
-  // Tracks whether the initial session_live replay has been received (first batch = replace, rest = append)
-  const replayDoneRef = useRef(false)
   // Tracks whether web-initiated stream events are active (skip session_live appends during run)
   const runningRef = useRef(false)
   // Guards against processing the same streamEvent twice (useEffect re-runs on dep change)
   const lastEvTsRef = useRef(0)
-  // Holds the result message from stream events so it can be re-appended after session_live replace
-  const pendingResultRef = useRef(null)
 
   // Apply chatInit when it changes (from History "Continue in Chat" or session click)
   useEffect(() => {
     if (!chatInit) return
     if (chatInit === prevChatInitRef.current) return
     prevChatInitRef.current = chatInit
-    replayDoneRef.current = false
     setProjectPath(chatInit.projectPath)
     setSessionId(chatInit.sessionId)
-    setMessages([])
-    // Start live-tailing — first session_live broadcast will carry full replay
+    setMessages([{ role: 'system', text: '載入歷史紀錄…', ts: Date.now() }])
+    // Start live-tailing for VS Code session incremental updates
     fetch('/api/session/watch', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionId: chatInit.sessionId }),
     }).catch(() => {})
+    // Load history from API (single source of truth for past messages)
+    fetch(`/api/history/${chatInit.sessionId}`)
+      .then(r => r.json())
+      .then(d => {
+        const hist = (d.messages ?? []).map(m => ({ ...m, historical: true }))
+        setMessages(prev => {
+          const newStream = prev.filter(m => !m.historical && m.role !== 'system')
+          return [...hist, { role: 'system', text: '─── 以上為歷史紀錄，從此繼續 ───', ts: Date.now() }, ...newStream]
+        })
+      })
+      .catch(() => setMessages([{ role: 'system', text: '歷史紀錄載入失敗', ts: Date.now() }]))
   }, [chatInit])
 
   // On mount: mark all existing streamEvents as already-processed so a tab-switch remount
@@ -869,44 +875,27 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
     let liveUpdated = false
 
     for (const ev of newEvts) {
-      // ── session_live: VS Code live tail OR initial replay ──────────────────
+      // ── session_live: VS Code live tail (incremental only) ───────────────
       if (ev.type === 'session_live' && ev.sessionId === sessionId) {
-        const incoming = ev.messages ?? []
-        if (ev.isReplay || !replayDoneRef.current) {
-          replayDoneRef.current = true
-          runningRef.current = false  // clear post-result hold
-          const next = []
-          for (const m of incoming) {
-            const msg = { ...m, historical: true }
+        if (runningRef.current) continue  // web run active — claude_stream is source of truth
+        setMessages(prev => {
+          const existingToolKeys = new Set(prev.filter(m => m.toolId).map(m => `${m.role}:${m.toolId}`))
+          let next = [...prev]
+          for (const m of ev.messages ?? []) {
+            const msg = { ...m, live: true }
+            if (msg.toolId) {
+              const key = `${msg.role}:${msg.toolId}`
+              if (existingToolKeys.has(key)) continue
+              existingToolKeys.add(key)
+            }
             if (msg.role === 'tool_result') {
               const idx = next.map(x => x.toolId).lastIndexOf(msg.toolId)
-              if (idx >= 0) { next.splice(idx + 1, 0, msg); continue }
+              if (idx >= 0) { next = [...next.slice(0, idx + 1), msg, ...next.slice(idx + 1)]; continue }
             }
-            next.push(msg)
+            next = [...next, msg]
           }
-          const pending = pendingResultRef.current
-          if (pending) { pendingResultRef.current = null; next.push(pending) }
-          setMessages(next)
-        } else if (!runningRef.current) {
-          setMessages(prev => {
-            const existingToolKeys = new Set(prev.filter(m => m.toolId).map(m => `${m.role}:${m.toolId}`))
-            let next = [...prev]
-            for (const m of incoming) {
-              const msg = { ...m, live: true }
-              if (msg.toolId) {
-                const key = `${msg.role}:${msg.toolId}`
-                if (existingToolKeys.has(key)) continue
-                existingToolKeys.add(key)
-              }
-              if (msg.role === 'tool_result') {
-                const idx = next.map(x => x.toolId).lastIndexOf(msg.toolId)
-                if (idx >= 0) { next = [...next.slice(0, idx + 1), msg, ...next.slice(idx + 1)]; continue }
-              }
-              next = [...next, msg]
-            }
-            return next
-          })
-        }
+          return next
+        })
         continue
       }
 
@@ -965,21 +954,13 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
       } else if (event.type === 'result') {
         setRunning(false)
         const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : ''
-        const resultMsg = { role: 'result', text: `完成${cost}`, ts: Date.now() }
-        pendingResultRef.current = resultMsg
-        setMessages(m => [...m, resultMsg])
-        // Keep runningRef=true — cleared when isReplay arrives after watch refresh
-        if (sessionId) {
-          fetch('/api/session/watch', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sessionId }),
-          }).catch(() => { runningRef.current = false })
-        } else {
-          runningRef.current = false
-        }
+        setMessages(m => [...m, { role: 'result', text: `完成${cost}`, ts: Date.now() }])
+        // Hold runningRef for 700ms to absorb any trailing session_live fires
+        // (file watcher or Stop hook may broadcast already-shown messages from claude_stream)
+        setTimeout(() => { runningRef.current = false }, 700)
       } else if (event.type === 'done') {
-        runningRef.current = false
         setRunning(false)
+        setTimeout(() => { runningRef.current = false }, 700)
       }
     }
 
