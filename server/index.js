@@ -285,6 +285,7 @@ app.post('/hook/SessionEnd', async (request) => {
 app.post('/hook/PreToolUse', async (request) => {
   const e = request.body
   forwardToClaudia(e, 'PreToolUse')
+  if (subprocessSids.has(e.session_id)) return { ok: true }
   const s = upsertSession(e.session_id)
   // Fill in displayName from cwd if still generic
   if (e.cwd && (!s.cwd || s.displayName === 'Session')) {
@@ -1015,7 +1016,7 @@ function spawnClaude(projectPath, prompt, sessionId = null) {
         }
         // Skip hook noise
         if (event.type === 'system' && (event.subtype === 'hook_started' || event.subtype === 'hook_response')) continue
-        broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath), event })
+        broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath), sessionId: entry.sessionId ?? null, event })
       } catch {}
     }
   })

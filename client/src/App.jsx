@@ -827,6 +827,8 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
   const runningRef = useRef(false)
   // Guards against processing the same streamEvent twice (useEffect re-runs on dep change)
   const lastEvTsRef = useRef(0)
+  // Holds the result message from stream events so it can be re-appended after session_live replace
+  const pendingResultRef = useRef(null)
 
   // Apply chatInit when it changes (from History "Continue in Chat" or session click)
   useEffect(() => {
@@ -844,115 +846,144 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
     }).catch(() => {})
   }, [chatInit])
 
-  // Process incoming stream events (subprocess)
+  // On mount: mark all existing streamEvents as already-processed so a tab-switch remount
+  // doesn't replay the full 200-event buffer and cause massive duplicates.
+  useEffect(() => {
+    const maxTs = streamEvents.reduce((m, e) => Math.max(m, e._arrivalTs ?? 0), 0)
+    lastEvTsRef.current = maxTs
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []) // intentionally empty — runs once on mount only
+
+  // Process incoming stream events — loop over ALL new events to avoid React 18 batching issue
+  // (processing only the last event caused content_block_stop to swallow preceding deltas,
+  //  so live thinking text never appeared before the block was cleared)
   useEffect(() => {
     if (!streamEvents.length) return
-    const ev = streamEvents[streamEvents.length - 1]
 
-    // Guard: skip if this is the same event re-processed due to dep change (projectPath/sessionId)
-    const evTs = ev._arrivalTs ?? 0
-    if (evTs && evTs <= lastEvTsRef.current) return
-    if (evTs) lastEvTsRef.current = evTs
+    // Find all events not yet processed (arrival timestamp > last processed)
+    const startIdx = streamEvents.findIndex(ev => (ev._arrivalTs ?? 0) > lastEvTsRef.current)
+    if (startIdx < 0) return
+    const newEvts = streamEvents.slice(startIdx)
+    lastEvTsRef.current = newEvts[newEvts.length - 1]._arrivalTs ?? lastEvTsRef.current
 
-    // ── session_live: VS Code live tail OR initial replay ────────────────────
-    if (ev.type === 'session_live' && ev.sessionId === sessionId) {
-      const incoming = ev.messages ?? []
-      if (ev.isReplay || !replayDoneRef.current) {
-        // isReplay flag (from /api/session/watch) OR first batch → always REPLACE (authoritative)
-        replayDoneRef.current = true
-        const next = []
-        for (const m of incoming) {
-          const msg = { ...m, historical: true }
-          if (msg.role === 'tool_result') {
-            const idx = next.map(x => x.toolId).lastIndexOf(msg.toolId)
-            if (idx >= 0) { next.splice(idx + 1, 0, msg); continue }
-          }
-          next.push(msg)
-        }
-        setMessages(next)
-      } else if (!runningRef.current) {
-        // Incremental update — only when NOT actively streaming (avoid duplicate with stream events)
-        setMessages(prev => {
-          const existingToolKeys = new Set(prev.filter(m => m.toolId).map(m => `${m.role}:${m.toolId}`))
-          let next = [...prev]
+    let liveUpdated = false
+
+    for (const ev of newEvts) {
+      // ── session_live: VS Code live tail OR initial replay ──────────────────
+      if (ev.type === 'session_live' && ev.sessionId === sessionId) {
+        const incoming = ev.messages ?? []
+        if (ev.isReplay || !replayDoneRef.current) {
+          replayDoneRef.current = true
+          runningRef.current = false  // clear post-result hold
+          const next = []
           for (const m of incoming) {
-            const msg = { ...m, live: true }
-            // Deduplicate tool_use / tool_result by toolId
-            if (msg.toolId) {
-              const key = `${msg.role}:${msg.toolId}`
-              if (existingToolKeys.has(key)) continue
-              existingToolKeys.add(key)
-            }
+            const msg = { ...m, historical: true }
             if (msg.role === 'tool_result') {
               const idx = next.map(x => x.toolId).lastIndexOf(msg.toolId)
-              if (idx >= 0) { next = [...next.slice(0, idx + 1), msg, ...next.slice(idx + 1)]; continue }
+              if (idx >= 0) { next.splice(idx + 1, 0, msg); continue }
             }
-            next = [...next, msg]
+            next.push(msg)
+          }
+          const pending = pendingResultRef.current
+          if (pending) { pendingResultRef.current = null; next.push(pending) }
+          setMessages(next)
+        } else if (!runningRef.current) {
+          setMessages(prev => {
+            const existingToolKeys = new Set(prev.filter(m => m.toolId).map(m => `${m.role}:${m.toolId}`))
+            let next = [...prev]
+            for (const m of incoming) {
+              const msg = { ...m, live: true }
+              if (msg.toolId) {
+                const key = `${msg.role}:${msg.toolId}`
+                if (existingToolKeys.has(key)) continue
+                existingToolKeys.add(key)
+              }
+              if (msg.role === 'tool_result') {
+                const idx = next.map(x => x.toolId).lastIndexOf(msg.toolId)
+                if (idx >= 0) { next = [...next.slice(0, idx + 1), msg, ...next.slice(idx + 1)]; continue }
+              }
+              next = [...next, msg]
+            }
+            return next
+          })
+        }
+        continue
+      }
+
+      // ── claude_stream: real-time subprocess events ─────────────────────────
+      if (ev.type !== 'claude_stream') continue
+      if (normPath(ev.projectPath) !== normPath(projectPath)) continue
+      // Reject events from a different subprocess session (same projectPath, different session)
+      if (ev.sessionId && sessionId && ev.sessionId !== sessionId) continue
+      const { event } = ev
+
+      if (event.type === 'system' && event.subtype === 'init') {
+        setSessionId(event.session_id)
+      } else if (event.type === 'content_block_start') {
+        const t = event.content_block?.type
+        if (t === 'thinking') { liveBlockRef.current = { type: 'thinking', text: '' }; liveUpdated = true }
+        else if (t === 'text')    { liveBlockRef.current = { type: 'text', text: '' };    liveUpdated = true }
+        else                      { liveBlockRef.current = null;                           liveUpdated = true }
+      } else if (event.type === 'content_block_delta') {
+        const d = event.delta
+        if (liveBlockRef.current && (d?.type === 'thinking_delta' || d?.type === 'text_delta')) {
+          liveBlockRef.current = { ...liveBlockRef.current, text: liveBlockRef.current.text + (d.thinking ?? d.text ?? '') }
+          liveUpdated = true
+        }
+      } else if (event.type === 'content_block_stop') {
+        liveBlockRef.current = null; liveUpdated = true
+      } else if (event.type === 'assistant') {
+        liveBlockRef.current = null; liveUpdated = true
+        const blocks = event.message?.content ?? []
+        const newMsgs = []
+        for (const b of blocks) {
+          if (b.type === 'thinking')
+            newMsgs.push({ role: 'thinking', text: b.thinking, ts: Date.now() })
+          else if (b.type === 'text' && b.text.trim())
+            newMsgs.push({ role: 'assistant', text: b.text, ts: Date.now() })
+          else if (b.type === 'tool_use')
+            newMsgs.push({ role: 'tool_use', toolName: b.name, input: b.input, toolId: b.id, ts: Date.now() })
+        }
+        if (newMsgs.length) setMessages(m => [...m, ...newMsgs])
+      } else if (event.type === 'user') {
+        const blocks = event.message?.content ?? []
+        setMessages(prev => {
+          let next = [...prev]
+          for (const b of blocks) {
+            if (b.type !== 'tool_result') continue
+            const output = Array.isArray(b.content)
+              ? b.content.filter(x => x.type === 'text').map(x => x.text).join('').slice(0, 300)
+              : String(b.content ?? '').slice(0, 300)
+            if (!output.trim()) continue
+            const resultMsg = { role: 'tool_result', toolId: b.tool_use_id, output, ts: Date.now() }
+            const idx = next.map(m => m.toolId).lastIndexOf(b.tool_use_id)
+            if (idx >= 0) next = [...next.slice(0, idx + 1), resultMsg, ...next.slice(idx + 1)]
+            else next = [...next, resultMsg]
           }
           return next
         })
-      }
-      return
-    }
-
-    if (normPath(ev.projectPath) !== normPath(projectPath)) return
-    const { event } = ev
-
-    if (event.type === 'system' && event.subtype === 'init') {
-      setSessionId(event.session_id)
-    } else if (event.type === 'content_block_start') {
-      const t = event.content_block?.type
-      if (t === 'thinking') { liveBlockRef.current = { type: 'thinking', text: '' }; scheduleLiveUpdate() }
-      else if (t === 'text') { liveBlockRef.current = { type: 'text', text: '' }; scheduleLiveUpdate() }
-      else liveBlockRef.current = null
-    } else if (event.type === 'content_block_delta') {
-      const d = event.delta
-      if (liveBlockRef.current && (d?.type === 'thinking_delta' || d?.type === 'text_delta')) {
-        liveBlockRef.current = { ...liveBlockRef.current, text: liveBlockRef.current.text + (d.thinking ?? d.text ?? '') }
-        scheduleLiveUpdate()
-      }
-    } else if (event.type === 'content_block_stop') {
-      liveBlockRef.current = null
-      scheduleLiveUpdate()
-    } else if (event.type === 'assistant') {
-      liveBlockRef.current = null
-      const blocks = event.message?.content ?? []
-      const newMsgs = []
-      for (const b of blocks) {
-        if (b.type === 'thinking')
-          newMsgs.push({ role: 'thinking', text: b.thinking, ts: Date.now() })
-        else if (b.type === 'text' && b.text.trim())
-          newMsgs.push({ role: 'assistant', text: b.text, ts: Date.now() })
-        else if (b.type === 'tool_use')
-          newMsgs.push({ role: 'tool_use', toolName: b.name, input: b.input, toolId: b.id, ts: Date.now() })
-      }
-      if (newMsgs.length) setMessages(m => [...m, ...newMsgs])
-    } else if (event.type === 'user') {
-      const blocks = event.message?.content ?? []
-      setMessages(prev => {
-        let next = [...prev]
-        for (const b of blocks) {
-          if (b.type !== 'tool_result') continue
-          const output = Array.isArray(b.content)
-            ? b.content.filter(x => x.type === 'text').map(x => x.text).join('').slice(0, 300)
-            : String(b.content ?? '').slice(0, 300)
-          if (!output.trim()) continue
-          const resultMsg = { role: 'tool_result', toolId: b.tool_use_id, output, ts: Date.now() }
-          const idx = next.map(m => m.toolId).lastIndexOf(b.tool_use_id)
-          if (idx >= 0) next = [...next.slice(0, idx + 1), resultMsg, ...next.slice(idx + 1)]
-          else next = [...next, resultMsg]
+      } else if (event.type === 'result') {
+        setRunning(false)
+        const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : ''
+        const resultMsg = { role: 'result', text: `完成${cost}`, ts: Date.now() }
+        pendingResultRef.current = resultMsg
+        setMessages(m => [...m, resultMsg])
+        // Keep runningRef=true — cleared when isReplay arrives after watch refresh
+        if (sessionId) {
+          fetch('/api/session/watch', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId }),
+          }).catch(() => { runningRef.current = false })
+        } else {
+          runningRef.current = false
         }
-        return next
-      })
-    } else if (event.type === 'result') {
-      runningRef.current = false
-      setRunning(false)
-      const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : ''
-      setMessages(m => [...m, { role: 'result', text: `完成${cost}`, ts: Date.now() }])
-    } else if (event.type === 'done') {
-      runningRef.current = false
-      setRunning(false)
+      } else if (event.type === 'done') {
+        runningRef.current = false
+        setRunning(false)
+      }
     }
+
+    if (liveUpdated) scheduleLiveUpdate()
   }, [streamEvents, projectPath, sessionId])
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
@@ -1108,7 +1139,7 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
             )}
             {/* Thinking block */}
             {m.role === 'thinking' && (
-              <details className="border border-purple-700/40 rounded bg-purple-900/10 px-2 py-1">
+              <details open className="border border-purple-700/40 rounded bg-purple-900/10 px-2 py-1">
                 <summary className="text-[9px] text-purple-400 cursor-pointer select-none uppercase tracking-widest">💭 Thinking</summary>
                 <div className="mt-1 text-[10px] text-purple-300/70 font-mono" style={{ whiteSpace: 'pre-wrap' }}>{m.text}</div>
               </details>
@@ -1156,15 +1187,6 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
         {running && !liveBlockRef.current && (
           <div className="text-[10px] text-[var(--text-muted)] animate-pulse">Claude 思考中…</div>
         )}
-
-        {/* Hook event log — inline at bottom of chat */}
-        {(logs ?? []).filter(l => !l.sessionId || l.sessionId === selectedId).map((log, i) => (
-          <div key={`log-${i}`} className={`text-[10px] font-mono leading-5 ${
-            log.level === 'user'       ? 'text-[var(--gold)]/70' :
-            log.level === 'permission' ? 'text-amber-400/80' :
-            'text-[var(--text-muted)]/60'
-          }`}>{log.text ?? JSON.stringify(log)}</div>
-        ))}
 
         <div ref={bottomRef} />
       </div>
@@ -1306,6 +1328,14 @@ function MobileSessionBar({ sessions, selectedId, setActiveTab, connected, onBou
         className="text-[var(--text-muted)] hover:text-[var(--gold)] text-xs shrink-0 px-1"
         title="Bounty Settings"
       >⚙</button>
+      {/* Open claude.ai */}
+      <a
+        href="https://claude.ai"
+        target="_blank"
+        rel="noopener noreferrer"
+        title="開啟 Claude.ai"
+        className="text-[9px] text-[var(--text-muted)] hover:text-[var(--gold)] shrink-0 px-1 no-underline"
+      >↗</a>
     </div>
   )
 }
@@ -1869,6 +1899,14 @@ export default function App() {
           className="text-[9px] text-[var(--text-muted)] hover:text-[var(--gold)] border border-[var(--border)] hover:border-[var(--gold-border)] rounded-sm px-1.5 py-0.5 transition-colors tracking-wide uppercase">
           ⚙ Bounty
         </button>
+        <a
+          href="https://claude.ai"
+          target="_blank"
+          rel="noopener noreferrer"
+          title="開啟 Claude.ai"
+          className="text-[9px] text-[var(--text-muted)] hover:text-[var(--gold)] border border-[var(--border)] hover:border-[var(--gold-border)] rounded-sm px-1.5 py-0.5 transition-colors tracking-wide uppercase no-underline">
+          ↗ Claude
+        </a>
       </header>
 
       {/* ── Main layout ── */}
