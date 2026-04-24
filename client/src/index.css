@@ -133,3 +133,30 @@ body {
   0%   { transform: translateY(0) rotate(0deg); opacity: var(--op, 0.7); }
   100% { transform: translateY(100vh) rotate(360deg); opacity: 0; }
 }
+
+/* ── Markdown body (assistant messages) ── */
+.md-body { font-size: 11px; line-height: 1.65; }
+.md-body p { margin: 0 0 0.6em; }
+.md-body p:last-child { margin-bottom: 0; }
+.md-body h1,.md-body h2,.md-body h3 { font-weight: 600; margin: 0.9em 0 0.35em; color: var(--text-h); }
+.md-body h1 { font-size: 15px; border-bottom: 1px solid var(--border); padding-bottom: 0.25em; }
+.md-body h2 { font-size: 13px; }
+.md-body h3 { font-size: 12px; }
+.md-body ul,.md-body ol { margin: 0.35em 0 0.6em 1.25em; padding: 0; }
+.md-body li { margin: 0.18em 0; }
+.md-body ul { list-style: disc; }
+.md-body ol { list-style: decimal; }
+.md-body li > ul,.md-body li > ol { margin: 0.15em 0 0.15em 1em; }
+.md-body code { font-family: ui-monospace,monospace; font-size: 10px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 3px; padding: 0.1em 0.35em; color: #e2c27d; }
+.md-body pre { background: var(--surface-2); border: 1px solid var(--border); border-radius: 5px; padding: 0.65em 0.85em; overflow-x: auto; margin: 0.5em 0; }
+.md-body pre code { background: none; border: none; padding: 0; color: #d4d4d4; font-size: 10px; }
+.md-body blockquote { border-left: 2px solid var(--gold); margin: 0.5em 0; padding: 0.2em 0.75em; color: var(--text-muted); }
+.md-body table { border-collapse: collapse; width: 100%; margin: 0.5em 0; font-size: 10px; }
+.md-body th { background: var(--surface-2); color: var(--text-h); font-weight: 600; text-align: left; padding: 0.3em 0.6em; border: 1px solid var(--border); }
+.md-body td { padding: 0.25em 0.6em; border: 1px solid var(--border); }
+.md-body tr:nth-child(even) td { background: var(--surface-2); }
+.md-body a { color: var(--gold); text-decoration: underline; text-underline-offset: 2px; }
+.md-body hr { border: none; border-top: 1px solid var(--border); margin: 0.75em 0; }
+.md-body strong { font-weight: 700; color: var(--text-h); }
+.md-body em { font-style: italic; color: var(--text-muted); }
+.md-body input[type=checkbox] { accent-color: var(--gold); margin-right: 0.35em; }

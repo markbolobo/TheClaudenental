@@ -7,7 +7,7 @@ export default defineConfig({
   server: {
     port: 4444,
     host: true,
-    allowedHosts: 'all',
+    allowedHosts: true,
     proxy: {
       '/hook': 'http://localhost:3001',
       '/api': 'http://localhost:3001',

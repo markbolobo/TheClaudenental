@@ -36,7 +36,8 @@ function findClaudeExe() {
   return 'claude'
 }
 
-const CLAUDE_EXE = findClaudeExe()
+// 每次呼叫動態解析，不快取，確保 Claude Code 升版後無需重啟 server
+function getClaudeExe() { return findClaudeExe() }
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -989,7 +990,7 @@ function spawnClaude(projectPath, prompt, sessionId = null) {
   ]
   if (sessionId) args.unshift('--resume', sessionId)
 
-  const proc = spawn(CLAUDE_EXE, args, { cwd: projectPath, stdio: ['ignore', 'pipe', 'pipe'] })
+  const proc = spawn(getClaudeExe(), args, { cwd: projectPath, stdio: ['ignore', 'pipe', 'pipe'] })
   const entry = { proc, sessionId, projectPath, status: 'running' }
   claudeProcs.set(projectPath, entry)
 
@@ -1291,6 +1292,57 @@ function scanJsonlSessions() {
     } catch {}
   }
 }
+
+// ─── Ratings & Prefs (cross-device sync) ─────────────────────────────────────
+
+const RATINGS_FILE = path.join(os.homedir(), '.claude', 'tc_ratings.json')
+const PREFS_FILE   = path.join(os.homedir(), '.claude', 'tc_prefs.json')
+const HISTORY_FILE = path.join(os.homedir(), '.claude', 'tc_pref_history.json')
+
+function readRatingsFile() {
+  try { return JSON.parse(fs.readFileSync(RATINGS_FILE, 'utf8')) } catch { return [] }
+}
+function writeRatingsFile(data) {
+  fs.writeFileSync(RATINGS_FILE, JSON.stringify(data.slice(-1000)), 'utf8')
+}
+
+app.get('/api/ratings', async () => ({ ratings: readRatingsFile() }))
+
+app.post('/api/ratings', async (request) => {
+  const { rating } = request.body ?? {}
+  if (!rating?.id) return { ok: false, error: 'missing id' }
+  if (rating.__clearAll) { writeRatingsFile([]); return { ok: true } }
+  const all = readRatingsFile()
+  const idx = all.findIndex(r => r.id === rating.id)
+  if (idx >= 0) all[idx] = rating; else all.push(rating)
+  writeRatingsFile(all)
+  return { ok: true }
+})
+
+app.get('/api/ratings/prefs', async () => {
+  try { return JSON.parse(fs.readFileSync(PREFS_FILE, 'utf8')) } catch { return { text: '' } }
+})
+
+app.post('/api/ratings/prefs', async (request) => {
+  const { text } = request.body ?? {}
+  fs.writeFileSync(PREFS_FILE, JSON.stringify({ text: text ?? '' }), 'utf8')
+  return { ok: true }
+})
+
+app.get('/api/ratings/history', async () => {
+  try { return { history: JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')) } }
+  catch { return { history: [] } }
+})
+
+app.post('/api/ratings/history', async (request) => {
+  const { snapshot } = request.body ?? {}
+  if (!snapshot?.ts) return { ok: false }
+  let all = []
+  try { all = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')) } catch {}
+  all.push(snapshot)
+  fs.writeFileSync(HISTORY_FILE, JSON.stringify(all.slice(-200)), 'utf8')
+  return { ok: true }
+})
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
