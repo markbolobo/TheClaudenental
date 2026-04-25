@@ -1815,7 +1815,7 @@ ${thought ? `重點指示：${thought}` : ''}
     },
     {
       id: 'close', icon: '🏁', label: '結案結算',
-      desc: 'Session 收尾結算\n成果摘要 + 遺留清單 + 同步知識 + 變更清單（不擅自 commit）',
+      desc: 'Session 收尾結算\n成果摘要 + 遺留清單 + 同步知識 + 變更清單 + TODO 看板掃描',
       urlLabel: '（選填）本 Session 完成的主要成果', thoughtLabel: '（選填）遺留或要交接的事項',
       build: (url, thought) =>
 `結案結算 — 本次 Session 要收尾，請幫我處理：
@@ -1827,22 +1827,40 @@ ${thought ? `重點指示：${thought}` : ''}
 5. **變更清單**：列出該 commit 的檔案（分組別：code / memory / docs），但不要自作主張 commit，等我確認
 6. **規矩快照**：若本次評分資料有顯著變化，建議我去規矩頁面按「⚡ 分析並存檔」
 
+7. **⭐ TODO 看板掃描**（GET /api/todos）：
+   - 列出本次 session 動過的卡（updatedAt 在 session 期間內）
+   - 列出仍在「實作中」「驗證中」的卡，附上 sessionId 對應關係
+   - 找出「擱置」超過 7 天的卡，建議翻倉庫或重啟
+   - 找出「想到了」超過 30 天的卡，建議移倉庫
+   - 沒被討論過的「想到了」卡，建議下次 session 啟動優先處理
+   - 任何在 \`memory/MEMORY.md\` 待處理區的議題，但 TODO 看板沒對應卡的，建卡
+   - 任何已標完成但 MEMORY.md 還列待辦的，跨 Session 全面同步（參 \`feedback_cross_session_full_sync.md\`）
+
 本次主要成果：${url || '（請自行從對話推導）'}
 遺留事項：${thought || '（請自行從對話推導）'}`,
     },
     {
       id: 'start', icon: '🚀', label: 'Session 啟動',
-      desc: 'Session 啟動接手前情\n讀 last_session_state.md + 規矩確認 + 推薦起手式',
+      desc: 'Session 啟動接手前情\n讀 last_session_state + 規矩確認 + TODO 掃描 + 推薦起手式',
       urlLabel: '（選填）今天想聚焦的主題', thoughtLabel: '（選填）特別想避免或警覺的事',
       build: (url, thought) =>
 `Session 啟動 — 請幫我暖機：
 
 1. **讀取上次交接**：.agent/last_session_state.md 拿到上次 session 的接續點
 2. **掃描在途工作**：memory/MEMORY.md 的「待處理任務」段，列出目前進行中的項目
-3. **載入今日上下文**：如果有聚焦主題，主動載入對應的 .agent/knowledge/*.md 檔案
-4. **環境檢查**：git status / 未 commit 的變更 / pm2 服務狀態 / 上次雙版本編譯是否通過
-5. **建議起手式**：告訴我今天第一步建議從哪裡開始，並列出 2~3 個可選方向讓我挑
-6. **規矩確認**：讀取目前的偏好文字（PREF_TEXT_KEY），確認風格基準
+3. **⭐ TODO 看板掃描**（GET /api/todos）：
+   - 列出當前「實作中」「驗證中」「討論中」的卡，按 updatedAt 排序
+   - 列出有 sessionId 但 session 已關閉的卡（孤兒卡），建議是否要重啟接續
+   - 列出超過 7 天無更新的「擱置」卡，提醒考慮翻倉庫或重啟
+   - 列出本週新增的「想到了」卡，看是否值得這次 session 處理
+4. **載入今日上下文**：如果有聚焦主題，主動載入對應的 .agent/knowledge/*.md 檔案
+5. **環境檢查**：git status / 未 commit 的變更 / pm2 服務狀態 / 上次雙版本編譯是否通過
+6. **⭐ 雙軌同步檢查**（feedback_dual_continuity_strategy）：
+   - MEMORY.md 待處理 vs TODO 看板狀態是否一致
+   - project_*.md 結案標記 vs MEMORY.md / TODO 是否同步
+   - 不一致 → 立即補同步
+7. **建議起手式**：告訴我今天第一步建議從哪裡開始，並列出 2~3 個可選方向讓我挑
+8. **規矩確認**：讀取目前的偏好文字（PREF_TEXT_KEY），確認風格基準
 
 今天想聚焦：${url || '（還沒決定，請從待辦中推薦）'}
 警覺事項：${thought || '（無）'}`,
