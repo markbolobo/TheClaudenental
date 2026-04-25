@@ -31,6 +31,39 @@ function suggestStageForCard(card) {
   return null
 }
 
+// Phase 5: 「下一步建議」— 比 stage suggestion 更廣，考慮自然進程而非只 mismatch
+function nextStepForCard(card) {
+  const text = ((card.title ?? '') + ' ' + (card.note ?? '')).toLowerCase()
+  const ageDays = (Date.now() - (card.updatedAt ?? card.createdAt ?? Date.now())) / 86400000
+  switch (card.column) {
+    case 'idea':
+      if (/(討論|提案|評估)/.test(text)) return { col: 'discussing', label: '進入討論', tone: 'normal' }
+      if (ageDays > 30) return { col: 'storage', label: '想法太久未動 → 進倉庫', tone: 'cold' }
+      return { col: 'discussing', label: '展開討論', tone: 'soft' }
+    case 'discussing':
+      if (/(去做|開工|動手|實作)/.test(text)) return { col: 'doing', label: '開工實作', tone: 'normal' }
+      if (ageDays > 14) return { col: 'paused', label: '討論停滯 → 擱置', tone: 'warn' }
+      return { col: 'doing', label: '達成共識後動手', tone: 'soft' }
+    case 'doing':
+      if (/(測試|驗證|跑跑看)/.test(text)) return { col: 'verifying', label: '送驗證', tone: 'normal' }
+      if (ageDays > 7) return { col: 'paused', label: '實作卡住 → 擱置查原因', tone: 'warn' }
+      return { col: 'verifying', label: '完成後送驗證', tone: 'soft' }
+    case 'verifying':
+      if (/(已完成|通過|✅|ok)/.test(text)) return { col: 'done', label: '驗證通過 → 結案', tone: 'normal' }
+      if (ageDays > 5) return { col: 'doing', label: '驗證未過 → 回實作', tone: 'warn' }
+      return { col: 'done', label: '驗證通過後結案', tone: 'soft' }
+    case 'paused':
+      if (ageDays > 30) return { col: 'storage', label: '長期擱置 → 進倉庫', tone: 'cold' }
+      return { col: 'doing', label: '解鎖後可拖回實作', tone: 'soft' }
+    case 'done':
+      return null
+    case 'storage':
+      return { col: 'idea', label: '時機到 → 翻出來', tone: 'soft' }
+    default:
+      return null
+  }
+}
+
 // 拖卡進入這些 column 會彈視窗讓使用者選 session（需要 Claude 動作的階段）
 const TRIGGER_CHAT_COLUMNS = new Set(['discussing', 'doing', 'verifying'])
 
@@ -1027,13 +1060,21 @@ function Card({ card, tags, onPatch, onDelete, onOpenDetail, suggestedColumn, ju
   const cardTags = (card.tagIds ?? []).map(id => tags.find(t => t.id === id)).filter(Boolean)
   const stageMismatch = suggestedColumn && suggestedColumn !== card.column
   const suggestedLabel = suggestedColumn ? COLUMN_BY_ID[suggestedColumn]?.label : null
+  // Phase 5: 下一步建議
+  const nextStep = nextStepForCard(card)
+  const nextLabel = nextStep ? `${COLUMN_BY_ID[nextStep.col]?.icon ?? ''} ${nextStep.label}` : null
+  const toneClass = {
+    normal: 'border-[var(--gold)]/60 text-[var(--gold)]',
+    soft:   'border-[var(--border)] text-[var(--text-muted)]',
+    warn:   'border-amber-500/60 text-amber-300',
+    cold:   'border-blue-500/40 text-blue-300/80',
+  }[nextStep?.tone] ?? ''
 
   function handleClick(e) {
     if (isDragging) return
     onOpenDetail?.(card.id)
   }
 
-  // Phase 1: 落定微動畫（拖完 600ms 高光）
   const settleClass = justSettled ? 'ring-2 ring-[var(--gold)] shadow-[0_0_20px_rgba(201,162,39,0.6)]' : ''
 
   return (
@@ -1066,6 +1107,15 @@ function Card({ card, tags, onPatch, onDelete, onOpenDetail, suggestedColumn, ju
           <div className="hidden group-hover/dot:block absolute right-0 top-3 z-20 px-2 py-1 rounded bg-[var(--surface-2)] border border-red-500/50 text-[9px] text-red-300 whitespace-nowrap shadow-lg">
             建議階段：{suggestedLabel}
           </div>
+        </div>
+      )}
+
+      {/* Phase 5: 下一步建議（hover 顯示在卡片底部） */}
+      {nextStep && !isDragging && (
+        <div className={`hidden group-hover:block mt-1 pt-1 border-t border-dashed border-[var(--border)] text-[8px] ${toneClass} flex items-center gap-1`}>
+          <span className="opacity-70">下一步：</span>
+          <span className="font-semibold">{nextLabel}</span>
+          <span className="opacity-50 ml-auto">（拖過去）</span>
         </div>
       )}
 
