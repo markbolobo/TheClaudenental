@@ -542,8 +542,17 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
       {/* 卡片詳情抽屜 */}
       {activeCardId && (
         <CardDrawer card={cards.find(c => c.id === activeCardId)} tags={tags} themes={themes}
+          sessions={sessions}
           onClose={() => setActiveCardId(null)}
-          onPatch={patchCard} onDelete={deleteCard} />
+          onPatch={patchCard} onDelete={deleteCard}
+          onContinueInChat={(card) => {
+            // Phase 8: 回主線 — 跳對應 session + 預填續行 prompt
+            const targetSession = card.sessionId ?? '__new__'
+            const stageLabel = COLUMN_BY_ID[card.column]?.label ?? card.column
+            const prefill = `回到 TODO 卡：${card.title}\n\n## 卡片狀態\n- 階段：${stageLabel}\n- 上次更新：${new Date(card.updatedAt ?? card.createdAt).toLocaleString('zh-TW', { hour12: false })}\n${card.note ? `\n## 卡片內容\n${card.note}\n` : ''}\n## 接續討論`
+            onTriggerChat?.({ sessionId: targetSession, prefillText: prefill })
+            setActiveCardId(null)
+          }} />
       )}
 
       {/* 拖曳後 modal：選擇接續方式 */}
@@ -910,7 +919,7 @@ function TrashModal({ cards, tags, onClose, onRestore, onPurge }) {
   )
 }
 
-function CardDrawer({ card, tags, themes, onClose, onPatch, onDelete }) {
+function CardDrawer({ card, tags, themes, sessions = [], onClose, onPatch, onDelete, onContinueInChat }) {
   const [title, setTitle] = useState(card?.title ?? '')
   const [note, setNote] = useState(card?.note ?? '')
   useEffect(() => { setTitle(card?.title ?? ''); setNote(card?.note ?? '') }, [card?.id])
@@ -920,6 +929,7 @@ function CardDrawer({ card, tags, themes, onClose, onPatch, onDelete }) {
   const cardTags = (card.tagIds ?? []).map(id => tags.find(t => t.id === id)).filter(Boolean)
   const nonThemeTagIds = new Set(card.tagIds ?? [])
   const allTags = tags.filter(t => t.kind === 'tag')
+  const linkedSession = card.sessionId ? sessions.find(s => s.id === card.sessionId) : null
 
   function commit(patch) { onPatch(card.id, patch) }
   function toggleTag(tagId) {
@@ -936,6 +946,14 @@ function CardDrawer({ card, tags, themes, onClose, onPatch, onDelete }) {
         <div className="px-3 py-2 border-b border-[var(--border)] flex items-center gap-2">
           <span className="text-[10px] uppercase tracking-widest text-[var(--text-muted)]">卡片詳情</span>
           <div className="flex-1" />
+          {/* Phase 8: 回主線按鈕 */}
+          {onContinueInChat && (
+            <button onClick={() => onContinueInChat(card)}
+              title={linkedSession ? `繼續在原 session 討論（${linkedSession.displayName ?? linkedSession.id.slice(0, 8)}）` : '在新 session 討論這張卡'}
+              className="text-[10px] text-[var(--gold)] hover:bg-[var(--gold)]/15 px-2 py-0.5 rounded border border-[var(--gold)]/60 font-semibold">
+              💬→ {linkedSession ? '回主線' : '討論'}
+            </button>
+          )}
           <button onClick={() => { if (window.confirm('刪除這張卡？（可在垃圾桶還原）')) { onDelete(card.id); onClose() } }}
             className="text-[10px] text-red-400/70 hover:text-red-400 px-1.5 py-0.5 rounded border border-red-500/30">刪除</button>
           <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text)] text-[14px] ml-1">✕</button>
@@ -995,7 +1013,13 @@ function CardDrawer({ card, tags, themes, onClose, onPatch, onDelete }) {
             <div>更新: {new Date(card.updatedAt).toLocaleString()}</div>
             <div>版本: v{card.version ?? 1}</div>
             {card.parentId && <div>父卡: {card.parentId}</div>}
-            {card.sessionId && <div>session: {card.sessionId.slice(0, 8)}...</div>}
+            {linkedSession ? (
+              <div className="text-[var(--gold)]/80">
+                session: {linkedSession.displayName ?? card.sessionId.slice(0, 8)} ({linkedSession.status})
+              </div>
+            ) : card.sessionId ? (
+              <div>session: {card.sessionId.slice(0, 8)}...（已關閉）</div>
+            ) : null}
           </div>
         </div>
       </div>
