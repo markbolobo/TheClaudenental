@@ -91,6 +91,11 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
   const [tagManagerOpen, setTagManagerOpen] = useState(false)  // Phase 2: tag 管理 modal
   const [searchQuery, setSearchQuery] = useState('')           // Phase 3: 搜尋
   const [storageQuery, setStorageQuery] = useState('')         // Phase 4: 倉庫獨立搜尋
+  // Phase 6: 視圖模式 A=膠囊聚焦 / B=多看板全景；持久化
+  const [viewMode, setViewMode] = useState(() => {
+    try { return localStorage.getItem('tc_todo_view') || 'A' } catch { return 'A' }
+  })
+  useEffect(() => { try { localStorage.setItem('tc_todo_view', viewMode) } catch {} }, [viewMode])
 
   // 重新載資料（衝突 / 還原後用）
   async function reloadCards() {
@@ -397,6 +402,20 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
     <div className="flex flex-col h-full overflow-hidden">
       {/* 主題膠囊列 */}
       <div className="shrink-0 px-2 py-2 border-b border-[var(--border)] flex gap-1.5 overflow-x-auto items-center">
+        {/* Phase 6: A/B 視圖切換 */}
+        <div className="shrink-0 flex border border-[var(--border)] rounded-full overflow-hidden">
+          <button onClick={() => setViewMode('A')}
+            title="A 聚焦：單一看板 + 主題膠囊（手機友善）"
+            className={`px-2 py-0.5 text-[9px] font-semibold transition-colors ${
+              viewMode === 'A' ? 'bg-[var(--gold)]/20 text-[var(--gold)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'
+            }`}>🎯 聚焦</button>
+          <button onClick={() => setViewMode('B')}
+            title="B 全景：每主題獨立看板（深度工作）"
+            className={`px-2 py-0.5 text-[9px] font-semibold transition-colors ${
+              viewMode === 'B' ? 'bg-[var(--gold)]/20 text-[var(--gold)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'
+            }`}>🌐 全景</button>
+        </div>
+
         {/* Phase 3: 搜尋框 */}
         <div className="shrink-0 relative">
           <input value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
@@ -415,17 +434,32 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
           }`}>全部</button>
         {themes.map(theme => {
           const active = activeThemes.has(theme.id)
-          return (
-            <button key={theme.id}
-              onClick={() => setActiveThemes(s => {
-                const next = new Set(s)
-                if (next.has(theme.id)) next.delete(theme.id); else next.add(theme.id)
-                return next
-              })}
-              style={active ? { borderColor: theme.color, color: theme.color, backgroundColor: theme.color + '22' } : undefined}
-              className={`shrink-0 px-2.5 py-1 rounded-full text-[10px] font-semibold border transition-colors ${
+          // Phase 6: B 模式單選 tab；A 模式多選膠囊
+          const handleClick = () => setActiveThemes(s => {
+            if (viewMode === 'B') {
+              // 單選：點當前的清空（=全部）；點其他切換
+              return active && s.size === 1 ? new Set() : new Set([theme.id])
+            }
+            const next = new Set(s)
+            if (next.has(theme.id)) next.delete(theme.id); else next.add(theme.id)
+            return next
+          })
+          const className = viewMode === 'B'
+            ? `shrink-0 px-3 py-1 text-[11px] font-bold border-b-2 transition-colors ${
+                active
+                  ? ''
+                  : 'border-transparent text-[var(--text-muted)] hover:text-[var(--text)]'
+              }`
+            : `shrink-0 px-2.5 py-1 rounded-full text-[10px] font-semibold border transition-colors ${
                 active ? '' : 'border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text)]'
-              }`}>
+              }`
+          const style = active
+            ? (viewMode === 'B'
+                ? { borderColor: theme.color, color: theme.color, backgroundColor: theme.color + '11' }
+                : { borderColor: theme.color, color: theme.color, backgroundColor: theme.color + '22' })
+            : undefined
+          return (
+            <button key={theme.id} onClick={handleClick} style={style} className={className}>
               <span className="mr-1" style={{ color: theme.color }}>●</span>{theme.name}
             </button>
           )
