@@ -6,6 +6,7 @@ import { SortableContext, useSortable, arrayMove, horizontalListSortingStrategy 
 import { CSS } from '@dnd-kit/utilities'
 import { useCostEngine, BountyOverlay, BountyToast, ContractModal, fmtCost, computeDeltaCost } from './BountySystem.jsx'
 import { TodoBoard } from './TodoBoard.jsx'
+import { MetricsDashboard } from './MetricsDashboard.jsx'
 import BountySettings from './BountySettings.jsx'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -3281,6 +3282,7 @@ function PromptStudioPanel() {
 const TABS = [
   { id: 'chat',      label: 'Chat' },
   { id: 'todos',     label: '待辦' },
+  { id: 'metrics',   label: '📊 儀表板' },
   { id: 'tasks',     label: 'Tasks' },
   { id: 'history',   label: 'History' },
   { id: 'prompt',    label: 'Prompt' },
@@ -4061,6 +4063,7 @@ export default function App() {
                   setActiveTab('chat')
                 }} />
             )}
+            {activeTab === 'metrics' && <MetricsDashboard />}
             {activeTab === 'history'   && <HistoryPanel onContinue={handleContinueInChat} />}
             {activeTab === 'prompt'    && <PromptStudioPanel />}
             {activeTab === 'prefs'     && <PreferencesPanel />}
