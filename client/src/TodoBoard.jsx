@@ -55,6 +55,7 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
   const [trashCards, setTrashCards] = useState([])
   const [activeCardId, setActiveCardId] = useState(null)  // 詳情抽屜
   const [pendingDrag, setPendingDrag] = useState(null)    // { card, fromCol, toCol } 拖曳後彈窗用
+  const [tagManagerOpen, setTagManagerOpen] = useState(false)  // Phase 2: tag 管理 modal
 
   // 重新載資料（衝突 / 還原後用）
   async function reloadCards() {
@@ -154,6 +155,32 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
     if (!window.confirm('永久刪除這張卡片？無法復原。')) return
     const r = await fetch(`/api/todos/${id}/purge`, { method: 'POST' }).then(r => r.json()).catch(() => null)
     if (r?.ok) setTrashCards(c => c.filter(x => x.id !== id))
+  }
+
+  // Tag 管理 API
+  async function createTag(payload) {
+    const r = await fetch('/api/todo-tags', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }).then(r => r.json()).catch(() => null)
+    if (r?.ok) await reloadTags()
+    return r
+  }
+  async function patchTag(id, patch) {
+    const r = await fetch(`/api/todo-tags/${id}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    }).then(r => r.json()).catch(() => null)
+    if (r?.ok) await reloadTags()
+    else if (r?.error) alert(`修改失敗：${r.error}`)
+    return r
+  }
+  async function deleteTag(id, replaceWith) {
+    const url = replaceWith ? `/api/todo-tags/${id}?replaceWith=${encodeURIComponent(replaceWith)}` : `/api/todo-tags/${id}`
+    const r = await fetch(url, { method: 'DELETE' }).then(r => r.json()).catch(() => null)
+    if (r?.ok) { await reloadTags(); await reloadCards() }
+    else if (r?.error) alert(`刪除失敗：${r.error}`)
+    return r
   }
 
   // 一鍵套用所有紅點卡的階段建議：批次更新 column + 自動 append note 紀錄歷史
@@ -350,6 +377,10 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
             ⚡ 套用建議 ({mismatchedCards.length})
           </button>
         )}
+        <button onClick={() => setTagManagerOpen(true)} title="標籤管理"
+          className="shrink-0 px-2 py-1 rounded text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)] border border-[var(--border)] hover:border-[var(--gold-border)]">
+          🏷
+        </button>
         <button onClick={openTrash} title="垃圾桶"
           className="shrink-0 px-2 py-1 rounded text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)] border border-[var(--border)] hover:border-[var(--gold-border)]">
           🗑
@@ -413,6 +444,200 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
           onRevert={confirmDragRevert}
           onSelectSession={confirmDragWithSession} />
       )}
+
+      {/* Tag 管理 modal */}
+      {tagManagerOpen && (
+        <TagManagerModal
+          tags={tags}
+          cards={cards}
+          onClose={() => setTagManagerOpen(false)}
+          onCreate={createTag}
+          onPatch={patchTag}
+          onDelete={deleteTag} />
+      )}
+    </div>
+  )
+}
+
+function TagManagerModal({ tags, cards, onClose, onCreate, onPatch, onDelete }) {
+  const [editing, setEditing] = useState(null)  // { id, name, color, parentId, kind }
+  const [creating, setCreating] = useState(null)  // { name, color, parentId, kind }
+
+  const themes = tags.filter(t => t.kind === 'theme')
+  const labels = tags.filter(t => t.kind === 'tag')
+  const cardCountByTagId = (() => {
+    const map = new Map()
+    for (const c of cards) {
+      if (c.themeId) map.set(c.themeId, (map.get(c.themeId) ?? 0) + 1)
+      for (const tid of c.tagIds ?? []) map.set(tid, (map.get(tid) ?? 0) + 1)
+    }
+    return map
+  })()
+
+  // 主題層級樹
+  function ThemeNode({ theme, depth }) {
+    const children = themes.filter(t => t.parentId === theme.id)
+    const count = cardCountByTagId.get(theme.id) ?? 0
+    return (
+      <div>
+        <div className="flex items-center gap-2 py-1.5 hover:bg-[var(--surface-2)] rounded group" style={{ paddingLeft: depth * 16 + 8 }}>
+          <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: theme.color }} />
+          <span className="text-[11px] text-[var(--text)] flex-1">{theme.name}</span>
+          <span className="text-[9px] text-[var(--text-muted)]">{count > 0 ? `${count} 卡` : '–'}</span>
+          {theme.isBuiltIn && <span className="text-[8px] text-[var(--text-muted)] px-1 border border-[var(--border)] rounded">內建</span>}
+          <button onClick={() => setEditing({ ...theme })}
+            className="text-[9px] text-[var(--text-muted)] hover:text-[var(--gold)] hidden group-hover:inline px-1">改</button>
+          {!theme.isBuiltIn && (
+            <button onClick={async () => {
+              if (count > 0 && !window.confirm(`此主題有 ${count} 張卡引用，刪除會清掉這些卡的主題標記。確定？`)) return
+              if (count === 0 && !window.confirm('刪除此主題？')) return
+              await onDelete(theme.id)
+            }}
+              className="text-[9px] text-[var(--text-muted)] hover:text-red-400 hidden group-hover:inline px-1">刪</button>
+          )}
+        </div>
+        {children.map(c => <ThemeNode key={c.id} theme={c} depth={depth + 1} />)}
+      </div>
+    )
+  }
+
+  return (
+    <div className="absolute inset-0 z-40 bg-black/60 flex items-center justify-center p-4 animate-in fade-in duration-200" onClick={onClose}>
+      <div onClick={e => e.stopPropagation()}
+        className="bg-[var(--surface)] border border-[var(--gold-border)] rounded-lg w-[min(680px,95vw)] max-h-[85vh] flex flex-col shadow-2xl">
+
+        <div className="px-4 py-3 border-b border-[var(--border)] flex items-center gap-2">
+          <span className="text-[12px] font-semibold">🏷 標籤管理</span>
+          <span className="text-[9px] text-[var(--text-muted)]">{tags.length} 個（{themes.length} 主題 / {labels.length} 標籤）</span>
+          <div className="flex-1" />
+          <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text)] text-[14px]">✕</button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-3 grid grid-cols-2 gap-4">
+
+          {/* 主題（含層級） */}
+          <div>
+            <div className="flex items-center gap-2 mb-2">
+              <span className="text-[10px] uppercase tracking-widest text-[var(--text-muted)]">主題（有層級）</span>
+              <button onClick={() => setCreating({ name: '', color: '#9ca3af', parentId: null, kind: 'theme' })}
+                className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--gold)]/60 text-[var(--gold)] hover:bg-[var(--gold)]/10 ml-auto">+ 新增</button>
+            </div>
+            <div className="bg-[var(--surface-2)]/40 rounded p-1.5 max-h-[50vh] overflow-y-auto">
+              {themes.filter(t => !t.parentId).map(t => <ThemeNode key={t.id} theme={t} depth={0} />)}
+            </div>
+          </div>
+
+          {/* 標籤（扁平） */}
+          <div>
+            <div className="flex items-center gap-2 mb-2">
+              <span className="text-[10px] uppercase tracking-widest text-[var(--text-muted)]">標籤（扁平）</span>
+              <button onClick={() => setCreating({ name: '', color: '#9ca3af', parentId: null, kind: 'tag' })}
+                className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--gold)]/60 text-[var(--gold)] hover:bg-[var(--gold)]/10 ml-auto">+ 新增</button>
+            </div>
+            <div className="bg-[var(--surface-2)]/40 rounded p-1.5 max-h-[50vh] overflow-y-auto">
+              {labels.map(t => {
+                const count = cardCountByTagId.get(t.id) ?? 0
+                return (
+                  <div key={t.id} className="flex items-center gap-2 py-1.5 px-2 hover:bg-[var(--surface-2)] rounded group">
+                    <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: t.color }} />
+                    <span className="text-[11px] text-[var(--text)] flex-1">{t.name}</span>
+                    <span className="text-[9px] text-[var(--text-muted)]">{count > 0 ? `${count} 卡` : '–'}</span>
+                    {t.isBuiltIn && <span className="text-[8px] text-[var(--text-muted)] px-1 border border-[var(--border)] rounded">內建</span>}
+                    <button onClick={() => setEditing({ ...t })}
+                      className="text-[9px] text-[var(--text-muted)] hover:text-[var(--gold)] hidden group-hover:inline px-1">改</button>
+                    {!t.isBuiltIn && (
+                      <button onClick={async () => {
+                        if (count > 0 && !window.confirm(`此標籤有 ${count} 張卡引用，刪除會清掉這些卡的標籤。確定？`)) return
+                        if (count === 0 && !window.confirm('刪除此標籤？')) return
+                        await onDelete(t.id)
+                      }}
+                        className="text-[9px] text-[var(--text-muted)] hover:text-red-400 hidden group-hover:inline px-1">刪</button>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+
+        {/* 編輯抽屜 */}
+        {editing && (
+          <TagEditPanel tag={editing} themes={themes}
+            onCancel={() => setEditing(null)}
+            onSave={async (patch) => { await onPatch(editing.id, patch); setEditing(null) }} />
+        )}
+        {creating && (
+          <TagEditPanel tag={creating} themes={themes}
+            isNew
+            onCancel={() => setCreating(null)}
+            onSave={async (data) => { await onCreate(data); setCreating(null) }} />
+        )}
+
+        <div className="px-4 py-2 border-t border-[var(--border)] text-[9px] text-[var(--text-muted)]">
+          內建 tag 不可刪（可改名 / 改色）；自訂 tag 刪除會同步清掉所有卡片的引用。
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function TagEditPanel({ tag, themes, isNew, onCancel, onSave }) {
+  const [name, setName] = useState(tag.name)
+  const [color, setColor] = useState(tag.color)
+  const [parentId, setParentId] = useState(tag.parentId ?? '')
+  const [kind, setKind] = useState(tag.kind ?? 'tag')
+
+  const PRESET_COLORS = ['#ef4444','#f59e0b','#eab308','#10b981','#06b6d4','#3b82f6','#8b5cf6','#ec4899','#f43f5e','#fb923c','#facc15','#22c55e','#14b8a6','#0ea5e9','#a78bfa','#fb7185']
+
+  return (
+    <div className="border-t border-[var(--gold)]/40 bg-[var(--surface-2)] p-3 grid grid-cols-2 gap-3">
+      <div>
+        <div className="text-[9px] uppercase tracking-widest text-[var(--text-muted)] mb-1">名稱</div>
+        <input value={name} onChange={e => setName(e.target.value)} autoFocus
+          className="w-full bg-[var(--surface)] border border-[var(--border)] rounded px-2 py-1 text-[11px] outline-none focus:border-[var(--gold-border)]" />
+      </div>
+      <div>
+        <div className="text-[9px] uppercase tracking-widest text-[var(--text-muted)] mb-1">類型</div>
+        <select value={kind} onChange={e => setKind(e.target.value)}
+          disabled={!isNew}
+          className="w-full bg-[var(--surface)] border border-[var(--border)] rounded px-2 py-1 text-[11px] outline-none disabled:opacity-50">
+          <option value="tag">標籤（扁平）</option>
+          <option value="theme">主題（可有層級）</option>
+        </select>
+      </div>
+      <div className="col-span-2">
+        <div className="text-[9px] uppercase tracking-widest text-[var(--text-muted)] mb-1">顏色</div>
+        <div className="flex gap-1 flex-wrap">
+          {PRESET_COLORS.map(c => (
+            <button key={c} onClick={() => setColor(c)}
+              style={{ backgroundColor: c, outline: color === c ? '2px solid white' : 'none' }}
+              className="w-5 h-5 rounded-full hover:scale-110 transition-transform" />
+          ))}
+          <input type="color" value={color} onChange={e => setColor(e.target.value)}
+            className="w-5 h-5 rounded cursor-pointer" />
+        </div>
+      </div>
+      {kind === 'theme' && (
+        <div className="col-span-2">
+          <div className="text-[9px] uppercase tracking-widest text-[var(--text-muted)] mb-1">父層（選填）</div>
+          <select value={parentId} onChange={e => setParentId(e.target.value)}
+            className="w-full bg-[var(--surface)] border border-[var(--border)] rounded px-2 py-1 text-[11px] outline-none">
+            <option value="">（根層）</option>
+            {themes.filter(t => t.id !== tag.id).map(t => (
+              <option key={t.id} value={t.id}>{t.name}</option>
+            ))}
+          </select>
+        </div>
+      )}
+      <div className="col-span-2 flex gap-2 justify-end">
+        <button onClick={onCancel}
+          className="text-[10px] px-3 py-1 rounded text-[var(--text-muted)] hover:text-[var(--text)] border border-[var(--border)]">取消</button>
+        <button onClick={() => onSave({ name: name.trim() || '(untitled)', color, parentId: parentId || null, kind })}
+          disabled={!name.trim()}
+          className="text-[10px] px-3 py-1 rounded text-[var(--gold)] border border-[var(--gold)] bg-[var(--gold)]/10 hover:bg-[var(--gold)]/20 disabled:opacity-40">
+          {isNew ? '新增' : '儲存'}
+        </button>
+      </div>
     </div>
   )
 }
