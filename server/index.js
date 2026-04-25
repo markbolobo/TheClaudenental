@@ -1344,6 +1344,500 @@ app.post('/api/ratings/history', async (request) => {
   return { ok: true }
 })
 
+// ─── Workflow Order (cross-device sync for 心腹 pill ordering) ───────────────
+
+const WF_ORDER_FILE = path.join(os.homedir(), '.claude', 'tc_workflow_order.json')
+
+app.get('/api/workflow-order', async () => {
+  try { return JSON.parse(fs.readFileSync(WF_ORDER_FILE, 'utf8')) }
+  catch { return { order: [] } }
+})
+
+app.post('/api/workflow-order', async (request) => {
+  const { order } = request.body ?? {}
+  if (!Array.isArray(order)) return { ok: false, error: 'order must be array' }
+  fs.writeFileSync(WF_ORDER_FILE, JSON.stringify({ order }), 'utf8')
+  return { ok: true }
+})
+
+// ─── Events Log (atomic event journal — 為 Phase 4 禮遇後台囤資料) ───────────
+
+const METRICS_DIR = path.join(os.homedir(), '.claude', 'tc_metrics')
+const EVENTS_DIR  = path.join(METRICS_DIR, 'events')
+
+function ensureMetricsDir() {
+  try {
+    if (!fs.existsSync(METRICS_DIR)) fs.mkdirSync(METRICS_DIR, { recursive: true })
+    if (!fs.existsSync(EVENTS_DIR))  fs.mkdirSync(EVENTS_DIR,  { recursive: true })
+  } catch {}
+}
+ensureMetricsDir()
+
+function todayStamp() {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+// 寫一筆原子事件（fire-and-forget, append-only, 一日一檔）
+function logEvent(kind, data) {
+  try {
+    const file = path.join(EVENTS_DIR, `${todayStamp()}.jsonl`)
+    fs.appendFileSync(file, JSON.stringify({ ts: Date.now(), kind, data }) + '\n', 'utf8')
+  } catch {}
+}
+
+// 讀今日 / 指定日 / 範圍 events（給 Phase 4 儀表板用）
+app.get('/api/metrics/events', async (request) => {
+  const { date, from, to, kind } = request.query ?? {}
+  const want = []
+  try {
+    const files = fs.readdirSync(EVENTS_DIR).filter(f => f.endsWith('.jsonl'))
+    for (const f of files) {
+      const day = f.slice(0, -6)
+      if (date && day !== date) continue
+      if (from && day < from) continue
+      if (to   && day > to)   continue
+      const lines = fs.readFileSync(path.join(EVENTS_DIR, f), 'utf8').split('\n').filter(Boolean)
+      for (const line of lines) {
+        try {
+          const ev = JSON.parse(line)
+          if (kind && ev.kind !== kind) continue
+          want.push(ev)
+        } catch {}
+      }
+    }
+  } catch {}
+  return { events: want, count: want.length }
+})
+
+// ─── TODO Board (對話驅動 7 欄位看板，跨裝置同步) ─────────────────────────
+
+const TODOS_FILE     = path.join(os.homedir(), '.claude', 'tc_todos.json')
+const TODO_TAGS_FILE = path.join(os.homedir(), '.claude', 'tc_todo_tags.json')
+
+const COLUMNS = ['idea', 'discussing', 'doing', 'verifying', 'done', 'paused', 'storage']
+
+// 預定義 tag（首次存取時 seed），使用者可改可刪可加
+const SEED_TAGS = [
+  { id: 'theme-web',    name: 'web',           parentId: null,       color: '#3b82f6', isBuiltIn: true, kind: 'theme' },
+  { id: 'theme-ue',     name: 'UE',            parentId: null,       color: '#ef4444', isBuiltIn: true, kind: 'theme' },
+  { id: 'theme-self',   name: '個人',          parentId: null,       color: '#eab308', isBuiltIn: true, kind: 'theme' },
+  { id: 'ue-combat',    name: 'UE/戰鬥',       parentId: 'theme-ue', color: '#ef4444', isBuiltIn: true, kind: 'theme' },
+  { id: 'ue-anim',      name: 'UE/動畫',       parentId: 'theme-ue', color: '#ef4444', isBuiltIn: true, kind: 'theme' },
+  { id: 'ue-ui',        name: 'UE/UI',         parentId: 'theme-ue', color: '#ef4444', isBuiltIn: true, kind: 'theme' },
+  { id: 'ue-ai',        name: 'UE/AI',         parentId: 'theme-ue', color: '#ef4444', isBuiltIn: true, kind: 'theme' },
+  { id: 'tag-debug',    name: 'debug',         parentId: null,       color: '#a78bfa', isBuiltIn: true, kind: 'tag' },
+  { id: 'tag-knowledge',name: 'knowledge',     parentId: null,       color: '#22d3ee', isBuiltIn: true, kind: 'tag' },
+  { id: 'tag-refactor', name: 'refactor',      parentId: null,       color: '#fb923c', isBuiltIn: true, kind: 'tag' },
+  { id: 'tag-bug',      name: 'bug',           parentId: null,       color: '#f43f5e', isBuiltIn: true, kind: 'tag' },
+  { id: 'tag-feature',  name: 'feature',       parentId: null,       color: '#10b981', isBuiltIn: true, kind: 'tag' },
+  { id: 'tag-idea',     name: 'idea',          parentId: null,       color: '#facc15', isBuiltIn: true, kind: 'tag' },
+]
+
+function readTodos() {
+  try { return JSON.parse(fs.readFileSync(TODOS_FILE, 'utf8')) } catch { return { cards: [] } }
+}
+function writeTodos(data) { fs.writeFileSync(TODOS_FILE, JSON.stringify(data, null, 2), 'utf8') }
+
+function readTodoTags() {
+  try { return JSON.parse(fs.readFileSync(TODO_TAGS_FILE, 'utf8')) }
+  catch {
+    const seeded = { tags: SEED_TAGS }
+    try { fs.writeFileSync(TODO_TAGS_FILE, JSON.stringify(seeded, null, 2), 'utf8') } catch {}
+    return seeded
+  }
+}
+function writeTodoTags(data) { fs.writeFileSync(TODO_TAGS_FILE, JSON.stringify(data, null, 2), 'utf8') }
+
+// Cards — 預設過濾掉 soft-deleted；?includeDeleted=1 看全部
+app.get('/api/todos', async (request) => {
+  const data = readTodos()
+  const includeDeleted = request.query?.includeDeleted === '1'
+  return { cards: includeDeleted ? data.cards : data.cards.filter(c => !c.deletedAt) }
+})
+
+// 垃圾桶（只看 deleted）
+app.get('/api/todos/trash', async () => {
+  const data = readTodos()
+  return { cards: data.cards.filter(c => c.deletedAt).sort((a, b) => b.deletedAt - a.deletedAt) }
+})
+
+app.post('/api/todos', async (request) => {
+  const data = readTodos()
+  const body = request.body ?? {}
+  const card = {
+    id: `c${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    title: body.title ?? '(untitled)',
+    column: COLUMNS.includes(body.column) ? body.column : 'idea',
+    themeId: body.themeId ?? null,
+    tagIds: Array.isArray(body.tagIds) ? body.tagIds : [],
+    note: body.note ?? '',
+    parentId: body.parentId ?? null,
+    sessionId: body.sessionId ?? null,
+    lastDiscussedAt: body.sessionId ? Date.now() : null,
+    lastSummary: body.lastSummary ?? '',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    order: typeof body.order === 'number' ? body.order : Date.now(),
+    version: 1,            // ETag — 每次 PATCH +1
+    deletedAt: null,       // soft delete timestamp
+  }
+  data.cards.push(card)
+  writeTodos(data)
+  logEvent('card.create', { id: card.id, column: card.column, themeId: card.themeId, title: card.title })
+  return { ok: true, card }
+})
+
+app.patch('/api/todos/:id', async (request, reply) => {
+  const data = readTodos()
+  const card = data.cards.find(c => c.id === request.params.id)
+  if (!card) { reply.code(404); return { ok: false, error: 'not found' } }
+
+  // ETag 衝突偵測：If-Match header 帶 version；不符回 409
+  const ifMatch = request.headers['if-match']
+  if (ifMatch !== undefined && Number(ifMatch) !== card.version) {
+    reply.code(409)
+    return { ok: false, error: 'version conflict', currentVersion: card.version, currentCard: card }
+  }
+
+  const patch = request.body ?? {}
+  delete patch.id
+  delete patch.createdAt
+  delete patch.version
+  delete patch.deletedAt
+  const prevColumn = card.column
+  Object.assign(card, patch, { updatedAt: Date.now(), version: (card.version ?? 1) + 1 })
+  if (patch.column === 'discussing' || patch.sessionId) card.lastDiscussedAt = Date.now()
+  writeTodos(data)
+  logEvent('card.update', { id: card.id, patch, prevColumn, newColumn: card.column })
+  if (patch.column && patch.column !== prevColumn)
+    logEvent('card.move', { id: card.id, from: prevColumn, to: patch.column })
+  return { ok: true, card }
+})
+
+// Soft delete — 進垃圾桶（30 天可還原 / 真刪）
+app.delete('/api/todos/:id', async (request) => {
+  const data = readTodos()
+  const card = data.cards.find(c => c.id === request.params.id)
+  if (!card) return { ok: false, error: 'not found' }
+  card.deletedAt = Date.now()
+  card.version = (card.version ?? 1) + 1
+  writeTodos(data)
+  logEvent('card.delete', { id: card.id, title: card.title, column: card.column })
+  return { ok: true }
+})
+
+// 還原（從垃圾桶撈回看板）
+app.post('/api/todos/:id/restore', async (request) => {
+  const data = readTodos()
+  const card = data.cards.find(c => c.id === request.params.id)
+  if (!card) return { ok: false, error: 'not found' }
+  card.deletedAt = null
+  card.version = (card.version ?? 1) + 1
+  writeTodos(data)
+  logEvent('card.restore', { id: card.id })
+  return { ok: true, card }
+})
+
+// 真刪（垃圾桶內手動清掉）
+app.post('/api/todos/:id/purge', async (request) => {
+  const data = readTodos()
+  const before = data.cards.length
+  data.cards = data.cards.filter(c => c.id !== request.params.id)
+  writeTodos(data)
+  logEvent('card.purge', { id: request.params.id })
+  return { ok: true, removed: before - data.cards.length }
+})
+
+// 批次重排
+app.post('/api/todos/reorder', async (request) => {
+  const data = readTodos()
+  const updates = Array.isArray(request.body?.updates) ? request.body.updates : []
+  const byId = new Map(data.cards.map(c => [c.id, c]))
+  for (const u of updates) {
+    const card = byId.get(u.id)
+    if (!card) continue
+    if (u.column !== undefined) card.column = u.column
+    if (u.order  !== undefined) card.order  = u.order
+    card.updatedAt = Date.now()
+    card.version = (card.version ?? 1) + 1
+  }
+  writeTodos(data)
+  logEvent('card.reorder', { count: updates.length })
+  return { ok: true, updated: updates.length }
+})
+
+// Tag 循環防護 — 檢查若把 tagId 設成 newParentId 是否會形成循環
+function wouldCreateCycle(tags, tagId, newParentId) {
+  if (!newParentId) return false
+  if (newParentId === tagId) return true
+  const byId = new Map(tags.map(t => [t.id, t]))
+  let cur = byId.get(newParentId)
+  let hops = 0
+  while (cur && hops++ < 16) {
+    if (cur.id === tagId) return true
+    if (!cur.parentId) return false
+    cur = byId.get(cur.parentId)
+  }
+  return false  // hop limit 也視為安全（避免誤拒）
+}
+
+// Tags
+app.get('/api/todo-tags', async () => readTodoTags())
+
+app.post('/api/todo-tags', async (request, reply) => {
+  const data = readTodoTags()
+  const body = request.body ?? {}
+  const id = body.id ?? `t-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+  // 新建時也檢查 parentId 是否存在（防止懸空）
+  if (body.parentId && !data.tags.find(t => t.id === body.parentId)) {
+    reply.code(400)
+    return { ok: false, error: 'parentId not found' }
+  }
+  const tag = {
+    id,
+    name: body.name ?? 'untitled',
+    parentId: body.parentId ?? null,
+    color: body.color ?? '#9ca3af',
+    isBuiltIn: false,
+    kind: body.kind === 'theme' ? 'theme' : 'tag',
+  }
+  data.tags.push(tag)
+  writeTodoTags(data)
+  logEvent('tag.create', { id: tag.id, name: tag.name, kind: tag.kind })
+  return { ok: true, tag }
+})
+
+app.patch('/api/todo-tags/:id', async (request, reply) => {
+  const data = readTodoTags()
+  const tag = data.tags.find(t => t.id === request.params.id)
+  if (!tag) { reply.code(404); return { ok: false, error: 'not found' } }
+  const patch = request.body ?? {}
+  delete patch.id
+  // 循環防護：若改 parentId 要驗證
+  if (patch.parentId !== undefined && patch.parentId !== null) {
+    if (!data.tags.find(t => t.id === patch.parentId)) {
+      reply.code(400); return { ok: false, error: 'parentId not found' }
+    }
+    if (wouldCreateCycle(data.tags, tag.id, patch.parentId)) {
+      reply.code(400); return { ok: false, error: 'would create tag cycle' }
+    }
+  }
+  Object.assign(tag, patch)
+  writeTodoTags(data)
+  logEvent('tag.update', { id: tag.id, patch })
+  return { ok: true, tag }
+})
+
+app.delete('/api/todo-tags/:id', async (request) => {
+  const tagId = request.params.id
+  const replaceWith = request.query.replaceWith ?? null
+  const tagsData = readTodoTags()
+  const tag = tagsData.tags.find(t => t.id === tagId)
+  if (!tag) return { ok: false, error: 'not found' }
+  if (tag.isBuiltIn) return { ok: false, error: 'built-in tag cannot be deleted (rename/recolor instead)' }
+
+  const todosData = readTodos()
+  let touched = 0
+  for (const card of todosData.cards) {
+    const before = card.tagIds.length
+    card.tagIds = card.tagIds.filter(id => id !== tagId)
+    if (replaceWith && before !== card.tagIds.length && !card.tagIds.includes(replaceWith))
+      card.tagIds.push(replaceWith)
+    if (card.themeId === tagId) card.themeId = replaceWith
+    if (card.tagIds.length !== before || card.themeId !== tag.id) {
+      touched++
+      card.version = (card.version ?? 1) + 1
+    }
+  }
+  for (const t of tagsData.tags) if (t.parentId === tagId) t.parentId = null
+
+  tagsData.tags = tagsData.tags.filter(t => t.id !== tagId)
+  writeTodoTags(tagsData)
+  writeTodos(todosData)
+  logEvent('tag.delete', { id: tagId, replaceWith, cardsTouched: touched })
+  return { ok: true, cardsTouched: touched }
+})
+
+// ─── FB Content Push (bookmarklet bypass for login wall) ─────────────────────
+
+const FB_CONTENT_FILE = path.join(os.homedir(), '.claude', 'fb_content.json')
+
+function readFbContent() {
+  try { return JSON.parse(fs.readFileSync(FB_CONTENT_FILE, 'utf8')) } catch { return [] }
+}
+function writeFbContent(data) {
+  fs.writeFileSync(FB_CONTENT_FILE, JSON.stringify(data.slice(-50), null, 2), 'utf8')
+}
+
+// CORS pre-flight for bookmarklet posting from facebook.com
+app.options('/api/fb-push', async (request, reply) => {
+  reply.header('Access-Control-Allow-Origin', '*')
+  reply.header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+  reply.header('Access-Control-Allow-Headers', 'Content-Type')
+  reply.code(204).send()
+})
+
+app.post('/api/fb-push', async (request, reply) => {
+  reply.header('Access-Control-Allow-Origin', '*')
+  const b = request.body ?? {}
+  const entry = {
+    id:       'fb_' + Date.now(),
+    ts:       Date.now(),
+    url:      b.url      || '',
+    author:   b.author   || '',
+    content:  b.content  || '',
+    comments: Array.isArray(b.comments) ? b.comments : [],
+    links:    Array.isArray(b.links)    ? b.links    : [],
+    images:   Array.isArray(b.images)   ? b.images   : [],
+  }
+  const all = readFbContent(); all.push(entry); writeFbContent(all)
+  return { ok: true, id: entry.id, length: entry.content.length }
+})
+
+app.get('/api/fb-push',        async () => ({ list: readFbContent() }))
+app.get('/api/fb-push/latest', async () => {
+  const all = readFbContent()
+  return all[all.length - 1] || null
+})
+
+// ─── Bookmarklet install page (drag-and-drop to bookmarks bar) ───────────────
+
+// 改用 window.open 到 /fb-receive，在我們 origin 的頁面做 POST
+// 這樣 FB 的 CSP connect-src 限制不會影響到我們
+const FB_BOOKMARKLET = `javascript:(function(){try{var p=document.querySelector('[role="article"]')||document.querySelector('[data-pagelet*="FeedUnit"]')||document.body;var texts=Array.from(p.querySelectorAll('*')).filter(function(e){return e.children.length===0&&e.textContent.trim()}).map(function(e){return e.textContent.trim()});var u=Array.from(new Set(texts)).filter(function(t){return t.length>8&&!/^(讚|留言|分享|回覆|追蹤|關注|·|Like|Comment|Share|Reply|All reactions)$/i.test(t)});var author=(p.querySelector('h3 a,h4 a,strong a[role="link"]')||{}).textContent||'';var links=Array.from(p.querySelectorAll('a[href]')).map(function(a){return a.href}).filter(function(h){return h&&!h.includes('facebook.com/')&&!h.includes('fb.com/')&&!h.startsWith('javascript:')&&!h.includes('/privacy')&&!h.includes('/help')});var imgs=Array.from(p.querySelectorAll('img')).map(function(i){return i.src}).filter(function(s){return s&&s.includes('scontent')}).slice(0,10);var content=u.slice(0,100).join('\\n');var comments=u.slice(100,300);var data={url:location.href,author:author.trim(),content:content,comments:comments,links:Array.from(new Set(links)),images:imgs};var host='http://100.115.110.21:3001';var encoded=encodeURIComponent(JSON.stringify(data));if(encoded.length>200000){alert('內容太長，請縮減選取範圍');return}window.open(host+'/fb-receive#'+encoded,'_blank');}catch(e){alert('✗ 錯誤：'+e.message)}})();`
+
+// 接收頁面：bookmarklet 開新分頁到這裡，本頁的 JS 讀 hash 解碼後 POST 到 /api/fb-push
+// 因為本頁和 /api/fb-push 同源，不會被 FB 的 CSP 影響
+app.get('/fb-receive', async (request, reply) => {
+  reply.type('text/html; charset=utf-8')
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>📤 送往 Claude...</title>
+<style>
+  body { font-family: system-ui,-apple-system,"Microsoft JhengHei",sans-serif; background: #0a0a0a; color: #e6e6e6; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+  .box { text-align: center; padding: 40px; border: 1px solid #2a2a2a; border-radius: 12px; background: #141414; max-width: 480px; }
+  .status { font-size: 20px; margin-bottom: 12px; }
+  .meta { color: #888; font-size: 13px; line-height: 1.8; }
+  .ok { color: #4ade80; }
+  .err { color: #f87171; }
+  .btn { display: inline-block; margin-top: 16px; padding: 8px 20px; background: #c9a227; color: #0a0a0a; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }
+</style></head><body>
+<div class="box">
+  <div id="status" class="status">傳送中…</div>
+  <div id="meta" class="meta">正在解碼 FB 內容</div>
+  <button class="btn" id="closeBtn" style="display:none" onclick="window.close()">關閉視窗</button>
+</div>
+<script>
+(async function(){
+  const s = document.getElementById('status');
+  const m = document.getElementById('meta');
+  const b = document.getElementById('closeBtn');
+  try {
+    const encoded = location.hash.slice(1);
+    if (!encoded) throw new Error('沒有接收到資料（hash 為空）');
+    const data = JSON.parse(decodeURIComponent(encoded));
+    m.innerText = '解碼成功：' + (data.content ? data.content.length + ' 字' : '內容為空');
+    const res = await fetch('/api/fb-push', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const r = await res.json();
+    if (r.ok) {
+      s.className = 'status ok';
+      s.innerText = '✓ 已送到 Claude';
+      m.innerText = '內文 ' + (data.content||'').length + ' 字 · 留言 ' + (data.comments||[]).length + ' 段 · 連結 ' + (data.links||[]).length + ' 個';
+      b.style.display = 'inline-block';
+      setTimeout(() => window.close(), 2500);
+    } else {
+      throw new Error(r.error || '未知錯誤');
+    }
+  } catch (e) {
+    s.className = 'status err';
+    s.innerText = '✗ 失敗';
+    m.innerText = e.message;
+    b.style.display = 'inline-block';
+  }
+})();
+</script>
+</body></html>`
+})
+
+app.get('/bookmarklet', async (request, reply) => {
+  reply.type('text/html; charset=utf-8')
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>📤 送到 Claude — 安裝</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Microsoft JhengHei", sans-serif; background: #0a0a0a; color: #e6e6e6; max-width: 640px; margin: 40px auto; padding: 20px; line-height: 1.7; }
+  h1 { color: #c9a227; font-size: 22px; }
+  h2 { color: #c9a227; font-size: 15px; margin-top: 30px; border-bottom: 1px solid #2a2a2a; padding-bottom: 6px; }
+  .dragbtn { display: inline-block; padding: 14px 24px; background: linear-gradient(135deg,#c9a227,#8f6d00); color: #0a0a0a; font-weight: 700; font-size: 16px; border-radius: 8px; text-decoration: none; box-shadow: 0 4px 12px rgba(201,162,39,0.3); cursor: grab; user-select: none; }
+  .dragbtn:active { cursor: grabbing; }
+  .step { background: #141414; border: 1px solid #2a2a2a; border-radius: 6px; padding: 12px 16px; margin: 10px 0; }
+  .step .num { color: #c9a227; font-weight: 700; margin-right: 8px; }
+  code { background: #1a1a1a; padding: 2px 6px; border-radius: 3px; font-size: 13px; color: #e2c27d; }
+  .note { color: #888; font-size: 13px; margin-top: 6px; }
+  kbd { background: #2a2a2a; border: 1px solid #444; border-radius: 3px; padding: 1px 6px; font-size: 12px; }
+</style></head><body>
+<h1>📤 送到 Claude — 拖曳安裝</h1>
+<p>把下方金色按鈕<b>拖曳到</b>瀏覽器書籤列（通常在網址列下方），即完成安裝。</p>
+
+<p style="margin: 30px 0; text-align: center;">
+  <a class="dragbtn" href='${FB_BOOKMARKLET}' onclick="event.preventDefault(); alert('請用拖曳的方式把我拉到書籤列，不要點擊 :)');">📤 送到 Claude</a>
+</p>
+
+<h2>安裝步驟</h2>
+<div class="step"><span class="num">1</span>確認書籤列有顯示：<kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>B</kbd> 切換</div>
+<div class="step"><span class="num">2</span>用滑鼠按住上方金色按鈕 → <b>拖到書籤列任一位置</b> → 放開</div>
+<div class="step"><span class="num">3</span>出現「📤 送到 Claude」書籤即成功 ✓</div>
+
+<h2>使用方式</h2>
+<div class="step"><span class="num">1</span>Edge 開任一 FB 貼文（登入狀態）</div>
+<div class="step"><span class="num">2</span>需要看完整留言的話，先手動點開「查看更多留言」</div>
+<div class="step"><span class="num">3</span>點書籤列的「📤 送到 Claude」</div>
+<div class="step"><span class="num">4</span>看到 alert <code>✓ 已送到 Claude</code> 即成功</div>
+<div class="step"><span class="num">5</span>回 TheClaudenental → Chat → 點 ⚡ → 點「📋 FB 暫存」</div>
+
+<h2>疑難排解</h2>
+<div class="step">
+  <b>拖不動？</b><br>
+  Edge 有時會擋 <code>javascript:</code> bookmark。解法：<br>
+  1. 書籤列空白處右鍵 → 新增書籤<br>
+  2. 名稱：<code>📤 送到 Claude</code><br>
+  3. 網址：<a href="#" onclick="navigator.clipboard.writeText(${JSON.stringify(FB_BOOKMARKLET)}); this.textContent='✓ 已複製到剪貼簿，貼進書籤網址欄位'; return false;" style="color:#c9a227;">點此複製程式碼</a> → 貼進 URL 欄位
+</div>
+<div class="step">
+  <b>點了沒反應？</b><br>
+  確認 TheClaudenental server 運行中（<code>pm2 list</code> 看 <code>claudenental-server</code> 是 online）
+</div>
+<p class="note">書籤裡的程式碼指向 <code>http://100.115.110.21:3001</code>（Tailscale IP）。若你離開家用網路，需要修改為當時可連到的 server 位址。</p>
+</body></html>`
+})
+
+// ─── Open URL in specific browser (bypass Chrome extension conflicts) ────────
+
+app.post('/api/open-url', async (request) => {
+  const { url, browser } = request.body ?? {}
+  if (!url) return { ok: false, error: 'missing url' }
+  try { new URL(url) } catch { return { ok: false, error: 'invalid url' } }
+
+  // Windows: use `start` shell command with browser name
+  // msedge / chrome / firefox are registered as application names
+  const browserMap = {
+    edge:    ['cmd', ['/c', 'start', '', 'msedge', url]],
+    chrome:  ['cmd', ['/c', 'start', '', 'chrome',  url]],
+    firefox: ['cmd', ['/c', 'start', '', 'firefox', url]],
+    default: ['cmd', ['/c', 'start', '', url]],
+  }
+  const [cmd, args] = browserMap[browser] ?? browserMap.default
+  try {
+    const p = spawn(cmd, args, { detached: true, stdio: 'ignore', shell: false })
+    p.unref()
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: e.message }
+  }
+})
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 await app.listen({ port: PORT, host: '0.0.0.0' })

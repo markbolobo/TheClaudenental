@@ -1,7 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { DndContext, PointerSensor, TouchSensor, useSensor, useSensors, closestCenter } from '@dnd-kit/core'
+import { SortableContext, useSortable, arrayMove, horizontalListSortingStrategy } from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
 import { useCostEngine, BountyOverlay, BountyToast, ContractModal, fmtCost, computeDeltaCost } from './BountySystem.jsx'
+import { TodoBoard } from './TodoBoard.jsx'
 import BountySettings from './BountySettings.jsx'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -798,6 +802,40 @@ function CheckpointsPanel({ selected }) {
   )
 }
 
+// ─── Facebook link interceptor ────────────────────────────────────────────────
+// Chrome 可能有擴充元件導致 FB 頁面無法顯示，FB 網域連結改走 Edge
+const FB_DOMAINS = /^(?:www\.|m\.|web\.)?(?:facebook\.com|fb\.com|fb\.me|messenger\.com)$/i
+
+function isFacebookUrl(href) {
+  try { return FB_DOMAINS.test(new URL(href).hostname) } catch { return false }
+}
+
+function openInEdge(url) {
+  fetch('/api/open-url', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, browser: 'edge' }),
+  }).catch(() => {})
+}
+
+// ReactMarkdown component override: 攔截 FB 連結走 Edge
+const mdComponents = {
+  a({ href, children, ...rest }) {
+    if (href && isFacebookUrl(href)) {
+      return (
+        <a href={href}
+          onClick={e => { e.preventDefault(); openInEdge(href) }}
+          onTouchEnd={e => { e.preventDefault(); openInEdge(href) }}
+          title="用 Edge 開啟（避開 Chrome 擴充衝突）"
+          style={{ touchAction: 'manipulation' }}
+          {...rest}>
+          {children} <span style={{ fontSize: '0.85em', opacity: 0.7 }}>🌐</span>
+        </a>
+      )
+    }
+    return <a href={href} target="_blank" rel="noopener noreferrer" {...rest}>{children}</a>
+  },
+}
+
 // ─── Rating System ────────────────────────────────────────────────────────────
 // 被動訊號（不評分）= 可接受，低權重；主動訊號（明確評分）= 高權重。
 // 兩者共同描繪「規矩」（好球帶），定期分析後寫入偏好文字。
@@ -1030,6 +1068,11 @@ function MessageRating({ id, text, serverRating }) {
         className="text-[8px] px-2 py-0.5 rounded border border-[var(--gold)]/60 text-[var(--gold)] bg-[var(--gold)]/10 hover:bg-[var(--gold)]/20">
         完成
       </button>
+      <button onClick={() => { setPhase('idle'); setSelTags([]); setReaction(null) }}
+        title={saved?.explicit ? '取消修改（保留原評分）' : '取消評分'}
+        className="text-[8px] px-2 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text)] hover:border-[var(--gold-border)]">
+        ✕ 取消
+      </button>
     </div>
   )
 }
@@ -1037,6 +1080,112 @@ function MessageRating({ id, text, serverRating }) {
 // ─── Chat Panel ───────────────────────────────────────────────────────────────
 
 function normPath(p) { return (p ?? '').replace(/\\/g, '/').toLowerCase().replace(/\/$/, '') }
+
+function ContinueButton({ handleSend, setShowWorkflow, running }) {
+  const [mode, setMode] = useState(null) // null | 'input'
+  const [desc, setDesc] = useState('')
+  const inputRef = useRef(null)
+
+  function fire(text) {
+    setShowWorkflow(false)
+    setMode(null)
+    setDesc('')
+    handleSend(text)
+  }
+
+  function handleClick() {
+    if (mode === null) {
+      setMode('input')
+      setTimeout(() => inputRef.current?.focus(), 50)
+    }
+  }
+
+  function handleSendContinue() {
+    const trimmed = desc.trim()
+    fire(trimmed ? `請繼續\n\n補充說明：${trimmed}` : '請繼續')
+  }
+
+  if (mode === 'input') return (
+    <div className="shrink-0 flex items-center gap-1 px-2 py-1 rounded-full border border-green-500/60 bg-[var(--surface)] text-[9px]">
+      <input
+        ref={inputRef}
+        value={desc}
+        onChange={e => setDesc(e.target.value)}
+        onKeyDown={e => {
+          if (e.key === 'Enter') handleSendContinue()
+          if (e.key === 'Escape') { setMode(null); setDesc('') }
+        }}
+        placeholder="補充說明（選填）"
+        className="bg-transparent text-[var(--text)] outline-none w-28 placeholder:text-[var(--text-muted)]"
+      />
+      <button onClick={handleSendContinue}
+        className="text-green-400 font-bold hover:text-green-300 px-1">▶</button>
+      <button onClick={() => { setMode(null); setDesc('') }}
+        className="text-[var(--text-muted)] hover:text-[var(--text)] px-0.5">✕</button>
+    </div>
+  )
+
+  return (
+    <button
+      onClick={handleClick}
+      onTouchEnd={e => { e.preventDefault(); handleClick() }}
+      disabled={running}
+      style={{ touchAction: 'manipulation' }}
+      className="shrink-0 flex items-center gap-1 px-2 py-1 rounded-full text-[9px] font-semibold tracking-wide border border-green-500/60 text-green-400 hover:bg-green-500/10 transition-colors disabled:opacity-40">
+      <span>▶</span><span>請繼續</span>
+    </button>
+  )
+}
+
+// 共用 tooltip：滑鼠常駐時顯示說明（全站可用，不影響 drag/click）
+function Tooltip({ content, placement = 'top', maxWidth = 260, children, disabled = false }) {
+  const [show, setShow] = useState(false)
+  if (!content || disabled) return children
+  const posClass = placement === 'bottom' ? 'top-full mt-1' : 'bottom-full mb-1'
+  return (
+    <span className="relative inline-flex"
+      onMouseEnter={() => setShow(true)}
+      onMouseLeave={() => setShow(false)}
+      onFocus={() => setShow(true)}
+      onBlur={() => setShow(false)}>
+      {children}
+      {show && (
+        <span
+          role="tooltip"
+          style={{ maxWidth }}
+          className={`absolute z-50 ${posClass} left-1/2 -translate-x-1/2 whitespace-pre-wrap px-2 py-1 rounded bg-[var(--surface-2)] border border-[var(--gold-border)] text-[10px] leading-relaxed text-[var(--text)] shadow-lg pointer-events-none`}>
+          {content}
+        </span>
+      )}
+    </span>
+  )
+}
+
+function SortablePill({ wf, wfType, setWfType }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: wf.id })
+  return (
+    <Tooltip content={wf.desc} disabled={isDragging}>
+      <button
+        ref={setNodeRef}
+        {...attributes}
+        {...listeners}
+        onClick={() => setWfType(wf.id === wfType ? null : wf.id)}
+        style={{
+          transform: CSS.Transform.toString(transform),
+          transition,
+          opacity: isDragging ? 0.5 : 1,
+          touchAction: 'manipulation',
+        }}
+        className={`shrink-0 flex items-center gap-1 px-2 py-1 rounded-full text-[9px] font-semibold tracking-wide border transition-colors cursor-grab active:cursor-grabbing ${
+          wfType === wf.id
+            ? 'bg-[var(--gold)]/20 border-[var(--gold)] text-[var(--gold)]'
+            : 'border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text)]'
+        }`}>
+        <span>{wf.icon}</span><span>{wf.label}</span>
+      </button>
+    </Tooltip>
+  )
+}
 
 function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) {
   const [projectPath, setProjectPath] = useState('C:/Project/RomanPrototype')
@@ -1050,11 +1199,27 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
   const [wfUrl, setWfUrl]                   = useState('')
   const [wfThought, setWfThought]           = useState('')
   const [injectOnce, setInjectOnce]         = useState(false)  // B機制：單次注入偏好
+  const [pendingQueue, setPendingQueue]     = useState(() => {
+    // 從 localStorage 復原（Vite HMR / F5 / tab 卸載後重開都能接續）
+    try {
+      const raw = localStorage.getItem('tc_pending_queue')
+      if (!raw) return []
+      const parsed = JSON.parse(raw)
+      // 附件（File/Blob）無法序列化，復原後只剩文字
+      return Array.isArray(parsed) ? parsed.map(p => ({ text: p.text, attachments: [], ts: p.ts })) : []
+    } catch { return [] }
+  })
+  const [fbBuffer, setFbBuffer]             = useState([])     // FB 暫存列表
+  const [workflowOrder, setWorkflowOrder]   = useState([])     // 心腹 pill 排序（跨裝置同步）
+  const [withEvaluation, setWithEvaluation] = useState(true)   // 決策類心腹附上評估框架（D 方案）
   const fileInputRef = useRef(null)
   const attachMenuRef = useRef(null)
   const [sessionId, setSessionId] = useState(null)
   const [messages, setMessages] = useState([])
   const bottomRef = useRef(null)
+  const scrollContainerRef = useRef(null)
+  const isNearBottomRef = useRef(true)
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false)
   const prevChatInitRef = useRef(null)
   // Live streaming block (rAF-batched to avoid per-token re-renders)
   const liveBlockRef = useRef(null)  // { type: 'thinking'|'text', text: string } | null
@@ -1070,20 +1235,25 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
   // Guards against processing the same streamEvent twice (useEffect re-runs on dep change)
   const lastEvTsRef = useRef(0)
 
-  // Apply chatInit when it changes (from History "Continue in Chat" or session click)
+  // Apply chatInit when it changes (from History "Continue in Chat" / session click / TODO drag-trigger)
   useEffect(() => {
     if (!chatInit) return
     if (chatInit === prevChatInitRef.current) return
     prevChatInitRef.current = chatInit
-    setProjectPath(chatInit.projectPath)
+    if (chatInit.projectPath) setProjectPath(chatInit.projectPath)
     setSessionId(chatInit.sessionId)
+    // 預填輸入框（TODO 拖卡帶來的 prompt 模板）
+    if (chatInit.prefillText) setInput(chatInit.prefillText)
+    // 新 session（從 TODO 拖卡選「新聊天室」）— 不 load history
+    if (!chatInit.sessionId) {
+      setMessages([])
+      return
+    }
     setMessages([{ role: 'system', text: '載入歷史紀錄…', ts: Date.now() }])
-    // Start live-tailing for VS Code session incremental updates
     fetch('/api/session/watch', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionId: chatInit.sessionId }),
     }).catch(() => {})
-    // Load history from API (single source of truth for past messages)
     fetch(`/api/history/${chatInit.sessionId}`)
       .then(r => r.json())
       .then(d => {
@@ -1095,6 +1265,13 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
       })
       .catch(() => setMessages([{ role: 'system', text: '歷史紀錄載入失敗', ts: Date.now() }]))
   }, [chatInit])
+
+  // On mount: 拉取 workflow 排序（跨裝置同步）
+  useEffect(() => {
+    fetch('/api/workflow-order').then(r => r.json()).then(d => {
+      if (Array.isArray(d.order) && d.order.length) setWorkflowOrder(d.order)
+    }).catch(() => {})
+  }, [])
 
   // On mount: flush pending ratings → merge server data into cache → build id map
   useEffect(() => {
@@ -1234,20 +1411,63 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
     if (liveUpdated) scheduleLiveUpdate()
   }, [streamEvents, projectPath, sessionId])
 
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
+  useEffect(() => {
+    if (!isNearBottomRef.current) return
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
+
+  function handleChatScroll() {
+    const el = scrollContainerRef.current
+    if (!el) return
+    const nearBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) <= 80
+    isNearBottomRef.current = nearBottom
+    setShowJumpToLatest(!nearBottom)
+  }
+
+  function jumpToLatest() {
+    isNearBottomRef.current = true
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    setShowJumpToLatest(false)
+  }
+
+  async function doActualSend(text, atts) {
+    const rawPrompt = text || (atts.length ? '請查看附件' : '')
+    const prefText  = localStorage.getItem(PREF_TEXT_KEY) || ''
+    const prompt    = (injectOnce && prefText)
+      ? `[使用者回應偏好（本次請遵循）：\n${prefText}]\n\n${rawPrompt}`
+      : rawPrompt
+    if (injectOnce) setInjectOnce(false)
+    runningRef.current = true
+    setRunning(true)
+    const displayText = prompt + (atts.length ? `\n${atts.map(a => `[${a.name}]`).join(' ')}` : '')
+    setMessages(m => [...m, { role: 'user', text: displayText, attachments: atts, ts: Date.now() }])
+    try {
+      const res = await fetch('/api/claude/run', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectPath, prompt, sessionId, attachments: atts }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || !data.ok) {
+        setRunning(false); runningRef.current = false
+        const reason = data.error ?? `HTTP ${res.status}`
+        setMessages(m => [...m, { role: 'result', text: `發送失敗：${reason}`, ts: Date.now() }])
+      }
+    } catch (err) {
+      setRunning(false); runningRef.current = false
+      setMessages(m => [...m, { role: 'result', text: `發送失敗：${err.message}`, ts: Date.now() }])
+    }
+  }
 
   async function handleSend(overrideText) {
     const text = (overrideText ?? input).trim()
-    if (!text && attachments.length === 0) return
-    if (running) return
-
-    // /task <title> — intercept, create task, show feedback in chat
-    if (text.startsWith('/task ') && attachments.length === 0) {
+    const atts = overrideText ? [] : [...attachments]
+    if (!text && atts.length === 0) return
+    // /task <title> — 直接建立 task，不送 Claude
+    if (!overrideText && text.startsWith('/task ') && atts.length === 0) {
       const title = text.slice(6).trim()
       if (title && selectedId) {
         await fetch(`/api/sessions/${selectedId}/tasks`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ title, status: 'pending' }),
         })
         setMessages(m => [...m, { role: 'system', text: `✓ Task created: ${title}`, ts: Date.now() }])
@@ -1256,38 +1476,34 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
       setInput('')
       return
     }
-
-    const rawPrompt = text || (attachments.length ? '請查看附件' : '')
-    const prefText  = localStorage.getItem(PREF_TEXT_KEY) || ''
-    const prompt    = (injectOnce && prefText && !overrideText)
-      ? `[使用者回應偏好（本次請遵循）：\n${prefText}]\n\n${rawPrompt}`
-      : rawPrompt
-    if (injectOnce && !overrideText) setInjectOnce(false)
-
-    if (!overrideText) setInput('')
-    const sentAttachments = attachments
-    setAttachments([])
-    runningRef.current = true
-    setRunning(true)
-    const displayText = prompt + (sentAttachments.length ? `\n${sentAttachments.map(a => `[${a.name}]`).join(' ')}` : '')
-    setMessages(m => [...m, { role: 'user', text: displayText, attachments: sentAttachments, ts: Date.now() }])
-    try {
-      const res = await fetch('/api/claude/run', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectPath, prompt, sessionId, attachments: sentAttachments }),
-      })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok || !data.ok) {
-        setRunning(false)
-        const reason = data.error ?? `HTTP ${res.status}`
-        setMessages(m => [...m, { role: 'result', text: `發送失敗：${reason}`, ts: Date.now() }])
-      }
-    } catch (err) {
-      setRunning(false)
-      setMessages(m => [...m, { role: 'result', text: `發送失敗：${err.message}`, ts: Date.now() }])
+    // Claude 思考中 → 加入 FIFO 佇列
+    if (running) {
+      setPendingQueue(q => [...q, { text, attachments: atts, ts: Date.now() }])
+      if (!overrideText) { setInput(''); setAttachments([]) }
+      return
     }
+    if (!overrideText) { setInput(''); setAttachments([]) }
+    await doActualSend(text, atts)
   }
+
+  // 思考結束後從佇列取出下一筆送出（FIFO，一次一筆，送完再取下一筆）
+  useEffect(() => {
+    if (!running && pendingQueue.length > 0) {
+      const [next, ...rest] = pendingQueue
+      setPendingQueue(rest)
+      const t = setTimeout(() => { doActualSend(next.text, next.attachments) }, 300)
+      return () => clearTimeout(t)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running, pendingQueue])
+
+  // pendingQueue 同步到 localStorage（HMR / F5 後可復原；附件不序列化）
+  useEffect(() => {
+    try {
+      const slim = pendingQueue.map(({ text, ts }) => ({ text, ts }))
+      localStorage.setItem('tc_pending_queue', JSON.stringify(slim))
+    } catch {}
+  }, [pendingQueue])
 
   function handleStop() {
     fetch('/api/claude/stop', {
@@ -1302,6 +1518,7 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
   const WORKFLOWS = [
     {
       id: 'youtube', icon: '🎬', label: 'YouTube 吸收',
+      desc: 'YouTube 影片深度吸收\n自動查創作者含金量、下字幕、時序因果分析、整理到 knowledge/',
       urlLabel: '影片網址', thoughtLabel: '吸收後的期望或重點方向',
       build: (url, thought) =>
 `我貼上一部影片讓你做深度知識吸收，請依照以下步驟：
@@ -1318,6 +1535,7 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
     },
     {
       id: 'report', icon: '📰', label: '報導/查驗',
+      desc: '報導事實查驗 + 協作反思\n交叉比對可信度、提取有用部分、評估對協作的意義',
       urlLabel: '報導或文章網址', thoughtLabel: '這篇對我們協作的意義是什麼',
       build: (url, thought) =>
 `我貼上一篇報導讓你查驗並沉澱為協作基石：
@@ -1333,6 +1551,7 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
     },
     {
       id: 'tutorial', icon: '📖', label: '教學/文件',
+      desc: '教學文章 / 官方文件深度吸收\n自動找前後系列、整合成 knowledge/[主題].md',
       urlLabel: '教學文章或官方文件網址', thoughtLabel: '想補齊的知識方向',
       build: (url, thought) =>
 `我貼上一篇教學或文件讓你補齊完整知識：
@@ -1348,6 +1567,7 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
     },
     {
       id: 'aicase', icon: '👥', label: 'AI 協作案例',
+      desc: '分析別人的 AI 協作案例\n提煉協作模式、做差距分析、具體改進建議',
       urlLabel: 'FB 貼文或社群連結（或貼上截圖說明）', thoughtLabel: '覺得哪個做法值得學習或反思',
       build: (url, thought) =>
 `我分享一個別人與 AI 協作的案例，請分析並找出我們可以借鏡的地方：
@@ -1363,6 +1583,7 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
     },
     {
       id: 'github', icon: '🔗', label: 'GitHub 倉庫',
+      desc: 'GitHub repo 整合決策\n全面理解 + 社群經驗 + 推薦 Fork / 整合 / 學原理 路線',
       urlLabel: 'GitHub repo 網址', thoughtLabel: '想怎麼用它（fork / 整合 / 學原理）',
       build: (url, thought) =>
 `我分享一個 GitHub 倉庫，請做全面理解並給出行動建議：
@@ -1382,6 +1603,7 @@ Repo：${url}
     },
     {
       id: 'screenshot', icon: '📸', label: '截圖解析',
+      desc: '截圖解析推導實作方案\n對照 GASP 知識庫，從截圖推導羅馬版本（禁止自行發明）',
       urlLabel: '截圖說明或對應系統', thoughtLabel: '要解決的問題或疑惑',
       build: (url, thought) =>
 `我貼上截圖讓你解析並推導實作方案：
@@ -1395,6 +1617,7 @@ Repo：${url}
     },
     {
       id: 'knowledge', icon: '📚', label: '知識庫擴充',
+      desc: '擴充 .agent/knowledge/ 再回答\n先補齊資料，再用新資料回應（避免憑舊印象）',
       urlLabel: '主題或文件網址', thoughtLabel: '具體想知道什麼',
       build: (url, thought) =>
 `請針對以下主題擴充 .agent/knowledge/，再回答我：
@@ -1407,6 +1630,7 @@ Repo：${url}
     },
     {
       id: 'anim', icon: '🎞', label: '動畫自動加工',
+      desc: '動畫自動加工 A×B 組合\nA=搜尋方法、B=操作類型；缺一必先問、不擅自假設',
       urlLabel: 'A：搜尋方法（或動畫路徑）', thoughtLabel: 'B：操作類型（或目標說明）',
       build: (url, thought) =>
 `動畫自動加工任務，請先確認 A × B 組合再執行：
@@ -1419,6 +1643,7 @@ B（操作類型）：${thought || '（請補充）'}
     },
     {
       id: 'dream', icon: '🧠', label: 'Dream Pass',
+      desc: '定期記憶整理清理\n冗餘/過時/重複的 memory 條目合併或淘汰',
       urlLabel: '（選填）特別關注的領域', thoughtLabel: '（選填）本次清理的重點指示',
       build: (url, thought) =>
 `做一次 dream pass。
@@ -1428,6 +1653,7 @@ ${thought ? `重點指示：${thought}` : ''}
     },
     {
       id: 'debug', icon: '🔬', label: '除錯流程',
+      desc: '變數隔離 + 基準比較除錯\n不直接猜原因，列變數 → 最小可重現 → 一次改一個',
       urlLabel: '異常現象描述', thoughtLabel: '懷疑方向或已嘗試過的做法',
       build: (url, thought) =>
 `除錯任務，請用「變數隔離 + 基準比較」方法，不要直接猜原因：
@@ -1443,6 +1669,7 @@ ${thought ? `重點指示：${thought}` : ''}
     },
     {
       id: 'handoff', icon: '📋', label: 'Session 交接',
+      desc: 'Session 中途交接\n整理成果 + 更新 last_session_state.md + 列下 session 優先事項',
       urlLabel: '（選填）本次 session 主要做了什麼', thoughtLabel: '下個 session 的優先事項',
       build: (url, thought) =>
 `請幫我做 Session 交接：
@@ -1455,7 +1682,60 @@ ${thought ? `重點指示：${thought}` : ''}
 下個 session 優先事項：${thought || '（請自行從對話推導）'}`,
     },
     {
+      id: 'trace', icon: '🎯', label: '系統追溯',
+      desc: 'UE 系統追溯\n從畫面描述 / 系統名稱反推實作，L1-L4 齊全度判定 → 實作 / 補全 / 建 TODO',
+      urlLabel: '畫面描述 或 UE 系統名稱',
+      thoughtLabel: '特別關注的情境、目標效果、延伸方向',
+      build: (url, thought) =>
+`UE 系統追溯任務：從畫面 / 系統名稱反推 UE 實作，判斷知識是否足以動手。
+
+描述 / 系統名稱：${url}
+特別關注：${thought || '（未指定）'}
+
+## 第 1 步：判定知識齊全度
+
+依 L1-L4 權威等級查詢（參照 MEMORY.md「知識來源權威分級」）：
+- **L1** 羅馬專案實際 C++/BP/Asset（是否已有類似實作）
+- **L2** .agent/knowledge/ 的 GASP_*.md / Engine_*.md 條目
+- **L3** UE 官方文件 / 教學（需 WebFetch 驗證版本）
+- **L4** ★★★★★ 創作者教學（查 memory/reference_youtube_creators.md）
+
+**齊全標準**：至少一項 L1-L4 有明確成功案例支持（可直接照搬或小改）
+
+## 第 2 步：依齊全度分支
+
+### A. 不齊全（缺口明顯）
+- 說清楚「我懂的部分」（明確引用 L1-L4 來源）
+- 列出缺口：具體哪些細節沒有明確資料
+- 給我兩個選項：
+  1. 走「📚 知識庫擴充」或「📖 教學/文件」心腹先補全
+  2. 用現有知識先給方向性建議（承擔部分不確定）
+- 等我選哪條路再動，不要自行決定
+
+### B. 齊全（成功案例明確）
+提供完整內容：
+- 核心系統 / 類別 / 類別階層
+- 關鍵 API / 節點 / 資產型別
+- 常見坑 / 注意事項
+- **明確引用 L1-L4 來源**（檔名 + 章節或時間戳）
+
+然後問我選哪個方向：
+1. **直接提實作方案**，我確認細節後開工
+2. **列出近期最可能實作的延伸話題**（例如：這技術還能用在 X / Y / Z），討論後決定優先順序
+
+等我確認後：
+- 「實作」→ 進入實作階段
+- 「建 TODO」→ 之後 TODO 看板做好可寫進去（階段：💡 想到了 / 🗣 討論中）
+- 「擱置 / 倉庫」→ 記錄歸檔暫不實作
+
+## 禁忌
+- 禁止自行發明實作方式（必須有 L1-L4 來源支持）
+- 禁止將 L6 歸檔當事實依據（僅供 fork 參考，以 L1-L4 為準）
+- 禁止從空白處畫想像，必從 Baseline（現有系統）推導`,
+    },
+    {
       id: 'plan', icon: '🏗', label: '新功能規劃',
+      desc: '疊加不破壞原則規劃新功能\n探勘現有邊界 + 旁邊加不動主幹 + 驗證清單',
       urlLabel: '功能描述或相關資料連結', thoughtLabel: '希望如何疊加（不改哪些部分）',
       build: (url, thought) =>
 `新功能規劃，請用「疊加不破壞」原則：
@@ -1469,15 +1749,341 @@ ${thought ? `重點指示：${thought}` : ''}
 3. 設計「在舊功能旁邊加，不動舊功能主幹」的方案
 4. 列出完成後的驗證清單（確認舊功能仍正常）`,
     },
+    {
+      id: 'close', icon: '🏁', label: '結案結算',
+      desc: 'Session 收尾結算\n成果摘要 + 遺留清單 + 同步知識 + 變更清單（不擅自 commit）',
+      urlLabel: '（選填）本 Session 完成的主要成果', thoughtLabel: '（選填）遺留或要交接的事項',
+      build: (url, thought) =>
+`結案結算 — 本次 Session 要收尾，請幫我處理：
+
+1. **成果摘要**：本次 Session 完成的事項清單，以及大致的時間／token 花費範圍
+2. **遺留清單**：未完成或遺留的 TODO，附上下次可以直接切入的起點（檔案路徑 / 函式 / 待決策問題）
+3. **更新 .agent/last_session_state.md**：讓下個 Session 用「🚀 Session 啟動」能無縫接上
+4. **同步新知識**：把本次新發現的規律、踩坑、決策理由，寫進對應的 memory/feedback_*.md 或 knowledge/
+5. **變更清單**：列出該 commit 的檔案（分組別：code / memory / docs），但不要自作主張 commit，等我確認
+6. **規矩快照**：若本次評分資料有顯著變化，建議我去規矩頁面按「⚡ 分析並存檔」
+
+本次主要成果：${url || '（請自行從對話推導）'}
+遺留事項：${thought || '（請自行從對話推導）'}`,
+    },
+    {
+      id: 'start', icon: '🚀', label: 'Session 啟動',
+      desc: 'Session 啟動接手前情\n讀 last_session_state.md + 規矩確認 + 推薦起手式',
+      urlLabel: '（選填）今天想聚焦的主題', thoughtLabel: '（選填）特別想避免或警覺的事',
+      build: (url, thought) =>
+`Session 啟動 — 請幫我暖機：
+
+1. **讀取上次交接**：.agent/last_session_state.md 拿到上次 session 的接續點
+2. **掃描在途工作**：memory/MEMORY.md 的「待處理任務」段，列出目前進行中的項目
+3. **載入今日上下文**：如果有聚焦主題，主動載入對應的 .agent/knowledge/*.md 檔案
+4. **環境檢查**：git status / 未 commit 的變更 / pm2 服務狀態 / 上次雙版本編譯是否通過
+5. **建議起手式**：告訴我今天第一步建議從哪裡開始，並列出 2~3 個可選方向讓我挑
+6. **規矩確認**：讀取目前的偏好文字（PREF_TEXT_KEY），確認風格基準
+
+今天想聚焦：${url || '（還沒決定，請從待辦中推薦）'}
+警覺事項：${thought || '（無）'}`,
+    },
   ]
+
+  // 決策類心腹：需要「做法選項 + 優劣 + 商機 + 效能 + 風險 + 推薦」評估
+  const DECISION_WORKFLOWS = ['plan', 'debug', 'github', 'report', 'tutorial', 'anim', 'trace']
+
+  // 各心腹 checkbox 顯示的評估重點摘要（UI 端同步顯示）
+  const EVAL_SUMMARY = {
+    plan:     '做法優劣／商機／效能／疊加風險／推薦',
+    debug:    '根因假設／驗證步驟／副作用／回滾／推薦',
+    github:   '健康度／契合度／採用方式／整合成本／推薦',
+    report:   '含金量／誤區／借鏡價值／風險／推薦',
+    tutorial: '含金量／重疊度／補齊方向／吸收深度／推薦',
+    anim:     'A×B 組合／品質vs速度／批次可行性／效能／推薦',
+    trace:    '齊全度／缺口／實作選項／效能／疊加風險／推薦',
+  }
+
+  function buildEvaluationBlock(mode) {
+    const bodies = {
+      // 🏗 新功能規劃 — 完整 6 維度
+      plan:
+`### 1. 做法選項
+至少列出 2 個可行方案（A / B [/ C]），各自一句話說明核心思路
+
+### 2. 各方案優劣
+- 實作複雜度（幾行改動、需動多少檔）
+- 可維護性（未來改動成本、理解門檻）
+
+### 3. 商機 / 長期價值
+- 能沉澱什麼（知識庫條目、工具、pattern）
+- 能否重用到其他模組 / 專案
+
+### 4. 效能風險
+- 記憶體、幀率、同屏規模影響（UE 專案特別關注）
+- 最壞情況 benchmark 預估
+
+### 5. 疊加不破壞風險
+- 會動到哪些現有穩定路徑
+- 回滾成本（好退？難退？）
+
+### 6. 推薦選項 + 理由
+明確下結論，不只列表；若我堅持某方案，說明你會怎麼補強它的風險面`,
+
+      // 🔬 除錯流程 — 根因優先
+      debug:
+`### 1. 根因假設
+列出至少 2 個可能根因（H1 / H2 ...），各自附支持證據與反對證據
+
+### 2. 驗證步驟
+每個假設給出具體驗證方法（grep 什麼、改什麼變數隔離、用什麼指令觀察）
+排序由便宜到昂貴，先做便宜的
+
+### 3. 副作用評估
+若按主推方向修復，連帶會影響哪些現有路徑？有無隱性耦合？
+
+### 4. 回滾路徑
+修改點在哪、回滾成本（git revert 即可？還是需要手動拆？）
+
+### 5. 疊加不破壞點檢
+對照現有穩定行為，列出修復後必須仍正常的 3-5 個驗證點
+
+### 6. 推薦修復方向 + 理由
+下結論：先做哪個假設的驗證、為何先這個；若根因已幾乎確定就直接給修復方案`,
+
+      // 🔗 GitHub 倉庫 — 整合決策
+      github:
+`### 1. 倉庫健康度
+- 授權（MIT / GPL / 商用可否）
+- 近期活躍度（last commit / issue 回應速度）
+- star / fork 規模
+- 維護者可靠性
+
+### 2. 架構契合度
+- 與現有專案是否相容（UE 版本 / 相依性衝突）
+- 命名規範、C++ 風格是否與我們落差大
+
+### 3. 採用方式選項
+列出 2-3 種採用路徑：
+- Fork 深度客製
+- 作為 submodule / plugin 掛載
+- 抽概念重寫
+- 只學原理不引入
+
+### 4. 取代現有方案風險
+如果我們已有類似工具，換過去的機會成本是什麼？
+
+### 5. 整合成本 + 維護負擔
+- 學習曲線
+- API 穩定度（上游若大改我們跟不跟）
+- 長期維護要不要投人
+
+### 6. 推薦採用方式 + 理由
+明確下結論，指出若選推薦方案該從哪一步動手`,
+
+      // 📰 報導/查驗 — 資訊可信度
+      report:
+`### 1. 含金量評估
+- 資料來源可信度（一手 / 二手 / GPT 味 / 農場）
+- 作者權威性（背景、過往作品）
+- 是否有可驗證的具體事實（版本號、benchmark、code link）
+
+### 2. 誤區辨識
+找出文章中「看似合理但其實錯」或「過度簡化」的點
+特別注意：時效性落後、脫離上下文的結論、商業置入
+
+### 3. 借鏡價值
+哪些部分可直接吸收、哪些需要改造、哪些只是靈感
+
+### 4. 與既有知識的差距 / 重疊
+對照我們的 memory / knowledge，是補洞還是重複？
+
+### 5. 潛在風險
+盲目套用會踩什麼雷（效能 / 架構污染 / 維護陷阱）
+
+### 6. 推薦行動 + 理由
+下結論：深讀筆記 / 摘要存檔 / 跳過 / 進一步查證某點`,
+
+      // 📖 教學/文件 — 知識吸收決策
+      tutorial:
+`### 1. 知識含金量
+- 深度（基礎教學？進階？官方 API？）
+- 正確性（有無驗證過的程式碼、輸出範例）
+- 新舊程度（UE 版本、API 是否 deprecated）
+
+### 2. 與現有知識庫重疊度
+查 memory / knowledge 現有條目，這份資料是補空白、強化、還是重複？
+
+### 3. 補齊方向
+- 值得吸收成 knowledge/ 條目嗎？路徑建議？
+- 是否需要拆成多個小條目
+
+### 4. 實用場景
+對羅馬專案 / TheClaudenental 有哪些直接用到的地方（具體點名檔案或系統）
+
+### 5. 時間投資 vs 回報
+讀完需要多久、吸收後能節省多少未來的時間
+
+### 6. 推薦吸收深度 + 理由
+下結論：深讀 + 寫條目 / 快速摘要存檔 / 只記 reference 連結 / 跳過`,
+
+      // 🎯 系統追溯 — L1-L4 齊全度 + 實作方向 + 疊加風險
+      trace:
+`### 1. 知識齊全度評分
+逐一盤點 L1-L4 來源支持度（0-5 分）：
+- L1 羅馬專案實作：找到幾個類似例子？位置？
+- L2 knowledge/ GASP_*.md / Engine_*.md：哪些條目涵蓋？
+- L3 UE 官方文件 / 教學：有明確 API / 範例嗎？
+- L4 創作者教學：誰做過？品質等級？
+總分評級：齊全（>=12）/ 勉強（8-11）/ 不齊全（<8）
+
+### 2. 缺口分析 + 補全路徑
+- 具體哪些細節沒資料（點名到變數 / 參數 / 函式層級）
+- 補全建議：走「📚 知識庫擴充」/「📖 教學/文件」/「🎬 YouTube 吸收」哪條？
+- 預估補全時間（概略：短<1h / 中1-3h / 長>3h）
+
+### 3. 實作方案選項
+列出 2-3 條可行路徑：
+- 完全照搬 L1 現有實作
+- 以 L2/L3/L4 為藍本，改造到羅馬環境
+- 混合方案（部分照搬 + 部分自製）
+各自一句話說明核心取捨
+
+### 4. 效能風險
+- UE 同屏 150-200 人 / 25 玩家士兵規模下的影響
+- 記憶體、幀率、Tick 成本
+- LOD 策略需求
+
+### 5. 疊加不破壞風險
+- 會動到羅馬現有哪些穩定路徑（Character / ABP / Mover / AI / CR）
+- 與現有 Formation / RomanCharacter / 大盾等系統的相容性
+- 回滾成本（好退？難退？）
+
+### 6. 推薦方向 + 下一步
+下結論：
+- **立即實作**（哪個方案、從哪一步動手）
+- 或 **建 TODO**（放 💡 想到了 / 🗣 討論中 哪一階段）
+- 或 **擱置歸檔**（說明擱置條件，何時翻出來）
+若我堅持某方向，說明你會怎麼補強它的風險面`,
+
+      // 🎞 動畫自動加工 — 加工路徑選擇
+      anim:
+`### 1. 加工方法選項
+列出 2-3 種可行方法（對照 z_sub_anim_auto_process.md 的 A × B 組合）：
+- AnimModifier（Blueprint 批次）
+- ControlRig（執行期或 bake）
+- Python 批次（離線）
+- 手動調整
+
+### 2. 品質 vs 速度 trade-off
+各方法的輸出品質 / 處理時間 / 錯誤容忍度比較
+
+### 3. 批次處理可行性
+- 能一次處理多少資產
+- 錯誤重做成本（單檔 retry 還是整批 rebuild）
+- 是否可分段執行
+
+### 4. 效能影響
+- ABP 執行期成本（若是 runtime 方案）
+- 記憶體佔用（新增 curve / notify 數量）
+- 同屏規模瓶頸（150-200 人的影響）
+
+### 5. 疊加不破壞風險
+- 會不會動到現有角色 / 現有 BP
+- 原始資產是否保留（可否回滾）
+- 對 Retarget / IK 的下游影響
+
+### 6. 推薦方法 + 理由
+下結論：指定 A 搜尋法 × B 操作類型，並說明為什麼這個組合最適合這批資產`,
+    }
+
+    const body = bodies[mode] ?? bodies.plan
+    return `
+---
+
+## 評估框架（請附在主回覆後）
+
+請以「疊加不破壞」原則，提供結構化評估：
+
+${body}`
+  }
+
+  // 會產出 knowledge 文件的心腹：必須做「知識一致性確認」
+  const KNOWLEDGE_WORKFLOWS = ['youtube', 'report', 'tutorial', 'aicase', 'github', 'screenshot', 'knowledge', 'trace']
+
+  function buildConsistencyCheckBlock() {
+    return `
+---
+
+## 知識一致性確認（產出 knowledge 文件前必做）
+
+**目的**：避免重複造輪、避免衝突、確保新知識與既有知識庫相互引用。
+
+### 步驟
+1. **盤點關鍵詞**：抽出本次主題的 3-5 個關鍵詞（系統名 / 工具 / 概念）
+2. **grep 現有 knowledge**：對 \`.agent/knowledge/\` + \`memory/\` 跑關鍵詞 grep
+3. **三類定位**：對每個 hit 做分類
+   - **重疊**：既有資料已涵蓋此點 → 引用而非重寫
+   - **衝突**：既有說法與本次來源不同 → 標 ⚠️ 並評估誰權威（用 L1-L4 等級判定）
+   - **補洞**：既有沒提過 → 本次可作為新增章節
+4. **新文件加「知識一致性比對」段**：表格形式列「現有資料 → 重疊/衝突/補洞」
+5. **MEMORY.md 索引**：新文件加索引條目，引用其他相關文件時用 markdown link
+
+### 重要度與參考價值分類
+產出文件時，每個 Insight 標等級：
+- 🔴 **核心**（VERIFIED + 對羅馬專案直接價值高）
+- 🟡 **適用條件**（HYPOTHESIS + 需實測驗證）
+- 🟢 **細節**（VERIFIED 但邊角資訊）
+
+### 跨 Session 全面同步
+若本次內容讓既有「待處理任務」變成已完成（如真因確認、結案）：
+- 更新議題專屬 md（加結案標記）
+- 移除 MEMORY.md 「## 待處理任務」對應條目
+- TODO 看板對應卡推到 ✅ 完成
+- grep \`.agent/workflows/\` + \`.agent/skills/\` 找引用，同步更新
+- 半同步 = 沒同步（參 \`memory/feedback_cross_session_full_sync.md\`）`
+  }
 
   function handleWorkflowSend() {
     const wf = WORKFLOWS.find(w => w.id === wfType)
     if (!wf) return
-    const prompt = wf.build(wfUrl.trim(), wfThought.trim())
+    let prompt = wf.build(wfUrl.trim(), wfThought.trim())
+    if (withEvaluation && DECISION_WORKFLOWS.includes(wfType)) {
+      prompt += '\n' + buildEvaluationBlock(wfType)
+    }
+    if (KNOWLEDGE_WORKFLOWS.includes(wfType)) {
+      prompt += '\n' + buildConsistencyCheckBlock()
+    }
     setShowWorkflow(false)
     setWfType(null); setWfUrl(''); setWfThought('')
     handleSend(prompt)
+  }
+
+  // 根據 workflowOrder 重排 WORKFLOWS，新加入的 workflow 自動放到尾端
+  const orderedWorkflows = (() => {
+    if (!workflowOrder.length) return WORKFLOWS
+    const map = new Map(WORKFLOWS.map(w => [w.id, w]))
+    const result = []
+    for (const id of workflowOrder) {
+      const w = map.get(id)
+      if (w) { result.push(w); map.delete(id) }
+    }
+    for (const w of map.values()) result.push(w)  // 新增的 workflow 接在後面
+    return result
+  })()
+
+  // 拖曳感應器：桌面 PointerSensor（6px 啟動距離避免誤觸），手機 TouchSensor（長按 200ms 啟動）
+  const sortSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(TouchSensor,   { activationConstraint: { delay: 200, tolerance: 8 } }),
+  )
+
+  function handleWorkflowDragEnd(event) {
+    const { active, over } = event
+    if (!over || active.id === over.id) return
+    const oldIdx = orderedWorkflows.findIndex(w => w.id === active.id)
+    const newIdx = orderedWorkflows.findIndex(w => w.id === over.id)
+    const nextOrder = arrayMove(orderedWorkflows, oldIdx, newIdx).map(w => w.id)
+    setWorkflowOrder(nextOrder)
+    fetch('/api/workflow-order', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order: nextOrder }),
+    }).catch(() => {})
   }
 
   function handleKeyDown(e) {
@@ -1535,7 +2141,8 @@ ${thought ? `重點指示：${thought}` : ''}
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2 min-h-0">
+      <div ref={scrollContainerRef} onScroll={handleChatScroll}
+           className="flex-1 overflow-y-auto px-3 py-2 space-y-2 min-h-0 relative">
         {messages.length === 0 && (
           <div className="text-[10px] text-[var(--text-muted)] text-center mt-8">
             輸入訊息開始對話，不需要 VS Code 介面
@@ -1571,7 +2178,7 @@ ${thought ? `重點指示：${thought}` : ''}
             {m.role === 'assistant' && (
               <div>
                 <div className="md-body text-[var(--text)]">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.text || ''}</ReactMarkdown>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>{m.text || ''}</ReactMarkdown>
                 </div>
                 <div className="flex justify-end mt-0.5">
                   <MessageRating id={sessionId && m.ts ? `${sessionId}_${m.ts}` : null} text={m.text || ''}
@@ -1631,6 +2238,14 @@ ${thought ? `重點指示：${thought}` : ''}
         )}
 
         <div ref={bottomRef} />
+        {showJumpToLatest && (
+          <button onClick={jumpToLatest}
+            onTouchEnd={e => { e.preventDefault(); jumpToLatest() }}
+            style={{ touchAction: 'manipulation' }}
+            className="sticky bottom-2 ml-auto mr-1 shrink-0 flex items-center gap-1 px-3 py-1.5 rounded-full text-[10px] font-semibold bg-[var(--gold)]/20 border border-[var(--gold)]/60 text-[var(--gold)] hover:bg-[var(--gold)]/30 backdrop-blur-sm self-end w-fit">
+            ▼ 回到最新
+          </button>
+        )}
       </div>
 
       {/* Input area */}
@@ -1639,18 +2254,124 @@ ${thought ? `重點指示：${thought}` : ''}
         {/* Workflow Launcher */}
         {showWorkflow && (
           <div className="border-b border-[var(--border)] bg-[var(--surface-2)] p-2">
-            {/* Workflow type pills */}
+            {/* Workflow type pills + 人脈盤查 */}
             <div className="flex gap-1.5 overflow-x-auto pb-1.5 mb-2">
-              {WORKFLOWS.map(wf => (
-                <button key={wf.id} onClick={() => setWfType(wf.id === wfType ? null : wf.id)}
-                  className={`shrink-0 flex items-center gap-1 px-2 py-1 rounded-full text-[9px] font-semibold tracking-wide border transition-colors ${
-                    wfType === wf.id
-                      ? 'bg-[var(--gold)]/20 border-[var(--gold)] text-[var(--gold)]'
-                      : 'border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text)]'
-                  }`}>
-                  <span>{wf.icon}</span><span>{wf.label}</span>
-                </button>
-              ))}
+              <DndContext sensors={sortSensors} collisionDetection={closestCenter} onDragEnd={handleWorkflowDragEnd}>
+                <SortableContext items={orderedWorkflows.map(w => w.id)} strategy={horizontalListSortingStrategy}>
+                  {orderedWorkflows.map(wf => (
+                    <SortablePill key={wf.id} wf={wf} wfType={wfType} setWfType={setWfType} />
+                  ))}
+                </SortableContext>
+              </DndContext>
+              {/* 請繼續 — 快速續行，可選填補充說明 */}
+              <Tooltip content={'請繼續（可選填補充說明）\nClaude 自動接續未完成的工作'}>
+                <ContinueButton handleSend={handleSend} setShowWorkflow={setShowWorkflow} running={running} />
+              </Tooltip>
+              {/* 📋 FB 暫存 — 帶入 bookmarklet 送來的 FB 內容 */}
+              <Tooltip content={'FB 暫存\n帶入 Edge bookmarklet 送來的 FB 貼文內容\n自動做協作模式提煉 + 查證 + 差距分析'}>
+              <button
+                onClick={async () => {
+                  const d = await fetch('/api/fb-push/latest').then(r => r.json()).catch(() => null)
+                  if (!d?.content) {
+                    alert('沒有 FB 暫存內容。\n請先在 Edge 打開 FB 貼文，點書籤欄的「📤 送到 Claude」。')
+                    return
+                  }
+                  const prompt =
+`我分享一個別人與 AI 協作的案例（從 FB 暫存帶入），請分析並找出我們可以借鏡的地方：
+
+## 貼文來源
+${d.url}
+
+## 作者
+${d.author || '（未識別）'}
+
+## 內文
+${d.content}
+
+${d.comments?.length ? `## 留言（${d.comments.length} 則）\n${d.comments.join('\n---\n')}\n` : ''}
+${d.links?.length    ? `## 內含外部連結\n${d.links.join('\n')}\n`                 : ''}
+
+---
+
+請依以下步驟處理：
+1. **提煉協作模式**：他們用了什麼方法、工具、提示詞結構，與我們的做法有何不同
+2. **查證含金量**：作者姓名 + 內文提到的 GitHub / 技術，用 WebSearch 或 WebFetch 交叉驗證
+3. **差距分析**：他們做到了我們還沒做到的是什麼？我們有沒有比他們更好的地方？
+4. **改進建議**：具體列出 1~3 個可以直接套用或調整到我們協作中的做法
+5. 若值得長期參考：更新 memory/feedback_*.md 或 preferences.md
+
+請用我們平常的討論方式來聊，不只是列清單。`
+                  setShowWorkflow(false)
+                  handleSend(prompt)
+                }}
+                onTouchEnd={async e => {
+                  e.preventDefault()
+                  const d = await fetch('/api/fb-push/latest').then(r => r.json()).catch(() => null)
+                  if (!d?.content) { alert('沒有 FB 暫存內容。請先在 Edge 用書籤送過來。'); return }
+                  const prompt =
+`我分享一個別人與 AI 協作的案例（從 FB 暫存帶入），請分析：
+
+## 貼文來源
+${d.url}
+
+## 作者
+${d.author || '（未識別）'}
+
+## 內文
+${d.content}
+
+${d.comments?.length ? `## 留言\n${d.comments.join('\n---\n')}\n` : ''}
+${d.links?.length    ? `## 內含外部連結\n${d.links.join('\n')}\n`  : ''}
+
+請分析提煉協作模式 + 查證 + 差距分析 + 改進建議。`
+                  setShowWorkflow(false)
+                  handleSend(prompt)
+                }}
+                title="帶入最新一筆由 bookmarklet 送來的 FB 內容"
+                className="shrink-0 flex items-center gap-1 px-2 py-1 rounded-full text-[9px] font-semibold tracking-wide border border-blue-500/60 text-blue-400 hover:bg-blue-500/10 transition-colors"
+                style={{ touchAction: 'manipulation' }}>
+                <span>📋</span><span>FB 暫存</span>
+              </button>
+              </Tooltip>
+              {/* 人脈盤查 — 審查近期工作模式，評估是否需要擴充心腹陣容 */}
+              <Tooltip content={'人脈盤查\n審查近期工作模式，找出可成為新心腹的重複流程\n回顧 last_session_state + 跨 session 模式'}>
+              <button
+                onClick={() => {
+                  const prompt =
+`人脈盤查 — 請審查近期的工作模式，評估是否需要擴充心腹陣容：
+
+1. 回顧 .agent/last_session_state.md 以及最近幾個 session 的工作紀錄（若有）
+2. 找出重複出現、目的一致、步驟固定的工作流程，特別是跨 session 都有出現的模式
+3. 評估這些流程是否符合「目標明確 + 重複性高 + 有固定步驟」的心腹條件
+4. 用我們稍早討論新增工作流的方式提出建議：這個流程是什麼、為什麼值得成為心腹、附上 prompt 模板草稿
+5. 若現有心腹有可以優化的，也一起提出
+6. 等我確認後再實際加入心腹系統
+
+請用我們平常討論事情的方式來聊，不只是列清單。`
+                  setShowWorkflow(false)
+                  handleSend(prompt)
+                }}
+                onTouchEnd={e => {
+                  e.preventDefault()
+                  const prompt =
+`人脈盤查 — 請審查近期的工作模式，評估是否需要擴充心腹陣容：
+
+1. 回顧 .agent/last_session_state.md 以及最近幾個 session 的工作紀錄（若有）
+2. 找出重複出現、目的一致、步驟固定的工作流程，特別是跨 session 都有出現的模式
+3. 評估這些流程是否符合「目標明確 + 重複性高 + 有固定步驟」的心腹條件
+4. 用我們稍早討論新增工作流的方式提出建議：這個流程是什麼、為什麼值得成為心腹、附上 prompt 模板草稿
+5. 若現有心腹有可以優化的，也一起提出
+6. 等我確認後再實際加入心腹系統
+
+請用我們平常討論事情的方式來聊，不只是列清單。`
+                  setShowWorkflow(false)
+                  handleSend(prompt)
+                }}
+                className="shrink-0 flex items-center gap-1 px-2 py-1 rounded-full text-[9px] font-semibold tracking-wide border border-[var(--gold)]/60 text-[var(--gold)]/80 hover:bg-[var(--gold)]/10 hover:text-[var(--gold)] transition-colors"
+                style={{ touchAction: 'manipulation' }}>
+                <span>🕵</span><span>人脈盤查</span>
+              </button>
+              </Tooltip>
             </div>
             {/* Selected workflow fields */}
             {(() => {
@@ -1658,11 +2379,31 @@ ${thought ? `重點指示：${thought}` : ''}
               if (!wf) return (
                 <div className="text-[9px] text-[var(--text-muted)] text-center py-1">選擇心腹成員</div>
               )
+              const isUrl = (s) => { try { new URL(s); return true } catch { return false } }
+              const openWfUrl = () => {
+                const u = wfUrl.trim()
+                if (!isUrl(u)) return
+                // FB 網域自動走 Edge；其他網域讓系統預設瀏覽器處理（這裡仍請 server 用 Edge）
+                openInEdge(u)
+              }
               return (
                 <div className="flex flex-col gap-1.5">
-                  <input value={wfUrl} onChange={e => setWfUrl(e.target.value)}
-                    placeholder={wf.urlLabel}
-                    className="w-full bg-[var(--surface)] border border-[var(--border)] rounded px-2 py-1 text-[11px] text-[var(--text)] focus:outline-none focus:border-[var(--gold-border)] font-mono" />
+                  <div className="flex gap-1.5">
+                    <input value={wfUrl} onChange={e => setWfUrl(e.target.value)}
+                      placeholder={wf.urlLabel}
+                      className="flex-1 bg-[var(--surface)] border border-[var(--border)] rounded px-2 py-1 text-[11px] text-[var(--text)] focus:outline-none focus:border-[var(--gold-border)] font-mono" />
+                    <button onClick={openWfUrl} onTouchEnd={e => { e.preventDefault(); openWfUrl() }}
+                      disabled={!isUrl(wfUrl.trim())}
+                      title={isFacebookUrl(wfUrl.trim()) ? '開啟 FB 網址（Edge，避開 Chrome 擴充衝突）' : '在 Edge 瀏覽器開啟此網址'}
+                      className={`shrink-0 px-2 py-1 rounded border text-[10px] hover:text-[var(--text)] disabled:opacity-30 disabled:cursor-not-allowed ${
+                        isFacebookUrl(wfUrl.trim())
+                          ? 'border-[var(--gold)]/60 text-[var(--gold)]/80 hover:border-[var(--gold)] hover:text-[var(--gold)]'
+                          : 'border-[var(--border)] text-[var(--text-muted)] hover:border-[var(--gold-border)]'
+                      }`}
+                      style={{ touchAction: 'manipulation' }}>
+                      🌐 Edge{isFacebookUrl(wfUrl.trim()) ? ' (FB)' : ''}
+                    </button>
+                  </div>
                   <div className="flex gap-1.5">
                     <input value={wfThought} onChange={e => setWfThought(e.target.value)}
                       placeholder={wf.thoughtLabel}
@@ -1673,12 +2414,43 @@ ${thought ? `重點指示：${thought}` : ''}
                       ⚡ 啟動
                     </button>
                   </div>
+                  {DECISION_WORKFLOWS.includes(wfType) && (
+                    <label className="flex items-center gap-1.5 text-[9px] text-[var(--text-muted)] cursor-pointer select-none"
+                           title={`此心腹的評估維度：${EVAL_SUMMARY[wfType]}`}
+                           style={{ touchAction: 'manipulation' }}>
+                      <input type="checkbox" checked={withEvaluation}
+                        onChange={e => setWithEvaluation(e.target.checked)}
+                        className="accent-[var(--gold)] cursor-pointer" />
+                      <span>附上評估框架（{EVAL_SUMMARY[wfType]}）</span>
+                    </label>
+                  )}
                 </div>
               )
             })()}
           </div>
         )}
 
+        {/* 排隊訊息指示器（FIFO，可多筆） */}
+        {pendingQueue.length > 0 && (
+          <div className="flex flex-col gap-1 px-2 py-1.5 border-b border-amber-600/30 bg-amber-900/20">
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-amber-400 shrink-0">⏳ 排隊 {pendingQueue.length} 筆</span>
+              <div className="flex-1" />
+              <button onClick={() => setPendingQueue([])}
+                className="text-[9px] text-[var(--text-muted)] hover:text-red-400 shrink-0 px-1.5 py-0.5 rounded border border-[var(--border)]"
+                title="清除全部排隊">✕ 清空</button>
+            </div>
+            {pendingQueue.map((p, i) => (
+              <div key={p.ts} className="flex items-center gap-2 pl-3">
+                <span className="text-[9px] text-amber-400/60 font-mono w-4 shrink-0">{i + 1}</span>
+                <span className="text-[10px] text-[var(--text)] flex-1 truncate font-mono">{p.text}</span>
+                <button onClick={() => setPendingQueue(q => q.filter((_, j) => j !== i))}
+                  className="text-[9px] text-[var(--text-muted)] hover:text-red-400 shrink-0 px-1 rounded"
+                  title="移除此筆">✕</button>
+              </div>
+            ))}
+          </div>
+        )}
         {/* Attachment previews */}
         {attachments.length > 0 && (
           <div className="flex flex-wrap gap-1.5 px-2 pt-2">
@@ -1704,7 +2476,7 @@ ${thought ? `重點指示：${thought}` : ''}
           <button
             onClick={() => setInjectOnce(v => !v)}
             title={injectOnce ? '偏好注入：開（送出後自動關閉）' : '偏好注入：關（點擊啟用單次注入）'}
-            className={`w-7 h-7 flex items-center justify-center rounded border text-xs transition-colors shrink-0 ${
+            className={`w-9 h-9 md:w-7 md:h-7 flex items-center justify-center rounded border text-xs transition-colors shrink-0 touch-manipulation ${
               injectOnce
                 ? 'bg-[var(--gold)]/20 border-[var(--gold)] text-[var(--gold)]'
                 : 'border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] hover:border-[var(--gold-border)]'
@@ -1713,7 +2485,7 @@ ${thought ? `重點指示：${thought}` : ''}
           <button
             onClick={() => setShowWorkflow(v => !v)}
             title="心腹"
-            className={`w-7 h-7 flex items-center justify-center rounded border text-xs transition-colors shrink-0 ${
+            className={`w-9 h-9 md:w-7 md:h-7 flex items-center justify-center rounded border text-xs transition-colors shrink-0 touch-manipulation ${
               showWorkflow
                 ? 'bg-[var(--gold)]/20 border-[var(--gold)] text-[var(--gold)]'
                 : 'border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] hover:border-[var(--gold-border)]'
@@ -1723,7 +2495,7 @@ ${thought ? `重點指示：${thought}` : ''}
             <button
               onClick={() => setShowAttachMenu(v => !v)}
               disabled={running}
-              className="w-7 h-7 flex items-center justify-center rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] hover:border-[var(--gold-border)] transition-colors text-sm disabled:opacity-40"
+              className="w-9 h-9 md:w-7 md:h-7 flex items-center justify-center rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] hover:border-[var(--gold-border)] transition-colors text-sm disabled:opacity-40 touch-manipulation"
               title="附加檔案 / 新增任務">+</button>
             {showAttachMenu && (
               <div className="absolute bottom-full left-0 mb-1 w-44 bg-[var(--surface-2)] border border-[var(--border)] rounded shadow-lg z-20 overflow-hidden">
@@ -1759,20 +2531,27 @@ ${thought ? `重點指示：${thought}` : ''}
             onChange={e => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
-            placeholder="輸入訊息…"
+            placeholder={running ? '思考中也可以繼續輸入（送出會排隊）…' : '輸入訊息…'}
             rows={2}
-            disabled={running}
-            className="flex-1 bg-[var(--surface)] border border-[var(--border)] rounded px-2 py-1.5 text-base md:text-[11px] text-[var(--text)] resize-none outline-none placeholder:text-[var(--text-muted)] disabled:opacity-50"
+            className="flex-1 bg-[var(--surface)] border border-[var(--border)] rounded px-2 py-1.5 text-base md:text-[11px] text-[var(--text)] resize-none outline-none placeholder:text-[var(--text-muted)]"
           />
           <div className="flex flex-col gap-1 shrink-0">
             <button
-              onClick={handleSend}
-              disabled={running || (!input.trim() && attachments.length === 0)}
-              className="px-3 py-1.5 rounded bg-[var(--gold)]/20 border border-[var(--gold)]/50 text-[var(--gold)] text-[10px] hover:bg-[var(--gold)]/30 disabled:opacity-40"
-            >送出</button>
+              onClick={() => handleSend()}
+              onTouchEnd={e => { e.preventDefault(); handleSend() }}
+              disabled={!input.trim() && attachments.length === 0}
+              className={`px-4 py-3 md:px-3 md:py-1.5 rounded border text-[11px] md:text-[10px] active:opacity-80 disabled:opacity-40 select-none min-w-[52px] ${
+                running
+                  ? 'bg-amber-500/15 border-amber-500/50 text-amber-300 hover:bg-amber-500/25'
+                  : 'bg-[var(--gold)]/20 border-[var(--gold)]/50 text-[var(--gold)] hover:bg-[var(--gold)]/30'
+              }`}
+              style={{ touchAction: 'manipulation' }}
+            >{running ? '排隊' : '送出'}</button>
             {running && (
               <button onClick={handleStop}
-                className="px-3 py-1.5 rounded bg-red-900/30 border border-red-700/50 text-red-300 text-[10px] hover:bg-red-800/50">
+                onTouchEnd={e => { e.preventDefault(); handleStop() }}
+                className="px-4 py-3 md:px-3 md:py-1.5 rounded bg-red-900/30 border border-red-700/50 text-red-300 text-[11px] md:text-[10px] hover:bg-red-800/50"
+                style={{ touchAction: 'manipulation' }}>
                 停止
               </button>
             )}
@@ -2417,6 +3196,7 @@ function PromptStudioPanel() {
 
 const TABS = [
   { id: 'chat',      label: 'Chat' },
+  { id: 'todos',     label: '待辦' },
   { id: 'tasks',     label: 'Tasks' },
   { id: 'history',   label: 'History' },
   { id: 'prompt',    label: 'Prompt' },
@@ -2428,10 +3208,10 @@ const TABS = [
 ]
 
 const MOBILE_TABS = [
-  { id: 'chat',     label: 'CHAT',     icon: '◻' },
-  { id: 'tasks',    label: 'TASKS',    icon: '✓' },
-  { id: 'history',  label: 'HISTORY',  icon: '◷' },
   { id: 'sessions', label: 'SESSIONS', icon: '◈' },
+  { id: 'chat',     label: 'CHAT',     icon: '◻' },
+  { id: 'todos',    label: 'TODO',     icon: '✓' },
+  { id: 'history',  label: 'HISTORY',  icon: '◷' },
   { id: 'more',     label: 'MORE',     icon: '⋯' },
 ]
 
@@ -2640,11 +3420,28 @@ function Stage4Anim({ baseline, chatRunning, onDone }) {
 
 export default function App() {
   const [sessions, setSessions] = useState([])
-  const [selectedId, setSelectedId] = useState(null)
+  const [selectedId, setSelectedId] = useState(() => {
+    try { return localStorage.getItem('tc_selected_session') || null } catch { return null }
+  })
+  useEffect(() => {
+    try {
+      if (selectedId) localStorage.setItem('tc_selected_session', selectedId)
+      else localStorage.removeItem('tc_selected_session')
+    } catch {}
+  }, [selectedId])
   const [logs, setLogs] = useState([])
   const [renamingId, setRenamingId] = useState(null)
   const [renameVal, setRenameVal] = useState('')
-  const [activeTab, setActiveTab] = useState('chat')
+  const [activeTab, setActiveTab] = useState(() => {
+    try {
+      const saved = localStorage.getItem('tc_active_tab')
+      if (saved) return saved
+    } catch {}
+    return window.innerWidth < 768 ? 'sessions' : 'chat'
+  })
+  useEffect(() => {
+    try { localStorage.setItem('tc_active_tab', activeTab) } catch {}
+  }, [activeTab])
   const [streamEvents, setStreamEvents] = useState([])
   const [chatInit, setChatInit] = useState(null)
   // Ref tracking current chat projectPath for stream watcher (avoids stale sessions lookup)
@@ -3165,6 +3962,20 @@ export default function App() {
                   : <div className="text-[var(--text-muted)] text-xs text-center mt-8">{selected ? 'No tasks yet' : 'Select a session'}</div>
                 }
               </div>
+            )}
+            {activeTab === 'todos' && (
+              <TodoBoard
+                sessions={sessions}
+                onTriggerChat={({ sessionId, prefillText }) => {
+                  if (sessionId === '__new__') {
+                    setSelectedId(null)
+                    setChatInit({ sessionId: null, projectPath: 'C:/Project/RomanPrototype', prefillText, ts: Date.now() })
+                  } else {
+                    setSelectedId(sessionId)
+                    setChatInit({ sessionId, projectPath: 'C:/Project/RomanPrototype', prefillText, ts: Date.now() })
+                  }
+                  setActiveTab('chat')
+                }} />
             )}
             {activeTab === 'history'   && <HistoryPanel onContinue={handleContinueInChat} />}
             {activeTab === 'prompt'    && <PromptStudioPanel />}
