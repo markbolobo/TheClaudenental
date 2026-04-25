@@ -997,6 +997,70 @@ function generatePrefText(a) {
 
 const RATING_TAGS = ['太長', '太短', '方向對了', '方向偏了', '需要更多細節', '太囉嗦', '需要例子', '完美']
 
+// Phase 7: 把訊息變成 TODO 卡（插單機制）
+function PinToTodoButton({ text, sessionId }) {
+  const [open, setOpen] = useState(false)
+  const [title, setTitle] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [done, setDone] = useState(false)
+  const inputRef = useRef(null)
+
+  function autoTitle() {
+    const stripped = (text ?? '').replace(/[#*`>\-]/g, '').trim()
+    const firstLine = stripped.split('\n').find(l => l.trim()) ?? ''
+    return firstLine.slice(0, 60)
+  }
+
+  async function handleCreate() {
+    if (busy) return
+    const finalTitle = title.trim() || autoTitle() || '未命名插單'
+    setBusy(true)
+    try {
+      await fetch('/api/todos', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: finalTitle,
+          column: 'idea',
+          tagIds: ['tag-idea'],
+          sessionId: sessionId ?? null,
+          note: `插單來源（從 Chat 訊息建卡）：\n\n${text}\n\n[${new Date().toLocaleString('zh-TW', { hour12: false })}] 從 session ${sessionId?.slice(0, 8) ?? '(none)'} 建立`,
+        }),
+      })
+      setDone(true)
+      setTimeout(() => { setOpen(false); setDone(false); setTitle('') }, 1200)
+    } catch {}
+    finally { setBusy(false) }
+  }
+
+  if (done) return (
+    <span className="text-[9px] text-green-400 px-1.5 py-0.5 rounded border border-green-500/40 animate-pulse">✓ 已建卡</span>
+  )
+
+  if (open) return (
+    <span className="inline-flex items-center gap-1">
+      <input ref={inputRef} value={title} onChange={e => setTitle(e.target.value)} autoFocus
+        onKeyDown={e => {
+          if (e.key === 'Enter') handleCreate()
+          if (e.key === 'Escape') setOpen(false)
+        }}
+        placeholder={autoTitle() || '卡片標題'}
+        className="bg-[var(--surface)] border border-[var(--gold-border)] rounded-full px-2 py-0.5 text-[10px] outline-none w-48" />
+      <button onClick={handleCreate} disabled={busy}
+        className="text-[9px] text-[var(--gold)] hover:bg-[var(--gold)]/10 rounded px-1 disabled:opacity-50">建</button>
+      <button onClick={() => setOpen(false)}
+        className="text-[9px] text-[var(--text-muted)] hover:text-[var(--text)] rounded px-0.5">✕</button>
+    </span>
+  )
+
+  return (
+    <button onClick={() => setOpen(true)}
+      title="把這則回應變成 TODO 卡（插單）"
+      className="inline-flex items-center text-[10px] px-1.5 py-0.5 rounded-full border border-[var(--border)] text-[var(--text-muted)] hover:border-[var(--gold-border)] hover:text-[var(--gold)] transition-colors opacity-50 hover:opacity-100 select-none">
+      📌
+    </button>
+  )
+}
+
 function MessageRating({ id, text, serverRating }) {
   const [phase, setPhase]         = useState('idle') // idle | react | tag
   const [reaction, setReaction]   = useState(null)
@@ -2180,7 +2244,9 @@ ${body}`
                 <div className="md-body text-[var(--text)]">
                   <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>{m.text || ''}</ReactMarkdown>
                 </div>
-                <div className="flex justify-end mt-0.5">
+                <div className="flex justify-end items-center gap-1 mt-0.5">
+                  {/* Phase 7: 📌 插單建卡按鈕 */}
+                  <PinToTodoButton text={m.text || ''} sessionId={sessionId} />
                   <MessageRating id={sessionId && m.ts ? `${sessionId}_${m.ts}` : null} text={m.text || ''}
                     serverRating={sessionId && m.ts ? serverRatingsMap[`${sessionId}_${m.ts}`] : undefined} />
                 </div>
