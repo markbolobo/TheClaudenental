@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { DndContext, PointerSensor, TouchSensor, useSensor, useSensors, closestCorners, useDroppable } from '@dnd-kit/core'
+import { DndContext, PointerSensor, TouchSensor, useSensor, useSensors, closestCorners, useDroppable, DragOverlay } from '@dnd-kit/core'
 import { SortableContext, useSortable, arrayMove, verticalListSortingStrategy } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 
@@ -197,8 +197,40 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
     useSensor(TouchSensor,   { activationConstraint: { delay: 200, tolerance: 8 } }),
   )
 
+  // 拖曳中的卡片 + 當前懸停的目標欄（給 ghost preview 用）
+  const [activeDragCard, setActiveDragCard] = useState(null)
+  const [overColumn, setOverColumn] = useState(null)
+  // 剛落定的卡片（給「成功落定」微動畫用）
+  const [justSettledCardId, setJustSettledCardId] = useState(null)
+
+  function handleDragStart(event) {
+    const card = cards.find(c => c.id === event.active.id)
+    setActiveDragCard(card ?? null)
+  }
+
+  function handleDragOver(event) {
+    const { over } = event
+    if (!over) { setOverColumn(null); return }
+    if (typeof over.id === 'string' && over.id.startsWith('col:')) {
+      setOverColumn(over.id.slice(4))
+    } else {
+      const overCard = cards.find(c => c.id === over.id)
+      setOverColumn(overCard?.column ?? null)
+    }
+  }
+
+  function handleDragEndCleanup(cardId) {
+    setActiveDragCard(null)
+    setOverColumn(null)
+    if (cardId) {
+      setJustSettledCardId(cardId)
+      setTimeout(() => setJustSettledCardId(null), 600)
+    }
+  }
+
   function handleDragEnd(event) {
     const { active, over } = event
+    handleDragEndCleanup(active.id)
     if (!over || active.id === over.id) return
     const activeCard = cards.find(c => c.id === active.id)
     if (!activeCard) return
@@ -326,11 +358,18 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
       </div>
 
       {/* 看板 */}
-      <DndContext sensors={sensors} collisionDetection={closestCorners} onDragEnd={handleDragEnd}>
+      <DndContext sensors={sensors} collisionDetection={closestCorners}
+                  onDragStart={handleDragStart}
+                  onDragOver={handleDragOver}
+                  onDragCancel={() => handleDragEndCleanup(null)}
+                  onDragEnd={handleDragEnd}>
         <div className="flex-1 overflow-x-auto overflow-y-hidden flex gap-2 p-2 min-h-0">
           {COLUMNS.map(col => {
             const colCards = filteredCards.filter(c => c.column === col.id).sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
             const visible = col.id === 'storage' && !storageExpanded ? colCards.slice(-10) : colCards
+            const isOverThisCol = overColumn === col.id
+            const isTriggerTarget = isOverThisCol && activeDragCard && activeDragCard.column !== col.id && TRIGGER_CHAT_COLUMNS.has(col.id)
+            const isPlainTarget = isOverThisCol && activeDragCard && activeDragCard.column !== col.id && !TRIGGER_CHAT_COLUMNS.has(col.id)
             return (
               <Column key={col.id} col={col}
                 cards={visible} totalCount={colCards.length}
@@ -340,10 +379,16 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
                 onOpenDetail={(id) => setActiveCardId(id)}
                 expandable={col.id === 'storage' && colCards.length > 10}
                 expanded={storageExpanded}
-                onToggleExpand={() => setStorageExpanded(v => !v)} />
+                onToggleExpand={() => setStorageExpanded(v => !v)}
+                isTriggerTarget={isTriggerTarget}
+                isPlainTarget={isPlainTarget}
+                justSettledCardId={justSettledCardId} />
             )
           })}
         </div>
+        <DragOverlay dropAnimation={{ duration: 250, easing: 'cubic-bezier(.6,.05,.3,1)' }}>
+          {activeDragCard ? <DragGhost card={activeDragCard} tags={tags} /> : null}
+        </DragOverlay>
       </DndContext>
 
       {/* 垃圾桶 modal */}
@@ -458,6 +503,31 @@ function DragActionModal({ pending, sessions, onRevert, onSelectSession }) {
             ↩ 還原（不推進）
           </button>
           <div className="flex-1 text-[9px] text-[var(--text-muted)]">點空白也是還原</div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// Phase 1: 拖曳期間跟著游標的「飛行版」卡片（DragOverlay 用）
+function DragGhost({ card, tags }) {
+  const theme = tags.find(t => t.id === card.themeId)
+  const cardTags = (card.tagIds ?? []).map(id => tags.find(t => t.id === id)).filter(Boolean)
+  return (
+    <div className="bg-[var(--surface)] border-2 border-[var(--gold)] rounded p-1.5 shadow-[0_8px_24px_rgba(0,0,0,0.5),0_0_18px_rgba(201,162,39,0.45)] cursor-grabbing rotate-1 scale-105 w-[224px]">
+      <div className="flex gap-1 items-start">
+        {theme && <div className="w-1 self-stretch rounded-full shrink-0 min-h-[16px]" style={{ backgroundColor: theme.color }} />}
+        <div className="flex-1 min-w-0">
+          <div className="text-[10px] text-[var(--text)] leading-tight break-words">{card.title}</div>
+          {cardTags.length > 0 && (
+            <div className="flex gap-0.5 flex-wrap mt-1">
+              {cardTags.map(t => (
+                <span key={t.id} className="text-[8px] px-1 rounded border" style={{ color: t.color, borderColor: t.color + '88' }}>
+                  {t.name}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -598,17 +668,25 @@ function CardDrawer({ card, tags, themes, onClose, onPatch, onDelete }) {
   )
 }
 
-function Column({ col, cards, totalCount, tags, onCreate, onPatch, onDelete, onOpenDetail, expandable, expanded, onToggleExpand }) {
+function Column({ col, cards, totalCount, tags, onCreate, onPatch, onDelete, onOpenDetail, expandable, expanded, onToggleExpand, isTriggerTarget, isPlainTarget, justSettledCardId }) {
   const { setNodeRef, isOver } = useDroppable({ id: `col:${col.id}` })
   const [adding, setAdding] = useState(false)
   const [text, setText] = useState('')
   const inputRef = useRef(null)
 
+  // Phase 1: 拖曳目標欄高亮（trigger column 用紅金 pulse；其他用淡金邊框）
+  const colWrapClass = isTriggerTarget
+    ? 'border-[#ffb627] shadow-[0_0_18px_rgba(255,182,39,0.55)] animate-pulse'
+    : isPlainTarget
+      ? 'border-[var(--gold-border)] shadow-[0_0_10px_rgba(201,162,39,0.30)]'
+      : 'border-[var(--border)]'
+
   return (
-    <div className="shrink-0 w-[240px] flex flex-col bg-[var(--surface-2)] rounded border border-[var(--border)]">
+    <div className={`shrink-0 w-[240px] flex flex-col bg-[var(--surface-2)] rounded border-2 transition-all duration-150 ${colWrapClass}`}>
       <div className="px-2 py-1.5 flex items-center gap-1.5 border-b border-[var(--border)]">
         <span className={col.color}>{col.icon}</span>
         <span className="text-[10px] font-semibold tracking-widest uppercase">{col.label}</span>
+        {isTriggerTarget && <span className="text-[8px] text-[#ffb627] animate-pulse">⚡ 推進</span>}
         <span className="text-[9px] text-[var(--text-muted)] ml-auto">{totalCount}</span>
       </div>
 
@@ -636,10 +714,15 @@ function Column({ col, cards, totalCount, tags, onCreate, onPatch, onDelete, onO
           {cards.map(card => (
             <Card key={card.id} card={card} tags={tags}
               onPatch={onPatch} onDelete={onDelete} onOpenDetail={onOpenDetail}
-              suggestedColumn={suggestStageForCard(card)} />
+              suggestedColumn={suggestStageForCard(card)}
+              justSettled={justSettledCardId === card.id} />
           ))}
           {cards.length === 0 && (
-            <div className="text-[9px] text-[var(--text-muted)] text-center py-3 opacity-40">空</div>
+            <div className={`text-[9px] text-center py-3 transition-colors ${
+              isTriggerTarget ? 'text-[#ffb627] opacity-80' : isPlainTarget ? 'text-[var(--gold)] opacity-70' : 'text-[var(--text-muted)] opacity-40'
+            }`}>
+              {isTriggerTarget ? '⚡ 放開 → 推進' : isPlainTarget ? '↓ 放這' : '空'}
+            </div>
           )}
         </div>
       </SortableContext>
@@ -654,25 +737,25 @@ function Column({ col, cards, totalCount, tags, onCreate, onPatch, onDelete, onO
   )
 }
 
-function Card({ card, tags, onPatch, onDelete, onOpenDetail, suggestedColumn }) {
+function Card({ card, tags, onPatch, onDelete, onOpenDetail, suggestedColumn, justSettled }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: card.id })
   const theme = tags.find(t => t.id === card.themeId)
   const cardTags = (card.tagIds ?? []).map(id => tags.find(t => t.id === id)).filter(Boolean)
-  // 階段不符提示：suggestedColumn 由父層算好傳入；不符 = 顯示紅點
   const stageMismatch = suggestedColumn && suggestedColumn !== card.column
   const suggestedLabel = suggestedColumn ? COLUMN_BY_ID[suggestedColumn]?.label : null
 
-  // dnd-kit 已處理「拖曳期間不 fire click」，所以用 onClick 最乾淨
-  // PointerSensor activationConstraint distance:8 = 移動 < 8px 視為純點擊
   function handleClick(e) {
     if (isDragging) return
     onOpenDetail?.(card.id)
   }
 
+  // Phase 1: 落定微動畫（拖完 600ms 高光）
+  const settleClass = justSettled ? 'ring-2 ring-[var(--gold)] shadow-[0_0_20px_rgba(201,162,39,0.6)]' : ''
+
   return (
     <div ref={setNodeRef}
-      style={{ transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0.5 : 1 }}
-      className="bg-[var(--surface)] border border-[var(--border)] rounded p-1.5 hover:border-[var(--gold-border)] group relative">
+      style={{ transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0 : 1 }}
+      className={`bg-[var(--surface)] border border-[var(--border)] rounded p-1.5 hover:border-[var(--gold-border)] group relative transition-all duration-300 ${settleClass}`}>
       <div className="flex gap-1 items-start">
         {theme && <div className="w-1 self-stretch rounded-full shrink-0 min-h-[16px]" style={{ backgroundColor: theme.color }} />}
         <div className="flex-1 min-w-0" {...attributes} {...listeners}
