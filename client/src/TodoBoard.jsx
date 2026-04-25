@@ -56,6 +56,8 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
   const [activeCardId, setActiveCardId] = useState(null)  // 詳情抽屜
   const [pendingDrag, setPendingDrag] = useState(null)    // { card, fromCol, toCol } 拖曳後彈窗用
   const [tagManagerOpen, setTagManagerOpen] = useState(false)  // Phase 2: tag 管理 modal
+  const [searchQuery, setSearchQuery] = useState('')           // Phase 3: 搜尋
+  const [storageQuery, setStorageQuery] = useState('')         // Phase 4: 倉庫獨立搜尋
 
   // 重新載資料（衝突 / 還原後用）
   async function reloadCards() {
@@ -80,13 +82,29 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
     return cur
   }
 
-  const filteredCards = activeThemes.size === 0
+  const themeFiltered = activeThemes.size === 0
     ? cards
     : cards.filter(c => {
         if (!c.themeId) return false
         const root = rootThemeOf(c.themeId)
         return root && activeThemes.has(root.id)
       })
+
+  // Phase 3: 搜尋過濾（title + note + tag 名稱）
+  const q = searchQuery.trim().toLowerCase()
+  const filteredCards = !q ? themeFiltered : themeFiltered.filter(c => {
+    if ((c.title ?? '').toLowerCase().includes(q)) return true
+    if ((c.note ?? '').toLowerCase().includes(q)) return true
+    for (const tid of c.tagIds ?? []) {
+      const t = tags.find(x => x.id === tid)
+      if (t && t.name.toLowerCase().includes(q)) return true
+    }
+    if (c.themeId) {
+      const t = tags.find(x => x.id === c.themeId)
+      if (t && t.name.toLowerCase().includes(q)) return true
+    }
+    return false
+  })
 
   // 全部紅點卡（受主題篩選）
   const mismatchedCards = filteredCards.filter(c => {
@@ -346,6 +364,16 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
     <div className="flex flex-col h-full overflow-hidden">
       {/* 主題膠囊列 */}
       <div className="shrink-0 px-2 py-2 border-b border-[var(--border)] flex gap-1.5 overflow-x-auto items-center">
+        {/* Phase 3: 搜尋框 */}
+        <div className="shrink-0 relative">
+          <input value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
+            placeholder="🔍 搜尋 title / note / tag"
+            className="bg-[var(--surface)] border border-[var(--border)] rounded-full px-3 py-1 text-[10px] outline-none focus:border-[var(--gold-border)] w-44" />
+          {searchQuery && (
+            <button onClick={() => setSearchQuery('')}
+              className="absolute right-1 top-1/2 -translate-y-1/2 text-[10px] text-[var(--text-muted)] hover:text-[var(--text)] px-1">✕</button>
+          )}
+        </div>
         <button onClick={() => setActiveThemes(new Set())}
           className={`shrink-0 px-2.5 py-1 rounded-full text-[10px] font-semibold border transition-colors ${
             activeThemes.size === 0
@@ -396,11 +424,19 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
                   onDragEnd={handleDragEnd}>
         <div className="flex-1 overflow-x-auto overflow-y-hidden flex gap-2 p-2 min-h-0">
           {COLUMNS.map(col => {
-            const colCards = filteredCards.filter(c => c.column === col.id).sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
-            const visible = col.id === 'storage' && !storageExpanded ? colCards.slice(-10) : colCards
+            let colCards = filteredCards.filter(c => c.column === col.id).sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+            // Phase 4: 倉庫獨立搜尋
+            if (col.id === 'storage' && storageQuery.trim()) {
+              const sq = storageQuery.trim().toLowerCase()
+              colCards = colCards.filter(c =>
+                (c.title ?? '').toLowerCase().includes(sq) ||
+                (c.note ?? '').toLowerCase().includes(sq))
+            }
+            const visible = col.id === 'storage' && !storageExpanded && !storageQuery.trim() ? colCards.slice(-10) : colCards
             const isOverThisCol = overColumn === col.id
             const isTriggerTarget = isOverThisCol && activeDragCard && activeDragCard.column !== col.id && TRIGGER_CHAT_COLUMNS.has(col.id)
             const isPlainTarget = isOverThisCol && activeDragCard && activeDragCard.column !== col.id && !TRIGGER_CHAT_COLUMNS.has(col.id)
+            const isStorage = col.id === 'storage'
             return (
               <Column key={col.id} col={col}
                 cards={visible} totalCount={colCards.length}
@@ -408,12 +444,19 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
                 onCreate={(title) => createCard(col.id, title)}
                 onPatch={patchCard} onDelete={deleteCard}
                 onOpenDetail={(id) => setActiveCardId(id)}
-                expandable={col.id === 'storage' && colCards.length > 10}
+                expandable={isStorage && colCards.length > 10 && !storageQuery.trim()}
                 expanded={storageExpanded}
                 onToggleExpand={() => setStorageExpanded(v => !v)}
                 isTriggerTarget={isTriggerTarget}
                 isPlainTarget={isPlainTarget}
-                justSettledCardId={justSettledCardId} />
+                justSettledCardId={justSettledCardId}
+                storageQuery={isStorage ? storageQuery : null}
+                onStorageQueryChange={isStorage ? setStorageQuery : null}
+                onBulkDelete={isStorage ? async (ids) => {
+                  if (!ids.length) return
+                  if (!window.confirm(`刪除 ${ids.length} 張倉庫卡？（可在垃圾桶還原）`)) return
+                  for (const id of ids) await deleteCard(id)
+                } : null} />
             )
           })}
         </div>
@@ -893,11 +936,12 @@ function CardDrawer({ card, tags, themes, onClose, onPatch, onDelete }) {
   )
 }
 
-function Column({ col, cards, totalCount, tags, onCreate, onPatch, onDelete, onOpenDetail, expandable, expanded, onToggleExpand, isTriggerTarget, isPlainTarget, justSettledCardId }) {
+function Column({ col, cards, totalCount, tags, onCreate, onPatch, onDelete, onOpenDetail, expandable, expanded, onToggleExpand, isTriggerTarget, isPlainTarget, justSettledCardId, storageQuery, onStorageQueryChange, onBulkDelete }) {
   const { setNodeRef, isOver } = useDroppable({ id: `col:${col.id}` })
   const [adding, setAdding] = useState(false)
   const [text, setText] = useState('')
   const inputRef = useRef(null)
+  const [selectedIds, setSelectedIds] = useState(new Set())  // Phase 4: 倉庫批次選
 
   // Phase 1: 拖曳目標欄高亮（trigger column 用紅金 pulse；其他用淡金邊框）
   const colWrapClass = isTriggerTarget
@@ -914,6 +958,21 @@ function Column({ col, cards, totalCount, tags, onCreate, onPatch, onDelete, onO
         {isTriggerTarget && <span className="text-[8px] text-[#ffb627] animate-pulse">⚡ 推進</span>}
         <span className="text-[9px] text-[var(--text-muted)] ml-auto">{totalCount}</span>
       </div>
+
+      {/* Phase 4: 倉庫專屬搜尋框 + 批次刪 */}
+      {onStorageQueryChange && (
+        <div className="px-1.5 py-1 border-b border-[var(--border)]/50 flex flex-col gap-1">
+          <input value={storageQuery ?? ''} onChange={e => onStorageQueryChange(e.target.value)}
+            placeholder="🔍 倉庫搜尋"
+            className="w-full bg-[var(--surface)] border border-[var(--border)] rounded px-1.5 py-1 text-[9px] outline-none focus:border-[var(--gold-border)]" />
+          {cards.length > 0 && (storageQuery?.trim() || cards.length > 0) && (
+            <button onClick={() => onBulkDelete?.(cards.map(c => c.id))}
+              className="text-[8px] px-1.5 py-0.5 rounded border border-red-500/40 text-red-400/70 hover:bg-red-500/10 hover:text-red-400">
+              {storageQuery?.trim() ? `批次刪此搜尋結果（${cards.length}）` : `批次刪當前可見（${cards.length}）`}
+            </button>
+          )}
+        </div>
+      )}
 
       <div className="px-1.5 py-1 border-b border-[var(--border)]/50">
         {adding ? (
