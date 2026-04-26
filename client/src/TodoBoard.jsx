@@ -98,16 +98,23 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
   })
   // 監聽 sessionStorage（Chat 送出後 commit 會 removeItem，要同步刷掉視覺 ring）
   // 用 polling（sessionStorage 沒 storage event in 同 tab，跨 tab 才有）
+  // Safety: 10 分鐘自動超時，避免使用者永遠不送出時 polling 跑到天荒地老
   useEffect(() => {
     if (!pendingTransition) return
+    const startedAt = Date.now()
+    const TIMEOUT_MS = 10 * 60 * 1000  // 10 分鐘
     const tick = setInterval(() => {
       const raw = sessionStorage.getItem('tc_pending_todo_transition')
       if (!raw) {
         setPendingTransition(null)
         // server 端已被 ChatPanel commit，重新拉一次卡片狀態
         reloadCards()
+      } else if (Date.now() - startedAt > TIMEOUT_MS) {
+        // Timeout: 使用者太久沒送出，自動清掉 pending（卡留在 fromCol）
+        try { sessionStorage.removeItem('tc_pending_todo_transition') } catch {}
+        setPendingTransition(null)
       }
-    }, 500)
+    }, 1000)  // 從 500ms 改 1000ms（reduce CPU）
     return () => clearInterval(tick)
   }, [pendingTransition?.cardId])
   const [tagManagerOpen, setTagManagerOpen] = useState(false)  // Phase 2: tag 管理 modal

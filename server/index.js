@@ -1386,6 +1386,52 @@ function logEvent(kind, data) {
   } catch {}
 }
 
+// 過期資料 retention（防無限累積）
+// - events log: 保留 90 天
+// - invites: 過期 + 未用 → 刪
+// - user sessions: 過期 → 刪
+function cleanupExpiredData() {
+  const now = Date.now()
+  let removed = { events: 0, invites: 0, sessions: 0 }
+  try {
+    const cutoffMs = now - 90 * 86400000
+    for (const f of fs.readdirSync(EVENTS_DIR)) {
+      if (!f.endsWith('.jsonl')) continue
+      const day = f.slice(0, -6)
+      const dayTs = new Date(day).getTime()
+      if (!isNaN(dayTs) && dayTs < cutoffMs) {
+        try { fs.unlinkSync(path.join(EVENTS_DIR, f)); removed.events++ } catch {}
+      }
+    }
+  } catch {}
+  try {
+    const data = readInvites()
+    const before = data.invites.length
+    data.invites = data.invites.filter(i => i.usedByUserId || (i.expiresAt ?? 0) > now)
+    if (before !== data.invites.length) {
+      writeInvites(data)
+      removed.invites = before - data.invites.length
+    }
+  } catch {}
+  try {
+    const data = readUserSessions()
+    const before = data.sessions.length
+    data.sessions = data.sessions.filter(s => (s.expiresAt ?? 0) > now)
+    if (before !== data.sessions.length) {
+      writeUserSessions(data)
+      removed.sessions = before - data.sessions.length
+    }
+  } catch {}
+  if (removed.events || removed.invites || removed.sessions) {
+    console.log(`[cleanup] removed: ${removed.events} event files, ${removed.invites} expired invites, ${removed.sessions} expired sessions`)
+  }
+}
+// 啟動時跑一次（沒 sessions 對象前 readInvites/readUserSessions 都是空陣列，安全）
+// 用 setTimeout 延遲，等檔案讀寫函式都 ready
+setTimeout(() => { try { cleanupExpiredData() } catch (e) { console.error('[cleanup error]', e) } }, 5000)
+// 每 24 小時跑一次
+setInterval(() => { try { cleanupExpiredData() } catch (e) { console.error('[cleanup error]', e) } }, 24 * 60 * 60 * 1000)
+
 // 讀今日 / 指定日 / 範圍 events（給 Phase 4 儀表板用）
 app.get('/api/metrics/events', async (request) => {
   const { date, from, to, kind } = request.query ?? {}
