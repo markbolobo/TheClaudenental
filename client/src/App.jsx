@@ -3633,6 +3633,31 @@ function Stage4Anim({ baseline, chatRunning, onDone }) {
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 
+// Server health 顯示（連線數 + 記憶體）— 每 15 秒 polling
+function HealthIndicator() {
+  const [h, setH] = useState(null)
+  useEffect(() => {
+    let alive = true
+    function load() {
+      fetch('/api/health').then(r => r.json()).then(d => alive && setH(d)).catch(() => {})
+    }
+    load()
+    const id = setInterval(load, 15000)
+    return () => { alive = false; clearInterval(id) }
+  }, [])
+  if (!h) return null
+  const conns = h.connections ?? 0
+  const max = h.maxConnections ?? 100
+  const ratio = conns / max
+  const tone = ratio >= 0.9 ? 'text-red-400' : ratio >= 0.5 ? 'text-amber-400' : 'text-[var(--text-muted)]'
+  return (
+    <span className={`text-[10px] ${tone}`}
+      title={`server uptime ${Math.round(h.uptimeSec/60)}m · heap ${h.memoryMB}MB · rss ${h.memoryRssMB}MB`}>
+      👥 {conns}/{max} · {h.memoryMB}MB
+    </span>
+  )
+}
+
 // P2 階段 4：全域 fetch wrapper，自動帶 tc_session token + Authorization header
 // 已有的 fetch 不用改，瀏覽器會自動帶 cookie；這個 helper 給未來 collaborator 從不同 host 接的情境
 const tcAuthToken = () => {
@@ -4157,6 +4182,7 @@ export default function App() {
           {connected ? 'Connected' : 'Reconnecting…'}
         </span>
         <div className="flex-1" />
+        <HealthIndicator />
         <span className="text-[10px] text-[var(--text-muted)]">
           {sessions.filter(s => s.status === 'active').length} active · {sessions.length} sessions
         </span>

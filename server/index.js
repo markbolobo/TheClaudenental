@@ -51,10 +51,25 @@ const pendingSpawnCwds   = new Set()   // project paths currently spawning (pre-
 
 function broadcast(msg) {
   const data = JSON.stringify(msg)
+  // B. send 失敗自動清掉死 socket（防殭屍累積）
   for (const ws of clients) {
-    try { ws.send(data) } catch {}
+    try { ws.send(data) } catch { clients.delete(ws) }
   }
 }
+
+// C. Heartbeat（每 30 秒 ping，沒回 pong 視為死連線）
+const MAX_CONNECTIONS = 100  // D. 軟上限防意外
+setInterval(() => {
+  for (const ws of clients) {
+    if (ws.isAlive === false) {
+      try { ws.terminate() } catch {}
+      clients.delete(ws)
+      continue
+    }
+    ws.isAlive = false
+    try { ws.ping() } catch { clients.delete(ws) }
+  }
+}, 30_000)
 
 // ─── Session persistence ──────────────────────────────────────────────────────
 
@@ -83,8 +98,29 @@ loadPersistedSessions()
 
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 
+// A. Health endpoint — dashboard 可顯示連線數 / sessions 數 / 記憶體
+app.get('/api/health', async () => {
+  const mem = process.memoryUsage()
+  return {
+    ok: true,
+    connections: clients.size,
+    maxConnections: MAX_CONNECTIONS,
+    sessions: sessions.size,
+    uptimeSec: Math.round(process.uptime()),
+    memoryMB: Math.round(mem.heapUsed / 1024 / 1024),
+    memoryRssMB: Math.round(mem.rss / 1024 / 1024),
+  }
+})
+
 app.get('/ws', { websocket: true }, (socket) => {
+  // D. 軟上限保護（同時連線過多時拒絕新連線）
+  if (clients.size >= MAX_CONNECTIONS) {
+    try { socket.close(1013, 'too many connections') } catch {}
+    return
+  }
   clients.add(socket)
+  socket.isAlive = true
+  socket.on('pong', () => { socket.isAlive = true })  // C. heartbeat 配對
   socket.send(JSON.stringify({ type: 'state', sessions: [...sessions.values()], logs: logHistory }))
 
   socket.on('message', (raw) => {
