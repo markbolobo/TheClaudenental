@@ -3562,6 +3562,27 @@ function Stage4Anim({ baseline, chatRunning, onDone }) {
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 
+// P2 階段 4：全域 fetch wrapper，自動帶 tc_session token + Authorization header
+// 已有的 fetch 不用改，瀏覽器會自動帶 cookie；這個 helper 給未來 collaborator 從不同 host 接的情境
+const tcAuthToken = () => {
+  try { return localStorage.getItem('tc_session_token') } catch { return null }
+}
+const _origFetch = typeof window !== 'undefined' ? window.fetch.bind(window) : null
+if (typeof window !== 'undefined' && !window.__tcFetchPatched) {
+  window.fetch = (input, init = {}) => {
+    const t = tcAuthToken()
+    if (t) {
+      const headers = new Headers(init.headers || {})
+      if (!headers.has('Authorization')) headers.set('Authorization', `Bearer ${t}`)
+      init = { ...init, headers, credentials: 'include' }
+    } else if (!init.credentials) {
+      init = { ...init, credentials: 'include' }
+    }
+    return _origFetch(input, init)
+  }
+  window.__tcFetchPatched = true
+}
+
 export default function App() {
   const [sessions, setSessions] = useState([])
   const [selectedId, setSelectedId] = useState(() => {
@@ -3590,6 +3611,63 @@ export default function App() {
   const [chatInit, setChatInit] = useState(null)
   // Ref tracking current chat projectPath for stream watcher (avoids stale sessions lookup)
   const chatProjectPathRef = useRef('')
+
+  // P2 階段 4：當前登入身份（owner / collaborator / null）
+  const [currentUser, setCurrentUser] = useState(null)  // null = 載入中
+  const [acceptingInvite, setAcceptingInvite] = useState(null)  // { token } 接受邀請流程
+  const [inviteName, setInviteName] = useState('')
+
+  useEffect(() => {
+    // 處理 ?invite=xxx URL（被邀請者打開時）
+    try {
+      const url = new URL(window.location.href)
+      const inviteToken = url.searchParams.get('invite')
+      if (inviteToken) {
+        setAcceptingInvite({ token: inviteToken })
+        url.searchParams.delete('invite')
+        window.history.replaceState({}, '', url.toString())
+        return  // 不 fetch whoami，等接受完
+      }
+    } catch {}
+    // 沒邀請 token → 拿當前身份
+    fetch('/api/auth/whoami')
+      .then(r => r.json())
+      .then(d => {
+        if (d.ok) setCurrentUser(d.user)
+        else setCurrentUser({ id: 'u-owner', name: 'Mark', role: 'owner' })  // fallback
+      })
+      .catch(() => setCurrentUser({ id: 'u-owner', name: 'Mark', role: 'owner' }))
+  }, [])
+
+  async function acceptInvite() {
+    if (!acceptingInvite?.token || !inviteName.trim()) return
+    try {
+      const res = await fetch('/api/auth/accept-invite', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: acceptingInvite.token, name: inviteName.trim() }),
+      })
+      const data = await res.json()
+      if (!data.ok) {
+        alert(`接受邀請失敗：${data.error ?? '未知錯誤'}`)
+        return
+      }
+      // 持久化 session token（對方瀏覽器永遠帶）
+      try { localStorage.setItem('tc_session_token', data.sessionToken) } catch {}
+      setCurrentUser(data.user)
+      setAcceptingInvite(null)
+      setInviteName('')
+    } catch (e) {
+      alert(`網路錯誤：${e.message}`)
+    }
+  }
+
+  async function logout() {
+    if (!window.confirm('確認登出？')) return
+    await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {})
+    try { localStorage.removeItem('tc_session_token') } catch {}
+    setCurrentUser(null)
+    window.location.reload()
+  }
 
   // ── Bounty system ────────────────────────────────────────────────────────
   const [bountySettings, setBountySettings]     = useState({})
@@ -3918,6 +3996,38 @@ export default function App() {
       }
       return { ...s, tasks: updateTask(s.tasks) }
     }))
+  }
+
+  // P2 階段 4：邀請接受頁（先擋掉主畫面，受邀者看到的第一個視覺）
+  if (acceptingInvite) {
+    return (
+      <div className="flex flex-col h-full bg-[var(--bg)] text-[var(--text)] items-center justify-center p-4">
+        <div className="bg-[var(--surface)] border border-[var(--gold-border)] rounded-lg p-6 w-[min(420px,90vw)] flex flex-col gap-4 shadow-2xl">
+          <div className="text-[9px] uppercase tracking-[0.3em] text-[var(--gold)]/60">— The Continental —</div>
+          <h2 className="text-xl text-[var(--gold)] font-bold tracking-wider">受邀協作</h2>
+          <p className="text-[11px] text-[var(--text-muted)] leading-relaxed">
+            你被邀請成為 TheClaudenental 的協作者。<br/>
+            填入你的名字後即可進入，看到主人分享給你的卡片。
+          </p>
+          <input
+            value={inviteName}
+            onChange={e => setInviteName(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') acceptInvite() }}
+            autoFocus
+            placeholder="你的名字"
+            className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded px-3 py-2 text-[12px] text-[var(--text)] outline-none focus:border-[var(--gold-border)]"
+          />
+          <button onClick={acceptInvite} disabled={!inviteName.trim()}
+            className="px-4 py-2 rounded bg-[var(--gold)]/20 border border-[var(--gold)] text-[var(--gold)] font-semibold tracking-wider text-[11px] hover:bg-[var(--gold)]/30 disabled:opacity-40">
+            接受邀請進入
+          </button>
+          <div className="text-[9px] text-[var(--text-muted)]/70 leading-relaxed border-t border-[var(--border)] pt-3">
+            進入後你只會看到主人**特別分享給你**的卡片，無法存取其他資料。<br/>
+            session token 會存在你的瀏覽器 30 天。
+          </div>
+        </div>
+      </div>
+    )
   }
 
   return (
