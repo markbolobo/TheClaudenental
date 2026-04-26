@@ -1468,11 +1468,225 @@ function readTodoCategories() {
 }
 function writeTodoCategories(data) { fs.writeFileSync(TODO_CATEGORIES_FILE, JSON.stringify(data, null, 2), 'utf8') }
 
+// ─── Users / Sessions / Invites（P2 階段 3：分享卡片用） ────────────────────
+
+const USERS_FILE         = path.join(os.homedir(), '.claude', 'tc_users.json')
+const USER_SESSIONS_FILE = path.join(os.homedir(), '.claude', 'tc_user_sessions.json')
+const INVITES_FILE       = path.join(os.homedir(), '.claude', 'tc_invites.json')
+
+const SEED_USERS = [
+  { id: 'u-owner', email: 'owner@local', name: 'Mark', role: 'owner', createdAt: 0, color: '#facc15' },
+]
+
+function readUsers() {
+  try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')) }
+  catch {
+    const seeded = { users: SEED_USERS }
+    try { fs.writeFileSync(USERS_FILE, JSON.stringify(seeded, null, 2), 'utf8') } catch {}
+    return seeded
+  }
+}
+function writeUsers(d) { fs.writeFileSync(USERS_FILE, JSON.stringify(d, null, 2), 'utf8') }
+
+function readUserSessions() { try { return JSON.parse(fs.readFileSync(USER_SESSIONS_FILE, 'utf8')) } catch { return { sessions: [] } } }
+function writeUserSessions(d) { fs.writeFileSync(USER_SESSIONS_FILE, JSON.stringify(d, null, 2), 'utf8') }
+
+function readInvites() { try { return JSON.parse(fs.readFileSync(INVITES_FILE, 'utf8')) } catch { return { invites: [] } } }
+function writeInvites(d) { fs.writeFileSync(INVITES_FILE, JSON.stringify(d, null, 2), 'utf8') }
+
+function genToken() { return crypto.randomBytes(32).toString('hex') }
+
+function parseCookie(raw, name) {
+  if (!raw) return null
+  for (const part of raw.split(';')) {
+    const [k, ...v] = part.trim().split('=')
+    if (k === name) return decodeURIComponent(v.join('='))
+  }
+  return null
+}
+
+// Resolve user from request: cookie → query param token → Authorization → fallback owner
+async function resolveUser(request) {
+  const cookieToken = parseCookie(request.headers.cookie || '', 'tc_session')
+  const queryToken  = request.query?.tc_token
+  const bearerToken = (request.headers.authorization || '').replace(/^Bearer\s+/i, '')
+  const token = cookieToken || queryToken || bearerToken
+  if (token) {
+    const sess = readUserSessions().sessions.find(s => s.token === token && s.expiresAt > Date.now())
+    if (sess) {
+      const u = readUsers().users.find(x => x.id === sess.userId)
+      if (u) return { user: u, session: sess, viaToken: true }
+    }
+  }
+  // 沒 token：fallback to owner（host 端體驗不變；Tailnet 內信任邊界）
+  const owner = readUsers().users.find(u => u.role === 'owner')
+  return owner ? { user: owner, session: null, viaToken: false } : null
+}
+
+// Hook: 為每個 request 解析 user，附在 request.tcAuth
+app.addHook('onRequest', async (request) => {
+  request.tcAuth = await resolveUser(request)
+})
+
+// Helper: 要求 owner 才能執行的操作
+function requireOwner(request, reply) {
+  const u = request.tcAuth?.user
+  if (!u || u.role !== 'owner') {
+    reply.code(403)
+    return null
+  }
+  return u
+}
+
+// ─── Auth API ────────────────────────────────────────────────────────────────
+
+app.get('/api/auth/whoami', async (request) => {
+  const u = request.tcAuth?.user
+  if (!u) return { ok: false, user: null }
+  return { ok: true, user: { id: u.id, email: u.email, name: u.name, role: u.role, color: u.color } }
+})
+
+// Owner 生成邀請連結
+app.post('/api/auth/invite', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const body = request.body ?? {}
+  const invite = {
+    id: `inv-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    token: genToken(),
+    label: body.label ?? '受邀協作者',
+    invitedBy: request.tcAuth.user.id,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + 7 * 86400000,  // 7 天到期
+    usedByUserId: null,
+    usedAt: null,
+  }
+  const data = readInvites()
+  data.invites.push(invite)
+  writeInvites(data)
+  logEvent('invite.create', { id: invite.id, label: invite.label })
+  return { ok: true, invite }
+})
+
+// Owner 列出已發 invites
+app.get('/api/auth/invites', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  return readInvites()
+})
+
+// Owner 撤銷 invite
+app.delete('/api/auth/invites/:id', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const data = readInvites()
+  const before = data.invites.length
+  data.invites = data.invites.filter(i => i.id !== request.params.id)
+  writeInvites(data)
+  return { ok: true, removed: before - data.invites.length }
+})
+
+// 對方點 invite link → 接受邀請並建立 user + session
+app.post('/api/auth/accept-invite', async (request, reply) => {
+  const { token, name, email } = request.body ?? {}
+  if (!token || !name) { reply.code(400); return { ok: false, error: 'token + name required' } }
+  const invitesData = readInvites()
+  const inv = invitesData.invites.find(i => i.token === token)
+  if (!inv) { reply.code(404); return { ok: false, error: 'invalid invite token' } }
+  if (inv.expiresAt < Date.now()) { reply.code(410); return { ok: false, error: 'invite expired' } }
+  if (inv.usedByUserId) { reply.code(409); return { ok: false, error: 'invite already used' } }
+
+  // 建 user
+  const usersData = readUsers()
+  const user = {
+    id: `u-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    email: email ?? `${name.toLowerCase().replace(/\s+/g, '-')}@invited.local`,
+    name,
+    role: 'collaborator',
+    createdAt: Date.now(),
+    color: '#'+Math.floor(Math.random()*16777215).toString(16).padStart(6, '0'),
+    invitedBy: inv.invitedBy,
+  }
+  usersData.users.push(user)
+  writeUsers(usersData)
+
+  // 標記 invite 已用
+  inv.usedByUserId = user.id
+  inv.usedAt = Date.now()
+  writeInvites(invitesData)
+
+  // 建 session（30 天）
+  const sessionToken = genToken()
+  const sessData = readUserSessions()
+  sessData.sessions.push({
+    token: sessionToken,
+    userId: user.id,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + 30 * 86400000,
+  })
+  writeUserSessions(sessData)
+
+  logEvent('invite.accept', { inviteId: inv.id, userId: user.id, name })
+
+  // Set cookie（HTTP-only 不行，因為 Vite dev 是不同 origin；用普通 cookie + 也回 token 給 client localStorage）
+  reply.header('Set-Cookie', `tc_session=${sessionToken}; Path=/; Max-Age=${30*86400}; SameSite=Lax`)
+  return { ok: true, user, sessionToken }
+})
+
+app.post('/api/auth/logout', async (request, reply) => {
+  const token = parseCookie(request.headers.cookie || '', 'tc_session') ||
+                request.query?.tc_token ||
+                (request.headers.authorization || '').replace(/^Bearer\s+/i, '')
+  if (token) {
+    const data = readUserSessions()
+    data.sessions = data.sessions.filter(s => s.token !== token)
+    writeUserSessions(data)
+  }
+  reply.header('Set-Cookie', 'tc_session=; Path=/; Max-Age=0; SameSite=Lax')
+  return { ok: true }
+})
+
+// Owner 列出 users
+app.get('/api/auth/users', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const data = readUsers()
+  return { users: data.users.map(u => ({ id: u.id, email: u.email, name: u.name, role: u.role, color: u.color, createdAt: u.createdAt })) }
+})
+
+// Owner 撤銷 collaborator（同時刪該 user 的 sessions）
+app.delete('/api/auth/users/:id', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const userId = request.params.id
+  if (userId === 'u-owner') { reply.code(400); return { ok: false, error: 'cannot delete owner' } }
+  const usersData = readUsers()
+  usersData.users = usersData.users.filter(u => u.id !== userId)
+  writeUsers(usersData)
+  // 刪該 user 的 sessions
+  const sessData = readUserSessions()
+  sessData.sessions = sessData.sessions.filter(s => s.userId !== userId)
+  writeUserSessions(sessData)
+  // 卡片的 sharedWith 同步移除
+  const todosData = readTodos()
+  for (const card of todosData.cards) {
+    if (Array.isArray(card.sharedWith)) {
+      const before = card.sharedWith.length
+      card.sharedWith = card.sharedWith.filter(uid => uid !== userId)
+      if (before !== card.sharedWith.length) card.version = (card.version ?? 1) + 1
+    }
+  }
+  writeTodos(todosData)
+  logEvent('user.revoke', { userId })
+  return { ok: true }
+})
+
 // Cards — 預設過濾掉 soft-deleted；?includeDeleted=1 看全部
+// Collaborator 只看到被分享給他的卡（sharedWith 含其 userId）
 app.get('/api/todos', async (request) => {
   const data = readTodos()
   const includeDeleted = request.query?.includeDeleted === '1'
-  return { cards: includeDeleted ? data.cards : data.cards.filter(c => !c.deletedAt) }
+  let cards = includeDeleted ? data.cards : data.cards.filter(c => !c.deletedAt)
+  const u = request.tcAuth?.user
+  if (u && u.role === 'collaborator') {
+    cards = cards.filter(c => Array.isArray(c.sharedWith) && c.sharedWith.includes(u.id))
+  }
+  return { cards }
 })
 
 // 垃圾桶（只看 deleted）
@@ -1499,6 +1713,9 @@ app.post('/api/todos', async (request) => {
     updatedAt: Date.now(),
     order: typeof body.order === 'number' ? body.order : Date.now(),
     categoryId: body.categoryId ?? 'cat-personal',  // 預設個人分類
+    sharedWith: [],         // P2 階段 3：分享對象 user IDs
+    sharedBy: request.tcAuth?.user?.id ?? null,  // 建立者
+    sharedAt: null,         // 第一次被分享時的時間
     version: 1,            // ETag — 每次 PATCH +1
     deletedAt: null,       // soft delete timestamp
   }
@@ -1572,6 +1789,54 @@ app.post('/api/todos/:id/purge', async (request) => {
   writeTodos(data)
   logEvent('card.purge', { id: request.params.id })
   return { ok: true, removed: before - data.cards.length }
+})
+
+// 分享卡片給 collaborator(s)
+app.post('/api/todos/:id/share', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const data = readTodos()
+  const card = data.cards.find(c => c.id === request.params.id)
+  if (!card) { reply.code(404); return { ok: false, error: 'not found' } }
+  const userIds = Array.isArray(request.body?.userIds) ? request.body.userIds : []
+  // 驗證 userIds 都存在且是 collaborator
+  const allUsers = readUsers().users
+  const valid = userIds.filter(uid => allUsers.some(u => u.id === uid && u.role === 'collaborator'))
+  // 合併（不重複）
+  const existing = new Set(card.sharedWith ?? [])
+  for (const uid of valid) existing.add(uid)
+  card.sharedWith = [...existing]
+  if (!card.sharedAt) card.sharedAt = Date.now()
+  card.version = (card.version ?? 1) + 1
+  writeTodos(data)
+  logEvent('card.share', { cardId: card.id, addedUserIds: valid })
+  return { ok: true, card }
+})
+
+// 撤回分享給某 user
+app.delete('/api/todos/:id/share/:userId', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const data = readTodos()
+  const card = data.cards.find(c => c.id === request.params.id)
+  if (!card) { reply.code(404); return { ok: false, error: 'not found' } }
+  const before = (card.sharedWith ?? []).length
+  card.sharedWith = (card.sharedWith ?? []).filter(uid => uid !== request.params.userId)
+  card.version = (card.version ?? 1) + 1
+  writeTodos(data)
+  logEvent('card.unshare', { cardId: card.id, removedUserId: request.params.userId })
+  return { ok: true, card, removed: before - card.sharedWith.length }
+})
+
+// Collaborator 收件匣：被分享給此 user 的卡
+app.get('/api/todos/inbox', async (request) => {
+  const u = request.tcAuth?.user
+  if (!u) return { cards: [] }
+  const data = readTodos()
+  const cards = data.cards.filter(c =>
+    !c.deletedAt &&
+    Array.isArray(c.sharedWith) &&
+    c.sharedWith.includes(u.id)
+  )
+  return { cards }
 })
 
 // 批次重排
