@@ -3351,12 +3351,21 @@ const TABS = [
   { id: 'mcp',       label: 'MCP' },
 ]
 
+// P2 階段 4c：協作者只能看到分享給他們的卡片，所有個人功能都隱藏
+const COLLABORATOR_TABS = [
+  { id: 'todos',     label: '📥 收到的卡' },
+]
+
 const MOBILE_TABS = [
   { id: 'sessions', label: 'SESSIONS', icon: '◈' },
   { id: 'chat',     label: 'CHAT',     icon: '◻' },
   { id: 'todos',    label: 'TODO',     icon: '✓' },
   { id: 'history',  label: 'HISTORY',  icon: '◷' },
   { id: 'more',     label: 'MORE',     icon: '⋯' },
+]
+
+const COLLABORATOR_MOBILE_TABS = [
+  { id: 'todos',    label: 'INBOX', icon: '📥' },
 ]
 
 // ─── Mobile components ────────────────────────────────────────────────────────
@@ -3402,11 +3411,12 @@ function MobileSessionBar({ sessions, selectedId, setActiveTab, connected, onBou
   )
 }
 
-function MobileTabBar({ activeTab, setActiveTab }) {
+function MobileTabBar({ activeTab, setActiveTab, currentUser }) {
+  const tabs = currentUser?.role === 'collaborator' ? COLLABORATOR_MOBILE_TABS : MOBILE_TABS
   return (
     <nav className="md:hidden shrink-0 flex items-center px-3 pt-2 bg-[var(--surface)] border-t border-[var(--border)]" style={{ paddingBottom: 'max(20px, env(safe-area-inset-bottom))' }}>
       <div className="flex flex-1 h-[52px] bg-[var(--surface-2)] rounded-full border border-[var(--border)] p-1">
-        {MOBILE_TABS.map(t => (
+        {tabs.map(t => (
           <button key={t.id} onClick={() => setActiveTab(t.id)}
             className={`flex-1 flex flex-col items-center justify-center gap-0.5 rounded-full text-center transition-colors ${
               activeTab === t.id
@@ -3668,6 +3678,11 @@ export default function App() {
     setCurrentUser(null)
     window.location.reload()
   }
+
+  // Collaborator 一進來自動切到 todos（他們唯一能看到的 tab）
+  useEffect(() => {
+    if (currentUser?.role === 'collaborator') setActiveTab('todos')
+  }, [currentUser?.role])
 
   // ── Bounty system ────────────────────────────────────────────────────────
   const [bountySettings, setBountySettings]     = useState({})
@@ -4183,9 +4198,9 @@ export default function App() {
           {/* Mobile: session indicator */}
           <MobileSessionBar sessions={sessions} selectedId={selectedId} setActiveTab={setActiveTab} connected={connected} onBountySettings={() => setShowBountySettings(true)} />
 
-          {/* Tab bar — desktop only */}
+          {/* Tab bar — desktop only；collaborator 只看到 inbox */}
           <div className="hidden md:flex items-center border-b border-[var(--border)] bg-[var(--surface)] shrink-0 overflow-x-auto">
-            {TABS.map(tab => (
+            {(currentUser?.role === 'collaborator' ? COLLABORATOR_TABS : TABS).map(tab => (
               <button key={tab.id} onClick={() => setActiveTab(tab.id)}
                 className={`px-3 py-2 text-[10px] uppercase tracking-widest shrink-0 border-b-2 transition-colors ${
                   activeTab === tab.id
@@ -4199,6 +4214,18 @@ export default function App() {
               </button>
             ))}
             {selected && <StatusDot status={selected.status} />}
+            <div className="flex-1" />
+            {/* P2 階段 4c：身份指示 + logout */}
+            {currentUser?.role === 'collaborator' && (
+              <div className="flex items-center gap-2 px-3">
+                <span className="text-[10px] text-[var(--gold)]/80">👤 {currentUser.name}</span>
+                <span className="text-[8px] text-[var(--text-muted)] uppercase tracking-widest">協作者</span>
+                <button onClick={logout}
+                  className="text-[9px] px-2 py-0.5 rounded text-[var(--text-muted)] hover:text-red-400 border border-[var(--border)] hover:border-red-500/40">
+                  登出
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Tab content */}
@@ -4344,7 +4371,7 @@ export default function App() {
       </div>
 
       {/* Mobile bottom tab bar */}
-      <MobileTabBar activeTab={activeTab} setActiveTab={setActiveTab} />
+      <MobileTabBar activeTab={activeTab} setActiveTab={setActiveTab} currentUser={currentUser} />
     </div>
   )
 }
