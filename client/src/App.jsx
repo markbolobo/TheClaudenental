@@ -1281,6 +1281,16 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
   const attachMenuRef = useRef(null)
   const [sessionId, setSessionId] = useState(null)
   const [messages, setMessages] = useState([])
+  // Hard cap 1000 則保護記憶體（state 太大也會慢）；超過 1000 才砍最舊
+  // 但 DOM render 用 visibleCount 控制（手動揭露），保留資料感
+  useEffect(() => {
+    if (messages.length > 1000) setMessages(m => m.slice(-1000))
+  }, [messages.length])
+  // 手動揭露：預設顯示最近 150 則；點「載入更早」每次 +100
+  // 新訊息進來 → 顯示窗口自動跟著最新（不會把新的擋住）
+  const [visibleCount, setVisibleCount] = useState(150)
+  // 對話內搜尋：有輸入時 render filter 結果（不受 visibleCount 限制）
+  const [chatSearchQuery, setChatSearchQuery] = useState('')
   const bottomRef = useRef(null)
   const scrollContainerRef = useRef(null)
   const isNearBottomRef = useRef(true)
@@ -2281,6 +2291,22 @@ ${body}`
         <button onClick={clearChat} className="text-[9px] text-[var(--text-muted)] hover:text-[var(--text)] shrink-0">✕ clear</button>
       </div>
 
+      {/* Chat 搜尋框（對話內全文搜尋；有輸入時 render 全部 filter 結果） */}
+      {messages.length > 30 && (
+        <div className="shrink-0 px-3 py-1 border-b border-[var(--border)]/50 bg-[var(--surface-2)]/30 flex items-center gap-2">
+          <input
+            value={chatSearchQuery}
+            onChange={e => setChatSearchQuery(e.target.value)}
+            placeholder={`🔍 搜尋此對話內容（${messages.length} 則）`}
+            className="flex-1 bg-transparent text-[10px] text-[var(--text)] outline-none placeholder:text-[var(--text-muted)]"
+          />
+          {chatSearchQuery && (
+            <button onClick={() => setChatSearchQuery('')}
+              className="text-[10px] text-[var(--text-muted)] hover:text-[var(--text)] px-1">✕</button>
+          )}
+        </div>
+      )}
+
       {/* Messages */}
       <div ref={scrollContainerRef} onScroll={handleChatScroll}
            className="flex-1 overflow-y-auto px-3 py-2 space-y-2 min-h-0 relative">
@@ -2289,7 +2315,41 @@ ${body}`
             輸入訊息開始對話，不需要 VS Code 介面
           </div>
         )}
-        {messages.map((m, i) => (
+
+        {/* 載入更早歷史按鈕（沒搜尋時顯示，且還有更早的訊息可載入） */}
+        {!chatSearchQuery.trim() && messages.length > visibleCount && (
+          <div className="text-center py-2">
+            <button onClick={() => setVisibleCount(c => c + 100)}
+              className="text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)] px-3 py-1 rounded border border-[var(--border)] hover:border-[var(--gold-border)]">
+              ↑ 載入更早 100 則（還有 {messages.length - visibleCount} 則）
+            </button>
+            <button onClick={() => setVisibleCount(messages.length)}
+              className="ml-2 text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)] px-2 py-1">
+              展開全部
+            </button>
+          </div>
+        )}
+
+        {(() => {
+          const q = chatSearchQuery.trim().toLowerCase()
+          const renderMessages = q
+            ? messages.filter(m => {
+                if ((m.text ?? '').toLowerCase().includes(q)) return true
+                if ((m.toolName ?? '').toLowerCase().includes(q)) return true
+                const inputStr = m.input ? JSON.stringify(m.input).toLowerCase() : ''
+                if (inputStr.includes(q)) return true
+                if (Array.isArray(m.attachments) && m.attachments.some(a => (a.name ?? '').toLowerCase().includes(q))) return true
+                return false
+              })
+            : messages.slice(-visibleCount)
+
+          if (q && renderMessages.length === 0) return (
+            <div className="text-[10px] text-[var(--text-muted)] text-center py-4 opacity-60">
+              「{chatSearchQuery}」沒有命中任何訊息
+            </div>
+          )
+
+          return renderMessages.map((m, i) => (
           <div key={i} className={`text-[11px] leading-relaxed ${m.historical ? 'opacity-75' : ''}`}>
             {/* System / divider */}
             {m.role === 'system' && (
@@ -2358,7 +2418,8 @@ ${body}`
               <div className="text-[10px] text-[var(--text-muted)] border-t border-[var(--border)] pt-1 mt-1">{m.text}</div>
             )}
           </div>
-        ))}
+          ))
+        })()}
         {/* Live streaming block */}
         {liveBlockRef.current && (
           <div className={`text-[11px] leading-relaxed ${liveBlockRef.current.type === 'thinking' ? '' : ''}`}>
