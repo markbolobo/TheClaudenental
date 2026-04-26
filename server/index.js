@@ -1386,27 +1386,18 @@ function logEvent(kind, data) {
   } catch {}
 }
 
-// 過期資料 retention（防無限累積）
-// - events log: 保留 90 天
-// - invites: 過期 + 未用 → 刪
-// - user sessions: 過期 → 刪
+// 過期資料清理（只清「過期」概念明確的：未用 invites + 已死 sessions）
+// 卡片 / events log 不自動真刪 — 對應 memory 三層分離哲學：
+// - 卡片 = 介面層（軟刪後永遠保留，要徹底刪走 /:id/purge 顯式呼叫）
+// - events log = 內容層（歷史不該被自動砍）
+// - knowledge / memory = 永久層
 function cleanupExpiredData() {
   const now = Date.now()
-  let removed = { events: 0, invites: 0, sessions: 0 }
-  try {
-    const cutoffMs = now - 90 * 86400000
-    for (const f of fs.readdirSync(EVENTS_DIR)) {
-      if (!f.endsWith('.jsonl')) continue
-      const day = f.slice(0, -6)
-      const dayTs = new Date(day).getTime()
-      if (!isNaN(dayTs) && dayTs < cutoffMs) {
-        try { fs.unlinkSync(path.join(EVENTS_DIR, f)); removed.events++ } catch {}
-      }
-    }
-  } catch {}
+  let removed = { invites: 0, sessions: 0 }
   try {
     const data = readInvites()
     const before = data.invites.length
+    // 只刪「過期且未用」的 invite（已用過的留作審計）
     data.invites = data.invites.filter(i => i.usedByUserId || (i.expiresAt ?? 0) > now)
     if (before !== data.invites.length) {
       writeInvites(data)
@@ -1422,26 +1413,12 @@ function cleanupExpiredData() {
       removed.sessions = before - data.sessions.length
     }
   } catch {}
-  // 軟刪除卡片：deletedAt 超過 30 天 → 真刪
-  let purgedCards = 0
-  try {
-    const data = readTodos()
-    const cutoff = now - 30 * 86400000
-    const before = data.cards.length
-    data.cards = data.cards.filter(c => !c.deletedAt || c.deletedAt > cutoff)
-    if (before !== data.cards.length) {
-      writeTodos(data)
-      purgedCards = before - data.cards.length
-    }
-  } catch {}
-  if (removed.events || removed.invites || removed.sessions || purgedCards) {
-    console.log(`[cleanup] removed: ${removed.events} event files, ${removed.invites} expired invites, ${removed.sessions} expired sessions, ${purgedCards} trashed cards (>30d)`)
+  if (removed.invites || removed.sessions) {
+    console.log(`[cleanup] removed: ${removed.invites} expired invites, ${removed.sessions} expired sessions`)
   }
 }
-// 啟動時跑一次（沒 sessions 對象前 readInvites/readUserSessions 都是空陣列，安全）
-// 用 setTimeout 延遲，等檔案讀寫函式都 ready
+// 啟動 5s 延遲 + 每 24 小時跑一次
 setTimeout(() => { try { cleanupExpiredData() } catch (e) { console.error('[cleanup error]', e) } }, 5000)
-// 每 24 小時跑一次
 setInterval(() => { try { cleanupExpiredData() } catch (e) { console.error('[cleanup error]', e) } }, 24 * 60 * 60 * 1000)
 
 // 讀今日 / 指定日 / 範圍 events（給 Phase 4 儀表板用）
