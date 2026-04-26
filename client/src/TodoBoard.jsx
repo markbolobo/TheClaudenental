@@ -1138,12 +1138,48 @@ function TrashModal({ cards, tags, onClose, onRestore, onPurge }) {
   )
 }
 
+// P2 階段 5：敏感資訊偵測（分享前掃 title + note）
+const SECRET_PATTERNS = [
+  { name: 'Anthropic API key', regex: /sk-ant-api[a-zA-Z0-9_-]{20,}/i },
+  { name: 'Google API key',    regex: /AIza[0-9A-Za-z_-]{20,}/ },
+  { name: 'GitHub token',      regex: /\bghp_[A-Za-z0-9]{20,}\b|\bgho_[A-Za-z0-9]{20,}\b/i },
+  { name: 'OpenAI API key',    regex: /sk-[a-zA-Z0-9]{32,}/i },
+  { name: 'Slack token',       regex: /\bxox[bp]-[A-Za-z0-9-]{20,}\b/i },
+  { name: 'AWS access key',    regex: /AKIA[0-9A-Z]{16}/ },
+  { name: 'Google OAuth',      regex: /\bya29\.[A-Za-z0-9_-]+\b/ },
+  { name: '密碼欄位',           regex: /\b(password|passwd|pwd|secret)\s*[:=]\s*['"`]?[^\s'"`]{6,}/i },
+  { name: '私鑰標記',           regex: /-----BEGIN [A-Z ]+PRIVATE KEY-----/ },
+]
+
+function scanForSecrets(text) {
+  if (!text) return []
+  const hits = []
+  for (const p of SECRET_PATTERNS) {
+    const m = text.match(p.regex)
+    if (m) hits.push({ name: p.name, sample: m[0].slice(0, 12) + '...' })
+  }
+  return hits
+}
+
 // P2 階段 4：CardDrawer 內的分享區塊
 function ShareSection({ card, collaborators, onShare, onUnshare }) {
   const [picking, setPicking] = useState(false)
   const sharedIds = new Set(card.sharedWith ?? [])
   const sharedUsers = collaborators.filter(u => sharedIds.has(u.id))
   const unsharedUsers = collaborators.filter(u => !sharedIds.has(u.id))
+
+  // P2 階段 5：分享前掃描 title + note
+  const secretHits = scanForSecrets((card.title ?? '') + '\n' + (card.note ?? ''))
+
+  function tryShare(userId) {
+    if (secretHits.length > 0) {
+      const lines = secretHits.map(h => `  • ${h.name}：${h.sample}`).join('\n')
+      const ok = window.confirm(`⚠️ 警告：偵測到此卡含敏感資訊\n\n${lines}\n\n分享後對方會永久持有副本。確認仍要分享？`)
+      if (!ok) return
+    }
+    onShare(card.id, [userId])
+    setPicking(false)
+  }
 
   return (
     <div className="border-t border-[var(--border)] pt-3">
@@ -1158,6 +1194,19 @@ function ShareSection({ card, collaborators, onShare, onUnshare }) {
           </button>
         )}
       </div>
+
+      {/* P2 階段 5：敏感資訊警告（分享前提示） */}
+      {secretHits.length > 0 && (
+        <div className="mb-2 p-2 rounded border border-red-500/60 bg-red-500/10">
+          <div className="text-[9px] font-semibold text-red-300 uppercase tracking-widest mb-1">⚠️ 偵測到敏感資訊</div>
+          <div className="text-[9px] text-red-200/80 leading-relaxed">
+            {secretHits.map(h => (
+              <div key={h.name}>• {h.name}：<span className="font-mono">{h.sample}</span></div>
+            ))}
+          </div>
+          <div className="text-[8px] text-red-200/60 mt-1">分享前會二次確認；建議先把敏感資訊從 note 移除。</div>
+        </div>
+      )}
 
       {/* 已分享名單 */}
       {sharedUsers.length === 0 && !picking && (
@@ -1182,7 +1231,7 @@ function ShareSection({ card, collaborators, onShare, onUnshare }) {
             <div className="text-[10px] text-[var(--text-muted)]">沒有可分享的協作者，先去頂部「👥 協作者」邀請。</div>
           ) : (
             unsharedUsers.map(u => (
-              <button key={u.id} onClick={() => { onShare(card.id, [u.id]); setPicking(false) }}
+              <button key={u.id} onClick={() => tryShare(u.id)}
                 className="flex items-center gap-2 px-2 py-1 rounded hover:bg-[var(--surface)] text-left">
                 <span className="w-5 h-5 rounded-full flex items-center justify-center text-[9px] font-bold" style={{ backgroundColor: u.color, color: '#000' }}>{u.name[0]?.toUpperCase()}</span>
                 <span className="text-[11px] text-[var(--text)]">{u.name}</span>
