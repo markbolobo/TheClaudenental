@@ -119,6 +119,66 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
     try { return localStorage.getItem('tc_todo_active_category') || 'cat-personal' } catch { return 'cat-personal' }
   })
   useEffect(() => { try { localStorage.setItem('tc_todo_active_category', activeCategoryId) } catch {} }, [activeCategoryId])
+
+  // P2 階段 4：協作者管理
+  const [allUsers, setAllUsers] = useState([])
+  const [currentUser, setCurrentUser] = useState(null)
+  const [usersModalOpen, setUsersModalOpen] = useState(false)
+  const [invites, setInvites] = useState([])
+
+  async function reloadUsers() {
+    try {
+      const me = await fetch('/api/auth/whoami').then(r => r.json())
+      if (me?.ok) setCurrentUser(me.user)
+    } catch {}
+    try {
+      const d = await fetch('/api/auth/users').then(r => r.json())
+      if (d?.users) setAllUsers(d.users)
+    } catch {}
+    try {
+      const d = await fetch('/api/auth/invites').then(r => r.json())
+      if (d?.invites) setInvites(d.invites)
+    } catch {}
+  }
+  useEffect(() => { reloadUsers() }, [])
+
+  const collaborators = allUsers.filter(u => u.role === 'collaborator')
+  const isOwner = currentUser?.role === 'owner'
+
+  async function shareCard(cardId, userIds) {
+    const r = await fetch(`/api/todos/${cardId}/share`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userIds }),
+    }).then(r => r.json()).catch(() => null)
+    if (r?.ok && r.card) setCards(c => c.map(x => x.id === cardId ? r.card : x))
+  }
+  async function unshareCard(cardId, userId) {
+    const r = await fetch(`/api/todos/${cardId}/share/${userId}`, { method: 'DELETE' }).then(r => r.json()).catch(() => null)
+    if (r?.ok && r.card) setCards(c => c.map(x => x.id === cardId ? r.card : x))
+  }
+
+  async function createInvite(label) {
+    const r = await fetch('/api/auth/invite', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: label || '受邀協作者' }),
+    }).then(r => r.json()).catch(() => null)
+    if (r?.ok && r.invite) {
+      setInvites(prev => [...prev, r.invite])
+      return r.invite
+    }
+    return null
+  }
+  async function revokeInvite(inviteId) {
+    if (!window.confirm('撤銷這個邀請連結？已用過的不影響，未用的點擊將失效。')) return
+    await fetch(`/api/auth/invites/${inviteId}`, { method: 'DELETE' })
+    setInvites(prev => prev.filter(i => i.id !== inviteId))
+  }
+  async function revokeUser(userId) {
+    if (!window.confirm('撤銷此協作者？\n他將無法再登入，被分享的卡也會自動取消他的存取。')) return
+    await fetch(`/api/auth/users/${userId}`, { method: 'DELETE' })
+    reloadUsers()
+    reloadCards()
+  }
   // Phase 6: 視圖模式 A=膠囊聚焦 / B=多看板全景；持久化
   const [viewMode, setViewMode] = useState(() => {
     try { return localStorage.getItem('tc_todo_view') || 'A' } catch { return 'A' }
@@ -512,6 +572,20 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
           className="shrink-0 px-2 py-1 rounded text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)] border-2 border-dashed border-[var(--border)] hover:border-[var(--gold-border)]">
           + 新分類
         </button>
+        <div className="flex-1" />
+        {/* P2 階段 4：協作者管理（owner only） */}
+        {isOwner && (
+          <button onClick={() => setUsersModalOpen(true)}
+            title={`管理協作者（已邀請 ${collaborators.length} 人）`}
+            className="shrink-0 px-2 py-1 rounded text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)] border border-[var(--border)] hover:border-[var(--gold-border)] flex items-center gap-1">
+            👥 協作者 {collaborators.length > 0 && <span className="text-[8px] text-[var(--gold)]">{collaborators.length}</span>}
+          </button>
+        )}
+        {currentUser && currentUser.role === 'collaborator' && (
+          <span className="shrink-0 text-[9px] text-[var(--text-muted)]">
+            👤 {currentUser.name} <span className="text-[var(--gold)]/70">(協作者)</span>
+          </span>
+        )}
       </div>
 
       {/* 主題膠囊列 */}
@@ -659,6 +733,10 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
       {activeCardId && (
         <CardDrawer card={cards.find(c => c.id === activeCardId)} tags={tags} themes={themes}
           categories={categories}
+          collaborators={collaborators}
+          isOwner={isOwner}
+          onShare={shareCard}
+          onUnshare={unshareCard}
           sessions={sessions}
           onClose={() => setActiveCardId(null)}
           onPatch={patchCard} onDelete={deleteCard}
@@ -691,6 +769,17 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
           onCreate={createTag}
           onPatch={patchTag}
           onDelete={deleteTag} />
+      )}
+
+      {/* P2 階段 4：協作者管理 modal（owner only） */}
+      {usersModalOpen && isOwner && (
+        <UsersModal
+          collaborators={collaborators}
+          invites={invites}
+          onClose={() => setUsersModalOpen(false)}
+          onCreateInvite={createInvite}
+          onRevokeInvite={revokeInvite}
+          onRevokeUser={revokeUser} />
       )}
     </div>
   )
@@ -1049,7 +1138,175 @@ function TrashModal({ cards, tags, onClose, onRestore, onPurge }) {
   )
 }
 
-function CardDrawer({ card, tags, themes, categories = [], sessions = [], onClose, onPatch, onDelete, onContinueInChat }) {
+// P2 階段 4：CardDrawer 內的分享區塊
+function ShareSection({ card, collaborators, onShare, onUnshare }) {
+  const [picking, setPicking] = useState(false)
+  const sharedIds = new Set(card.sharedWith ?? [])
+  const sharedUsers = collaborators.filter(u => sharedIds.has(u.id))
+  const unsharedUsers = collaborators.filter(u => !sharedIds.has(u.id))
+
+  return (
+    <div className="border-t border-[var(--border)] pt-3">
+      <div className="flex items-center gap-2 mb-2">
+        <div className="text-[9px] uppercase tracking-widest text-[var(--text-muted)]">分享給協作者</div>
+        <span className="text-[9px] text-[var(--text-muted)]">{sharedUsers.length} 人</span>
+        <div className="flex-1" />
+        {!picking && unsharedUsers.length > 0 && (
+          <button onClick={() => setPicking(true)}
+            className="text-[10px] text-[var(--gold)] hover:bg-[var(--gold)]/10 px-2 py-0.5 rounded border border-[var(--gold)]/40">
+            + 分享
+          </button>
+        )}
+      </div>
+
+      {/* 已分享名單 */}
+      {sharedUsers.length === 0 && !picking && (
+        <div className="text-[10px] text-[var(--text-muted)] opacity-60 py-1">尚未分享。協作者會在自己的 dashboard 收到。</div>
+      )}
+      {sharedUsers.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {sharedUsers.map(u => (
+            <div key={u.id} className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-[var(--surface-2)] border border-[var(--gold)]/40">
+              <span className="w-4 h-4 rounded-full flex items-center justify-center text-[8px] font-bold" style={{ backgroundColor: u.color, color: '#000' }}>{u.name[0]?.toUpperCase()}</span>
+              <span className="text-[10px] text-[var(--text)]">{u.name}</span>
+              <button onClick={() => onUnshare(card.id, u.id)} title="撤回分享" className="text-[10px] text-red-400/70 hover:text-red-400">✕</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* 選擇要分享的人 */}
+      {picking && (
+        <div className="mt-2 p-2 rounded bg-[var(--surface-2)] border border-[var(--gold)]/30 flex flex-col gap-1">
+          {unsharedUsers.length === 0 ? (
+            <div className="text-[10px] text-[var(--text-muted)]">沒有可分享的協作者，先去頂部「👥 協作者」邀請。</div>
+          ) : (
+            unsharedUsers.map(u => (
+              <button key={u.id} onClick={() => { onShare(card.id, [u.id]); setPicking(false) }}
+                className="flex items-center gap-2 px-2 py-1 rounded hover:bg-[var(--surface)] text-left">
+                <span className="w-5 h-5 rounded-full flex items-center justify-center text-[9px] font-bold" style={{ backgroundColor: u.color, color: '#000' }}>{u.name[0]?.toUpperCase()}</span>
+                <span className="text-[11px] text-[var(--text)]">{u.name}</span>
+              </button>
+            ))
+          )}
+          <button onClick={() => setPicking(false)} className="text-[9px] text-[var(--text-muted)] mt-1 hover:text-[var(--text)]">取消</button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// P2 階段 4：協作者管理 Modal
+function UsersModal({ collaborators, invites, onClose, onCreateInvite, onRevokeInvite, onRevokeUser }) {
+  const [newLabel, setNewLabel] = useState('')
+  const [latestInvite, setLatestInvite] = useState(null)
+
+  const inviteUrl = (token) => `${window.location.origin}${window.location.pathname}?invite=${token}`
+
+  async function handleCreate() {
+    const inv = await onCreateInvite(newLabel || '受邀協作者')
+    if (inv) {
+      setLatestInvite(inv)
+      setNewLabel('')
+    }
+  }
+  function copyLink(token) {
+    navigator.clipboard.writeText(inviteUrl(token))
+      .then(() => alert('邀請連結已複製，可貼給對方'))
+      .catch(() => alert('複製失敗，手動選取下方連結文字'))
+  }
+
+  const activeInvites = invites.filter(i => !i.usedByUserId && i.expiresAt > Date.now())
+
+  return (
+    <div className="absolute inset-0 z-40 bg-black/60 flex items-center justify-center p-4" onClick={onClose}>
+      <div onClick={e => e.stopPropagation()}
+        className="bg-[var(--surface)] border border-[var(--gold-border)] rounded-lg w-[min(640px,95vw)] max-h-[85vh] flex flex-col shadow-2xl">
+        <div className="px-4 py-3 border-b border-[var(--border)] flex items-center gap-2">
+          <span className="text-[12px] font-semibold tracking-wider">👥 協作者管理</span>
+          <span className="text-[9px] text-[var(--text-muted)]">{collaborators.length} 人 / 待用邀請 {activeInvites.length}</span>
+          <div className="flex-1" />
+          <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text)] text-[14px]">✕</button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4">
+          {/* 已加入的協作者 */}
+          <div>
+            <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] mb-2">已加入</div>
+            {collaborators.length === 0 ? (
+              <div className="text-[10px] text-[var(--text-muted)] opacity-60 py-2">沒有協作者。下方生成邀請連結傳給對方即可加入。</div>
+            ) : (
+              <div className="flex flex-col gap-1.5">
+                {collaborators.map(u => (
+                  <div key={u.id} className="flex items-center gap-2 px-2 py-1.5 rounded bg-[var(--surface-2)] border border-[var(--border)]">
+                    <span className="w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold" style={{ backgroundColor: u.color, color: '#000' }}>{u.name[0]?.toUpperCase()}</span>
+                    <span className="text-[11px] text-[var(--text)] flex-1">{u.name}</span>
+                    <span className="text-[9px] text-[var(--text-muted)]">加入於 {new Date(u.createdAt).toLocaleDateString('zh-TW')}</span>
+                    <button onClick={() => onRevokeUser(u.id)} title="撤銷此協作者"
+                      className="text-[9px] px-1.5 py-0.5 rounded text-red-400 hover:bg-red-500/10 border border-red-500/40">撤銷</button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* 生成新邀請 */}
+          <div className="border-t border-[var(--border)] pt-3">
+            <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] mb-2">生成邀請連結</div>
+            <div className="flex gap-2">
+              <input value={newLabel} onChange={e => setNewLabel(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') handleCreate() }}
+                placeholder="標籤（記憶用，例如「Alice 設計師」）"
+                className="flex-1 bg-[var(--surface-2)] border border-[var(--border)] rounded px-2 py-1.5 text-[11px] outline-none focus:border-[var(--gold-border)]" />
+              <button onClick={handleCreate}
+                className="px-3 py-1.5 rounded bg-[var(--gold)]/20 border border-[var(--gold)]/60 text-[var(--gold)] text-[10px] font-semibold hover:bg-[var(--gold)]/30">
+                + 生成邀請
+              </button>
+            </div>
+            {latestInvite && (
+              <div className="mt-3 p-3 rounded bg-[var(--gold)]/5 border border-[var(--gold)]/40">
+                <div className="text-[9px] text-[var(--gold)] mb-1.5 uppercase tracking-widest">✓ 已生成（複製給對方）</div>
+                <div className="font-mono text-[9px] text-[var(--text)] break-all bg-[var(--surface-2)] p-1.5 rounded">{inviteUrl(latestInvite.token)}</div>
+                <div className="flex items-center gap-2 mt-2">
+                  <button onClick={() => copyLink(latestInvite.token)}
+                    className="text-[10px] px-2 py-1 rounded bg-[var(--gold)]/20 border border-[var(--gold)]/60 text-[var(--gold)]">📋 複製</button>
+                  <span className="text-[8px] text-[var(--text-muted)]">7 天到期 / 一次性</span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* 待用邀請列表 */}
+          {activeInvites.length > 0 && (
+            <div className="border-t border-[var(--border)] pt-3">
+              <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] mb-2">待用邀請（還沒被點過）</div>
+              <div className="flex flex-col gap-1">
+                {activeInvites.map(inv => (
+                  <div key={inv.id} className="flex items-center gap-2 px-2 py-1 rounded bg-[var(--surface-2)] border border-[var(--border)]">
+                    <span className="text-[10px] text-[var(--text)] flex-1">{inv.label}</span>
+                    <button onClick={() => copyLink(inv.token)}
+                      className="text-[9px] text-[var(--gold)] hover:underline">複製連結</button>
+                    <span className="text-[8px] text-[var(--text-muted)]">到期 {new Date(inv.expiresAt).toLocaleDateString('zh-TW')}</span>
+                    <button onClick={() => onRevokeInvite(inv.id)} title="撤銷此邀請"
+                      className="text-[9px] px-1 text-red-400 hover:bg-red-500/10 rounded">✕</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="text-[9px] text-[var(--text-muted)]/70 leading-relaxed border-t border-[var(--border)] pt-2 mt-1">
+            <div className="font-semibold text-[var(--text-muted)] mb-1">提醒：</div>
+            • 對方點 invite link 後填名字即可進入<br/>
+            • 對方**只看得到你分享給他的卡片**，無法存取你的 chat / 規矩 / API key<br/>
+            • 對方應該裝自己的 Claude Code 用自己的 API key 接手卡片（見 SETUP_FOR_COLLABORATOR.md）
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function CardDrawer({ card, tags, themes, categories = [], collaborators = [], isOwner = true, onShare, onUnshare, sessions = [], onClose, onPatch, onDelete, onContinueInChat }) {
   const [title, setTitle] = useState(card?.title ?? '')
   const [note, setNote] = useState(card?.note ?? '')
   useEffect(() => { setTitle(card?.title ?? ''); setNote(card?.note ?? '') }, [card?.id])
@@ -1155,6 +1412,15 @@ function CardDrawer({ card, tags, themes, categories = [], sessions = [], onClos
               rows={6}
               className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded px-2 py-1.5 text-[11px] outline-none focus:border-[var(--gold-border)] resize-none" />
           </div>
+
+          {/* P2 階段 4：分享給協作者（owner only） */}
+          {isOwner && (
+            <ShareSection
+              card={card}
+              collaborators={collaborators}
+              onShare={onShare}
+              onUnshare={onUnshare} />
+          )}
 
           <div className="border-t border-[var(--border)] pt-2 text-[9px] text-[var(--text-muted)] space-y-0.5 font-mono">
             <div>id: {card.id}</div>
