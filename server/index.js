@@ -1422,8 +1422,20 @@ function cleanupExpiredData() {
       removed.sessions = before - data.sessions.length
     }
   } catch {}
-  if (removed.events || removed.invites || removed.sessions) {
-    console.log(`[cleanup] removed: ${removed.events} event files, ${removed.invites} expired invites, ${removed.sessions} expired sessions`)
+  // 軟刪除卡片：deletedAt 超過 30 天 → 真刪
+  let purgedCards = 0
+  try {
+    const data = readTodos()
+    const cutoff = now - 30 * 86400000
+    const before = data.cards.length
+    data.cards = data.cards.filter(c => !c.deletedAt || c.deletedAt > cutoff)
+    if (before !== data.cards.length) {
+      writeTodos(data)
+      purgedCards = before - data.cards.length
+    }
+  } catch {}
+  if (removed.events || removed.invites || removed.sessions || purgedCards) {
+    console.log(`[cleanup] removed: ${removed.events} event files, ${removed.invites} expired invites, ${removed.sessions} expired sessions, ${purgedCards} trashed cards (>30d)`)
   }
 }
 // 啟動時跑一次（沒 sessions 對象前 readInvites/readUserSessions 都是空陣列，安全）
