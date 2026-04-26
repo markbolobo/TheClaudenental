@@ -159,6 +159,30 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
     }).then(r => r.json()).catch(() => null)
     if (r?.ok && r.card) setCards(c => c.map(x => x.id === cardId ? r.card : x))
   }
+
+  // P3 沉澱卡片 note 到 md 檔（依 kind 決定 task 或 knowledge 模板）
+  async function sedimentCard(cardId) {
+    const card = cards.find(c => c.id === cardId)
+    if (!card) return
+    const isKnowledge = card.kind === 'knowledge'
+    const where = isKnowledge ? '.agent/knowledge/' : '.agent/topics/'
+    const noteSize = (card.note ?? '').length
+    if (noteSize < 50) {
+      if (!window.confirm(`卡片 note 只有 ${noteSize} 字，沉澱會建空白 md 檔。確認？`)) return
+    }
+    const msg = `沉澱此卡到 ${where}\n\n類型：${isKnowledge ? '🔵 knowledge（永久保留）' : '🟡 task（可整理）'}\n\n卡片 note 將變成短摘要 + 連結；完整內容寫進 md。`
+    if (!window.confirm(msg)) return
+    const r = await fetch(`/api/todos/${cardId}/sediment`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }).then(r => r.json()).catch(() => null)
+    if (r?.ok) {
+      setCards(c => c.map(x => x.id === cardId ? r.card : x))
+      alert(`✓ 沉澱完成：${r.path}\n\n卡片 note 已變短摘要，完整內容在 md 檔。`)
+    } else {
+      alert(`沉澱失敗：${r?.error ?? '未知'}`)
+    }
+  }
   async function unshareCard(cardId, userId) {
     const r = await fetch(`/api/todos/${cardId}/share/${userId}`, { method: 'DELETE' }).then(r => r.json()).catch(() => null)
     if (r?.ok && r.card) setCards(c => c.map(x => x.id === cardId ? r.card : x))
@@ -744,6 +768,7 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
           isOwner={isOwner}
           onShare={shareCard}
           onUnshare={unshareCard}
+          onSediment={sedimentCard}
           sessions={sessions}
           onClose={() => setActiveCardId(null)}
           onPatch={patchCard} onDelete={deleteCard}
@@ -1362,7 +1387,7 @@ function UsersModal({ collaborators, invites, onClose, onCreateInvite, onRevokeI
   )
 }
 
-function CardDrawer({ card, tags, themes, categories = [], collaborators = [], isOwner = true, onShare, onUnshare, sessions = [], onClose, onPatch, onDelete, onContinueInChat }) {
+function CardDrawer({ card, tags, themes, categories = [], collaborators = [], isOwner = true, onShare, onUnshare, onSediment, sessions = [], onClose, onPatch, onDelete, onContinueInChat }) {
   const [title, setTitle] = useState(card?.title ?? '')
   const [note, setNote] = useState(card?.note ?? '')
   useEffect(() => { setTitle(card?.title ?? ''); setNote(card?.note ?? '') }, [card?.id])
@@ -1467,6 +1492,37 @@ function CardDrawer({ card, tags, themes, categories = [], collaborators = [], i
               placeholder="補充說明、決策紀錄、上次討論摘要..."
               rows={6}
               className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded px-2 py-1.5 text-[11px] outline-none focus:border-[var(--gold-border)] resize-none" />
+          </div>
+
+          {/* P3：卡片=介面 / md=內容 — kind 切換 + 沉澱按鈕 */}
+          <div className="border-t border-[var(--border)] pt-3">
+            <div className="text-[9px] uppercase tracking-widest text-[var(--text-muted)] mb-1.5">類型 / 沉澱</div>
+            <div className="flex items-center gap-1.5 mb-2">
+              <button onClick={() => commit({ kind: 'task' })}
+                className={`text-[10px] px-2 py-0.5 rounded-full border ${(card.kind ?? 'task') === 'task' ? 'border-amber-400 text-amber-300 bg-amber-500/10' : 'border-[var(--border)] text-[var(--text-muted)]'}`}>
+                🟡 task
+              </button>
+              <button onClick={() => commit({ kind: 'knowledge' })}
+                className={`text-[10px] px-2 py-0.5 rounded-full border ${card.kind === 'knowledge' ? 'border-blue-400 text-blue-300 bg-blue-500/10' : 'border-[var(--border)] text-[var(--text-muted)]'}`}>
+                🔵 knowledge
+              </button>
+              <span className="text-[8px] text-[var(--text-muted)] ml-1">
+                {(card.kind ?? 'task') === 'task' ? '可整理' : '永久保留'}
+              </span>
+            </div>
+            {card.topicMdPath ? (
+              <div className="text-[9px] text-[var(--gold)]/80 font-mono bg-[var(--surface-2)] px-2 py-1 rounded border border-[var(--gold)]/30 mb-1">
+                📝 {card.topicMdPath}
+              </div>
+            ) : (
+              <div className="text-[9px] text-[var(--text-muted)] opacity-60 mb-1">尚未沉澱到 md</div>
+            )}
+            {onSediment && (
+              <button onClick={() => onSediment(card.id)}
+                className="text-[10px] px-2 py-1 rounded bg-[var(--gold)]/20 border border-[var(--gold)]/60 text-[var(--gold)] hover:bg-[var(--gold)]/30 font-semibold">
+                📝 沉澱到 md（依 kind 套模板）
+              </button>
+            )}
           </div>
 
           {/* P2 階段 4：分享給協作者（owner only） */}

@@ -1787,6 +1787,9 @@ app.post('/api/todos', async (request) => {
     sharedWith: [],         // P2 階段 3：分享對象 user IDs
     sharedBy: request.tcAuth?.user?.id ?? null,  // 建立者
     sharedAt: null,         // 第一次被分享時的時間
+    // P3：卡片=介面 / md=內容 設計鐵律
+    kind: body.kind === 'knowledge' ? 'knowledge' : 'task',  // 預設 task；少爺手動改 knowledge
+    topicMdPath: body.topicMdPath ?? null,  // 對應的話題 md 檔案路徑（相對於 RomanPrototype）
     version: 1,            // ETag — 每次 PATCH +1
     deletedAt: null,       // soft delete timestamp
   }
@@ -1850,6 +1853,102 @@ app.post('/api/todos/:id/restore', async (request) => {
   writeTodos(data)
   logEvent('card.restore', { id: card.id })
   return { ok: true, card }
+})
+
+// P3：沉澱卡片 note 到 md 檔案（卡片=介面 / md=內容 鐵律的具體實踐）
+// 卡片的 kind 決定 md 模板 + 寫入位置：
+//   task → .agent/topics/[id]-[slug].md（短期 / 可被時間整理）
+//   knowledge → .agent/knowledge/[slug].md（長期 / 永久保留）
+// 寫入後自動更新 card.topicMdPath
+app.post('/api/todos/:id/sediment', async (request, reply) => {
+  const data = readTodos()
+  const card = data.cards.find(c => c.id === request.params.id)
+  if (!card) { reply.code(404); return { ok: false, error: 'not found' } }
+
+  const projectRoot = request.body?.projectRoot || 'C:/Project/RomanPrototype'
+  const slug = (card.title ?? 'untitled').replace(/[\\/:*?"<>|\s]+/g, '-').slice(0, 60)
+  const isKnowledge = card.kind === 'knowledge'
+  const dir = isKnowledge ? '.agent/knowledge' : '.agent/topics'
+  const fileName = isKnowledge ? `${slug}.md` : `${card.id}-${slug}.md`
+  const fullPath = path.join(projectRoot, dir, fileName)
+
+  // 確保目錄存在
+  try { fs.mkdirSync(path.dirname(fullPath), { recursive: true }) } catch {}
+
+  // 已存在 → append 進度區塊；不存在 → 建新檔含模板
+  let content
+  if (fs.existsSync(fullPath)) {
+    const existing = fs.readFileSync(fullPath, 'utf8')
+    const stamp = new Date().toLocaleString('zh-TW', { hour12: false })
+    content = existing + `\n\n---\n\n## 沉澱於 ${stamp}\n\n${card.note ?? ''}\n`
+  } else if (isKnowledge) {
+    // knowledge 模板：精煉四節結構
+    content = `# ${card.title}
+
+> 從 TODO 卡片 ${card.id} 沉澱於 ${new Date().toLocaleString('zh-TW', { hour12: false })}
+> 卡片進度狀態：${card.column}
+
+## 正確做法
+
+（依此卡片實作經驗整理為 SOP）
+
+## 踩過的坑
+
+（過程中發現的陷阱、誤解、回溯點）
+
+## 順利的工作流程
+
+（這次哪些步驟特別 work，下次可重用）
+
+## 前後文（context / why）
+
+（為什麼這麼做、跟其他系統的關係、決策理由）
+
+---
+
+## 卡片原始內容
+
+${card.note ?? ''}
+`
+  } else {
+    // task 模板：簡短進度紀錄
+    content = `# ${card.title}
+
+> 從 TODO 卡片 ${card.id} 沉澱於 ${new Date().toLocaleString('zh-TW', { hour12: false })}
+> 卡片狀態：${card.column} (kind: task)
+
+## 目標
+
+${card.title}
+
+## 步驟 / 進度
+
+${card.note ?? '（未填）'}
+
+## 結果
+
+（完成後填入；本檔可被時間整理）
+`
+  }
+
+  try {
+    fs.writeFileSync(fullPath, content, 'utf8')
+  } catch (e) {
+    reply.code(500); return { ok: false, error: `write failed: ${e.message}` }
+  }
+
+  // 更新 card 的 topicMdPath（相對路徑，跨機器友善）
+  const relPath = `${dir}/${fileName}`
+  card.topicMdPath = relPath
+  card.version = (card.version ?? 1) + 1
+  card.updatedAt = Date.now()
+  // note 改成短摘要 + 連結
+  const summary = (card.note ?? '').slice(0, 100).replace(/\n/g, ' ')
+  card.note = `📝 已沉澱到 ${relPath}\n\n${summary}${(card.note ?? '').length > 100 ? '...' : ''}`
+  writeTodos(data)
+  logEvent('card.sediment', { id: card.id, kind: card.kind, path: relPath })
+
+  return { ok: true, card, path: relPath, fullPath }
 })
 
 // 真刪（垃圾桶內手動清掉）
