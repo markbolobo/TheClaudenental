@@ -660,9 +660,20 @@ export function BountyOverlay({ anim, settings, onDone }) {
   const cfg = settings[tk]
 
   // Custom media (video / image) takes full precedence
-  if (cfg?.mediaType === 'video' || (cfg?.mediaType === 'image' && tier !== 'L')) {
-    return <CustomMediaOverlay tierCode={tk} cfg={cfg} onDone={onDone} />
-  }
+  const inner = (cfg?.mediaType === 'video' || (cfg?.mediaType === 'image' && tier !== 'L'))
+    ? <CustomMediaOverlay tierCode={tk} cfg={cfg} onDone={onDone} />
+    : <DefaultOverlay anim={anim} settings={settings} onDone={onDone} />
 
-  return <DefaultOverlay anim={anim} settings={settings} onDone={onDone} />
+  // Unified Skip layer — 點擊任何位置跳到最後一幀
+  // z-[86] 蓋過 overlay (z-[85])；透明背景；title hint
+  return (
+    <>
+      {inner}
+      <div
+        className="fixed inset-0 z-[86] cursor-pointer"
+        onClick={onDone}
+        title="點擊跳過演出"
+        aria-label="Skip animation" />
+    </>
+  )
 }

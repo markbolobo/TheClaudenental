@@ -1505,6 +1505,11 @@ app.patch('/api/todos/:id', async (request, reply) => {
   delete patch.createdAt
   delete patch.version
   delete patch.deletedAt
+  // noteAppend 特殊處理：append 到現有 note 而非覆寫
+  if (typeof patch.noteAppend === 'string') {
+    card.note = (card.note ?? '') + patch.noteAppend
+    delete patch.noteAppend
+  }
   const prevColumn = card.column
   Object.assign(card, patch, { updatedAt: Date.now(), version: (card.version ?? 1) + 1 })
   if (patch.column === 'discussing' || patch.sessionId) card.lastDiscussedAt = Date.now()

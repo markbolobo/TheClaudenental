@@ -88,6 +88,28 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
   const [trashCards, setTrashCards] = useState([])
   const [activeCardId, setActiveCardId] = useState(null)  // 詳情抽屜
   const [pendingDrag, setPendingDrag] = useState(null)    // { card, fromCol, toCol } 拖曳後彈窗用
+  // 純方向 B：等 ChatPanel 送出後才 commit 的 pending transition
+  // 重整 / 切 tab 仍可從 sessionStorage 復原
+  const [pendingTransition, setPendingTransition] = useState(() => {
+    try {
+      const raw = sessionStorage.getItem('tc_pending_todo_transition')
+      return raw ? JSON.parse(raw) : null
+    } catch { return null }
+  })
+  // 監聽 sessionStorage（Chat 送出後 commit 會 removeItem，要同步刷掉視覺 ring）
+  // 用 polling（sessionStorage 沒 storage event in 同 tab，跨 tab 才有）
+  useEffect(() => {
+    if (!pendingTransition) return
+    const tick = setInterval(() => {
+      const raw = sessionStorage.getItem('tc_pending_todo_transition')
+      if (!raw) {
+        setPendingTransition(null)
+        // server 端已被 ChatPanel commit，重新拉一次卡片狀態
+        reloadCards()
+      }
+    }, 500)
+    return () => clearInterval(tick)
+  }, [pendingTransition?.cardId])
   const [tagManagerOpen, setTagManagerOpen] = useState(false)  // Phase 2: tag 管理 modal
   const [searchQuery, setSearchQuery] = useState('')           // Phase 3: 搜尋
   const [storageQuery, setStorageQuery] = useState('')         // Phase 4: 倉庫獨立搜尋
@@ -375,26 +397,43 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
     setPendingDrag(null)
     // 純拖回（其實 column 還沒改，所以什麼都不用做）
   }
+  // 純方向 B：選 session 後不立刻 patchCard column
+  // 改寫 sessionStorage pending；ChatPanel 真正送出後才 commit
+  // 視覺：卡留在 fromCol，但用 ⏳ ring 標示「等送出落實」
   function confirmDragWithSession(sessionId) {
+    if (!pendingDrag) return
+    const { card, fromCol, toCol } = pendingDrag
+    const fromL = COLUMN_BY_ID[fromCol]?.label ?? fromCol
+    const toL   = COLUMN_BY_ID[toCol]?.label ?? toCol
+    const prefillText = buildPromptForTransition(card, fromCol, toCol)
+    try {
+      sessionStorage.setItem('tc_pending_todo_transition', JSON.stringify({
+        cardId: card.id, fromCol, toCol,
+        fromColLabel: fromL, toColLabel: toL,
+        sessionId, ts: Date.now(),
+        prefillText,  // 重整 / 切 tab 後 ChatPanel 可從這還原 input
+      }))
+    } catch {}
+    setPendingTransition({ cardId: card.id, fromCol, toCol, sessionId, ts: Date.now() })
+    if (onTriggerChat) {
+      onTriggerChat({ sessionId, prefillText })
+    }
+    setPendingDrag(null)
+  }
+
+  // 只移卡不啟動 Chat（少爺 2026-04-26 需求：避免「input 清空後卡已切階段」狀態不一致）
+  function confirmDragMoveOnly() {
     if (!pendingDrag) return
     const { card, fromCol, toCol } = pendingDrag
     const ts = new Date().toLocaleString('zh-TW', { hour12: false })
     const oldL = COLUMN_BY_ID[fromCol]?.label ?? fromCol
     const newL = COLUMN_BY_ID[toCol]?.label ?? toCol
-    const sessionTag = sessionId === '__new__' ? '新聊天室' : `session ${String(sessionId).slice(0, 8)}`
-    const noteLine = `\n\n[${ts}] 手動拖曳：${oldL} → ${newL}（送往 ${sessionTag}）`
+    const noteLine = `\n\n[${ts}] 手動拖曳：${oldL} → ${newL}（只移卡，未啟動 Chat）`
     patchCard(card.id, {
       column: toCol,
       order: Date.now(),
-      sessionId: sessionId === '__new__' ? null : sessionId,
       note: (card.note ?? '') + noteLine,
     })
-    if (onTriggerChat) {
-      onTriggerChat({
-        sessionId,
-        prefillText: buildPromptForTransition(card, fromCol, toCol),
-      })
-    }
     setPendingDrag(null)
   }
 
@@ -517,6 +556,8 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
                 isTriggerTarget={isTriggerTarget}
                 isPlainTarget={isPlainTarget}
                 justSettledCardId={justSettledCardId}
+                pendingTransitionCardId={pendingTransition?.cardId ?? null}
+                pendingTransitionToCol={pendingTransition?.toCol ?? null}
                 storageQuery={isStorage ? storageQuery : null}
                 onStorageQueryChange={isStorage ? setStorageQuery : null}
                 onBulkDelete={isStorage ? async (ids) => {
@@ -561,6 +602,7 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
           pending={pendingDrag}
           sessions={sessions}
           onRevert={confirmDragRevert}
+          onMoveOnly={confirmDragMoveOnly}
           onSelectSession={confirmDragWithSession} />
       )}
 
@@ -761,7 +803,7 @@ function TagEditPanel({ tag, themes, isNew, onCancel, onSave }) {
   )
 }
 
-function DragActionModal({ pending, sessions, onRevert, onSelectSession }) {
+function DragActionModal({ pending, sessions, onRevert, onMoveOnly, onSelectSession }) {
   const { card, fromCol, toCol } = pending
   const fromL = COLUMN_BY_ID[fromCol]?.label ?? fromCol
   const toL = COLUMN_BY_ID[toCol]?.label ?? toCol
@@ -793,9 +835,21 @@ function DragActionModal({ pending, sessions, onRevert, onSelectSession }) {
           <div className="text-[10px] text-[var(--text-muted)] font-mono whitespace-pre-wrap max-h-24 overflow-y-auto leading-relaxed">{promptPreview}</div>
         </div>
 
-        {/* 三選項 */}
+        {/* 選項區 */}
         <div className="flex-1 overflow-y-auto p-3 flex flex-col gap-2">
           <div className="text-[10px] text-[var(--text-muted)] font-semibold mb-1">選擇接續方式：</div>
+
+          {/* 只移卡不啟動 Chat（解耦選項：避免 input 清空後狀態不一致） */}
+          <button onClick={onMoveOnly}
+            className="text-left px-3 py-2.5 rounded border border-stone-500/60 bg-stone-500/10 hover:bg-stone-500/20 transition-colors group">
+            <div className="flex items-center gap-2">
+              <span className="text-[14px]">📦</span>
+              <span className="text-[11px] font-semibold text-stone-300">只移卡，不啟動 Chat</span>
+            </div>
+            <div className="text-[9px] text-[var(--text-muted)] mt-0.5 ml-7">純粹推進階段，輸入框不動，之後想討論再點卡片</div>
+          </button>
+
+          <div className="text-[9px] text-[var(--text-muted)] uppercase tracking-widest mt-1">啟動 Chat 並推進</div>
 
           {/* 新聊天室 */}
           <button onClick={() => onSelectSession('__new__')}
@@ -840,13 +894,13 @@ function DragActionModal({ pending, sessions, onRevert, onSelectSession }) {
           )}
         </div>
 
-        {/* Footer */}
+        {/* Footer — 取消按鈕加紅色強調 + 明確語意 */}
         <div className="px-4 py-2 border-t border-[var(--border)] flex items-center gap-2">
           <button onClick={onRevert}
-            className="text-[10px] px-3 py-1.5 rounded text-[var(--text-muted)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] border border-[var(--border)]">
-            ↩ 還原（不推進）
+            className="text-[10px] px-3 py-1.5 rounded text-red-300 hover:text-red-200 hover:bg-red-500/10 border border-red-500/40 font-semibold">
+            ✕ 取消（卡片留在原階段）
           </button>
-          <div className="flex-1 text-[9px] text-[var(--text-muted)]">點空白也是還原</div>
+          <div className="flex-1 text-[9px] text-[var(--text-muted)] text-right">卡片現在還沒實際移動，點空白也等同取消</div>
         </div>
       </div>
     </div>
@@ -1027,7 +1081,7 @@ function CardDrawer({ card, tags, themes, sessions = [], onClose, onPatch, onDel
   )
 }
 
-function Column({ col, cards, totalCount, tags, onCreate, onPatch, onDelete, onOpenDetail, expandable, expanded, onToggleExpand, isTriggerTarget, isPlainTarget, justSettledCardId, storageQuery, onStorageQueryChange, onBulkDelete }) {
+function Column({ col, cards, totalCount, tags, onCreate, onPatch, onDelete, onOpenDetail, expandable, expanded, onToggleExpand, isTriggerTarget, isPlainTarget, justSettledCardId, storageQuery, onStorageQueryChange, onBulkDelete, pendingTransitionCardId, pendingTransitionToCol }) {
   const { setNodeRef, isOver } = useDroppable({ id: `col:${col.id}` })
   const [adding, setAdding] = useState(false)
   const [text, setText] = useState('')
@@ -1090,7 +1144,9 @@ function Column({ col, cards, totalCount, tags, onCreate, onPatch, onDelete, onO
             <Card key={card.id} card={card} tags={tags}
               onPatch={onPatch} onDelete={onDelete} onOpenDetail={onOpenDetail}
               suggestedColumn={suggestStageForCard(card)}
-              justSettled={justSettledCardId === card.id} />
+              justSettled={justSettledCardId === card.id}
+              isPendingTransition={pendingTransitionCardId === card.id}
+              pendingTransitionToCol={pendingTransitionCardId === card.id ? pendingTransitionToCol : null} />
           ))}
           {cards.length === 0 && (
             <div className={`text-[9px] text-center py-3 transition-colors ${
@@ -1112,7 +1168,7 @@ function Column({ col, cards, totalCount, tags, onCreate, onPatch, onDelete, onO
   )
 }
 
-function Card({ card, tags, onPatch, onDelete, onOpenDetail, suggestedColumn, justSettled }) {
+function Card({ card, tags, onPatch, onDelete, onOpenDetail, suggestedColumn, justSettled, isPendingTransition, pendingTransitionToCol }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: card.id })
   const theme = tags.find(t => t.id === card.themeId)
   const cardTags = (card.tagIds ?? []).map(id => tags.find(t => t.id === id)).filter(Boolean)
@@ -1134,11 +1190,14 @@ function Card({ card, tags, onPatch, onDelete, onOpenDetail, suggestedColumn, ju
   }
 
   const settleClass = justSettled ? 'ring-2 ring-[var(--gold)] shadow-[0_0_20px_rgba(201,162,39,0.6)]' : ''
+  // 純方向 B：等送出 ring（紫色 pulse + ⏳ icon）
+  const pendingClass = isPendingTransition ? 'ring-2 ring-purple-400 shadow-[0_0_18px_rgba(168,85,247,0.5)] animate-pulse' : ''
+  const pendingTargetLabel = pendingTransitionToCol ? COLUMN_BY_ID[pendingTransitionToCol]?.label : null
 
   return (
     <div ref={setNodeRef}
       style={{ transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0 : 1 }}
-      className={`bg-[var(--surface)] border border-[var(--border)] rounded p-1.5 hover:border-[var(--gold-border)] group relative transition-all duration-300 ${settleClass}`}>
+      className={`bg-[var(--surface)] border border-[var(--border)] rounded p-1.5 hover:border-[var(--gold-border)] group relative transition-all duration-300 ${settleClass} ${pendingClass}`}>
       <div className="flex gap-1 items-start">
         {theme && <div className="w-1 self-stretch rounded-full shrink-0 min-h-[16px]" style={{ backgroundColor: theme.color }} />}
         <div className="flex-1 min-w-0" {...attributes} {...listeners}
@@ -1156,6 +1215,14 @@ function Card({ card, tags, onPatch, onDelete, onOpenDetail, suggestedColumn, ju
           )}
         </div>
       </div>
+
+      {/* 純方向 B：pending transition 標記（左下角，不擋紅點） */}
+      {isPendingTransition && pendingTargetLabel && (
+        <div className="absolute -bottom-1 -left-1 z-10 flex items-center gap-0.5 px-1 py-0.5 rounded-full bg-purple-500/30 border border-purple-400 text-purple-100 text-[8px] font-bold whitespace-nowrap shadow"
+             title="Chat 送出後，此卡才會落實移動">
+          ⏳ 等送出 → {pendingTargetLabel}
+        </div>
+      )}
 
       {/* 階段不符紅點（hover 顯示建議階段） */}
       {stageMismatch && (

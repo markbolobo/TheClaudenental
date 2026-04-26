@@ -1301,14 +1301,26 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
   const lastEvTsRef = useRef(0)
 
   // Apply chatInit when it changes (from History "Continue in Chat" / session click / TODO drag-trigger)
+  // 用 localStorage 持久化已消費的 ts，避免 ChatPanel mount/unmount/F5 後重複預填
   useEffect(() => {
     if (!chatInit) return
     if (chatInit === prevChatInitRef.current) return
+    const incomingTs = chatInit.ts ?? 0
+    const consumedTs = Number(localStorage.getItem('tc_consumed_chatinit_ts')) || 0
+    if (incomingTs && incomingTs <= consumedTs) {
+      // 此 chatInit 已被消費過（之前 mount 時處理過）— 切 tab/F5 回來不再重新預填
+      prevChatInitRef.current = chatInit
+      return
+    }
     prevChatInitRef.current = chatInit
     if (chatInit.projectPath) setProjectPath(chatInit.projectPath)
     setSessionId(chatInit.sessionId)
     // 預填輸入框（TODO 拖卡帶來的 prompt 模板）
     if (chatInit.prefillText) setInput(chatInit.prefillText)
+    // 標記已消費
+    if (incomingTs) localStorage.setItem('tc_consumed_chatinit_ts', String(incomingTs))
+    // 純方向 B：開始 polling pending transition（commit 後讓 ring 消失）
+    // 不需在這做，pendingTransition 由 TodoBoard 自己 polling
     // 新 session（從 TODO 拖卡選「新聊天室」）— 不 load history
     if (!chatInit.sessionId) {
       setMessages([])
@@ -1330,6 +1342,23 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
       })
       .catch(() => setMessages([{ role: 'system', text: '歷史紀錄載入失敗', ts: Date.now() }]))
   }, [chatInit])
+
+  // 純方向 B：mount 時若有 pending todo transition 但 input 為空 → 從 sessionStorage 還原預填
+  // 防止「F5 / 切 tab 回來，看到卡有 ⏳ ring 但 input 空白」的不一致
+  useEffect(() => {
+    // 若 chatInit 待消費，由上面那個 useEffect 處理
+    const incomingTs = chatInit?.ts ?? 0
+    const consumedTs = Number(localStorage.getItem('tc_consumed_chatinit_ts')) || 0
+    if (chatInit && incomingTs > consumedTs) return
+    // 沒待消費 chatInit + 有 pending transition → 還原 input
+    try {
+      const raw = sessionStorage.getItem('tc_pending_todo_transition')
+      if (!raw) return
+      const t = JSON.parse(raw)
+      if (t?.prefillText) setInput(prev => prev || t.prefillText)
+    } catch {}
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // On mount: 拉取 workflow 排序（跨裝置同步）
   useEffect(() => {
@@ -1495,6 +1524,32 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
     setShowJumpToLatest(false)
   }
 
+  // 純方向 B：把 TODO 卡的 column 切換延遲到 Chat 真正送出後才落實
+  // sessionStorage key 由 TodoBoard 寫入，doActualSend 成功送出後 commit
+  function commitPendingTodoTransition() {
+    try {
+      const raw = sessionStorage.getItem('tc_pending_todo_transition')
+      if (!raw) return
+      const t = JSON.parse(raw)
+      if (!t?.cardId || !t?.toCol) return
+      sessionStorage.removeItem('tc_pending_todo_transition')
+      const ts = new Date().toLocaleString('zh-TW', { hour12: false })
+      const fromL = t.fromColLabel ?? t.fromCol
+      const toL   = t.toColLabel   ?? t.toCol
+      const sessionTag = t.sessionId === '__new__' ? '新聊天室' : (t.sessionId ? `session ${String(t.sessionId).slice(0, 8)}` : '新聊天室')
+      const noteAppend = `\n\n[${ts}] 卡片落實移動：${fromL} → ${toL}（Chat 已送出 ${sessionTag}）`
+      fetch(`/api/todos/${t.cardId}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          column: t.toCol,
+          order: Date.now(),
+          sessionId: t.sessionId === '__new__' ? null : t.sessionId,
+          noteAppend,
+        }),
+      }).catch(() => {})
+    } catch {}
+  }
+
   async function doActualSend(text, atts) {
     const rawPrompt = text || (atts.length ? '請查看附件' : '')
     const prefText  = localStorage.getItem(PREF_TEXT_KEY) || ''
@@ -1516,6 +1571,9 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
         setRunning(false); runningRef.current = false
         const reason = data.error ?? `HTTP ${res.status}`
         setMessages(m => [...m, { role: 'result', text: `發送失敗：${reason}`, ts: Date.now() }])
+      } else {
+        // ✅ Chat 真正送出 → 落實 pending todo transition（純方向 B 核心）
+        commitPendingTodoTransition()
       }
     } catch (err) {
       setRunning(false); runningRef.current = false
