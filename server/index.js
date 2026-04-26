@@ -1414,6 +1414,15 @@ app.get('/api/metrics/events', async (request) => {
 
 const TODOS_FILE     = path.join(os.homedir(), '.claude', 'tc_todos.json')
 const TODO_TAGS_FILE = path.join(os.homedir(), '.claude', 'tc_todo_tags.json')
+const TODO_CATEGORIES_FILE = path.join(os.homedir(), '.claude', 'tc_todo_categories.json')
+
+// 個人/工作分類（仿 Google 私人/工作雙帳號）— 獨立於 tags 的維度
+// 卡片只能屬於一個 category（單選）；tags 仍可多選
+// 預設兩個 builtin（不能刪），使用者可加減自訂
+const SEED_CATEGORIES = [
+  { id: 'cat-personal', name: '個人', icon: '🏠', color: '#a78bfa', isBuiltIn: true },
+  { id: 'cat-work',     name: '工作', icon: '💼', color: '#3b82f6', isBuiltIn: true },
+]
 
 const COLUMNS = ['idea', 'discussing', 'doing', 'verifying', 'done', 'paused', 'storage']
 
@@ -1449,6 +1458,16 @@ function readTodoTags() {
 }
 function writeTodoTags(data) { fs.writeFileSync(TODO_TAGS_FILE, JSON.stringify(data, null, 2), 'utf8') }
 
+function readTodoCategories() {
+  try { return JSON.parse(fs.readFileSync(TODO_CATEGORIES_FILE, 'utf8')) }
+  catch {
+    const seeded = { categories: SEED_CATEGORIES }
+    try { fs.writeFileSync(TODO_CATEGORIES_FILE, JSON.stringify(seeded, null, 2), 'utf8') } catch {}
+    return seeded
+  }
+}
+function writeTodoCategories(data) { fs.writeFileSync(TODO_CATEGORIES_FILE, JSON.stringify(data, null, 2), 'utf8') }
+
 // Cards — 預設過濾掉 soft-deleted；?includeDeleted=1 看全部
 app.get('/api/todos', async (request) => {
   const data = readTodos()
@@ -1479,6 +1498,7 @@ app.post('/api/todos', async (request) => {
     createdAt: Date.now(),
     updatedAt: Date.now(),
     order: typeof body.order === 'number' ? body.order : Date.now(),
+    categoryId: body.categoryId ?? 'cat-personal',  // 預設個人分類
     version: 1,            // ETag — 每次 PATCH +1
     deletedAt: null,       // soft delete timestamp
   }
@@ -1661,6 +1681,63 @@ app.delete('/api/todo-tags/:id', async (request) => {
   writeTodoTags(tagsData)
   writeTodos(todosData)
   logEvent('tag.delete', { id: tagId, replaceWith, cardsTouched: touched })
+  return { ok: true, cardsTouched: touched }
+})
+
+// Categories CRUD（個人/工作 分類維度）
+app.get('/api/todo-categories', async () => readTodoCategories())
+
+app.post('/api/todo-categories', async (request) => {
+  const data = readTodoCategories()
+  const body = request.body ?? {}
+  const cat = {
+    id: body.id ?? `cat-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    name: body.name ?? 'untitled',
+    icon: body.icon ?? '📁',
+    color: body.color ?? '#9ca3af',
+    isBuiltIn: false,
+  }
+  data.categories.push(cat)
+  writeTodoCategories(data)
+  logEvent('category.create', { id: cat.id, name: cat.name })
+  return { ok: true, category: cat }
+})
+
+app.patch('/api/todo-categories/:id', async (request, reply) => {
+  const data = readTodoCategories()
+  const cat = data.categories.find(c => c.id === request.params.id)
+  if (!cat) { reply.code(404); return { ok: false, error: 'not found' } }
+  const patch = request.body ?? {}
+  delete patch.id
+  delete patch.isBuiltIn
+  Object.assign(cat, patch)
+  writeTodoCategories(data)
+  logEvent('category.update', { id: cat.id, patch })
+  return { ok: true, category: cat }
+})
+
+app.delete('/api/todo-categories/:id', async (request, reply) => {
+  const catId = request.params.id
+  const replaceWith = request.query.replaceWith ?? 'cat-personal'  // 預設搬到個人
+  const data = readTodoCategories()
+  const cat = data.categories.find(c => c.id === catId)
+  if (!cat) { reply.code(404); return { ok: false, error: 'not found' } }
+  if (cat.isBuiltIn) { reply.code(400); return { ok: false, error: 'built-in category cannot be deleted (rename/recolor instead)' } }
+
+  // 把引用此 category 的卡片改到 replaceWith
+  const todosData = readTodos()
+  let touched = 0
+  for (const card of todosData.cards) {
+    if (card.categoryId === catId) {
+      card.categoryId = replaceWith
+      card.version = (card.version ?? 1) + 1
+      touched++
+    }
+  }
+  data.categories = data.categories.filter(c => c.id !== catId)
+  writeTodoCategories(data)
+  writeTodos(todosData)
+  logEvent('category.delete', { id: catId, replaceWith, cardsTouched: touched })
   return { ok: true, cardsTouched: touched }
 })
 

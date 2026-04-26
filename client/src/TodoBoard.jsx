@@ -113,6 +113,12 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
   const [tagManagerOpen, setTagManagerOpen] = useState(false)  // Phase 2: tag 管理 modal
   const [searchQuery, setSearchQuery] = useState('')           // Phase 3: 搜尋
   const [storageQuery, setStorageQuery] = useState('')         // Phase 4: 倉庫獨立搜尋
+  // P2 階段 1：個人/工作分類
+  const [categories, setCategories] = useState([])
+  const [activeCategoryId, setActiveCategoryId] = useState(() => {
+    try { return localStorage.getItem('tc_todo_active_category') || 'cat-personal' } catch { return 'cat-personal' }
+  })
+  useEffect(() => { try { localStorage.setItem('tc_todo_active_category', activeCategoryId) } catch {} }, [activeCategoryId])
   // Phase 6: 視圖模式 A=膠囊聚焦 / B=多看板全景；持久化
   const [viewMode, setViewMode] = useState(() => {
     try { return localStorage.getItem('tc_todo_view') || 'A' } catch { return 'A' }
@@ -129,7 +135,12 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
     setTags(d.tags ?? [])
   }
 
-  useEffect(() => { reloadCards(); reloadTags() }, [])
+  async function reloadCategories() {
+    const d = await fetch('/api/todo-categories').then(r => r.json()).catch(() => ({ categories: [] }))
+    setCategories(d.categories ?? [])
+  }
+
+  useEffect(() => { reloadCards(); reloadTags(); reloadCategories() }, [])
 
   const themes = tags.filter(t => t.kind === 'theme' && !t.parentId)
 
@@ -142,9 +153,12 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
     return cur
   }
 
+  // P2 階段 1：先用 category 過濾（永遠生效，預設個人）
+  const categoryFiltered = cards.filter(c => (c.categoryId ?? 'cat-personal') === activeCategoryId)
+
   const themeFiltered = activeThemes.size === 0
-    ? cards
-    : cards.filter(c => {
+    ? categoryFiltered
+    : categoryFiltered.filter(c => {
         if (!c.themeId) return false
         const root = rootThemeOf(c.themeId)
         return root && activeThemes.has(root.id)
@@ -177,9 +191,37 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
     const themeId = activeThemes.size === 1 ? [...activeThemes][0] : null
     const r = await fetch('/api/todos', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ column, title: title.trim(), themeId }),
+      body: JSON.stringify({ column, title: title.trim(), themeId, categoryId: activeCategoryId }),
     }).then(r => r.json()).catch(() => null)
     if (r?.ok) setCards(c => [...c, r.card])
+  }
+
+  // P2 階段 1：分類管理
+  async function createCategory(name) {
+    if (!name?.trim()) return
+    const r = await fetch('/api/todo-categories', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name.trim(), icon: '📁' }),
+    }).then(r => r.json()).catch(() => null)
+    if (r?.ok) {
+      setCategories(cs => [...cs, r.category])
+      setActiveCategoryId(r.category.id)
+    }
+  }
+  async function deleteCategory(id) {
+    const cat = categories.find(c => c.id === id)
+    if (!cat || cat.isBuiltIn) return
+    const cardCount = cards.filter(c => c.categoryId === id).length
+    const msg = cardCount > 0
+      ? `刪除分類「${cat.name}」？\n${cardCount} 張卡會被搬到「個人」分類`
+      : `刪除分類「${cat.name}」？`
+    if (!window.confirm(msg)) return
+    const r = await fetch(`/api/todo-categories/${id}`, { method: 'DELETE' }).then(r => r.json()).catch(() => null)
+    if (r?.ok) {
+      setCategories(cs => cs.filter(c => c.id !== id))
+      if (activeCategoryId === id) setActiveCategoryId('cat-personal')
+      reloadCards()
+    }
   }
 
   async function patchCard(id, patch) {
@@ -439,6 +481,39 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
+      {/* P2 階段 1：個人/工作分類 tabs（最頂層） */}
+      <div className="shrink-0 px-2 pt-1.5 pb-1 border-b border-[var(--border)] bg-[var(--surface-2)]/50 flex gap-1 overflow-x-auto items-center">
+        {categories.map(cat => {
+          const active = cat.id === activeCategoryId
+          const count = cards.filter(c => (c.categoryId ?? 'cat-personal') === cat.id).length
+          return (
+            <div key={cat.id} className="shrink-0 flex items-center group/cat">
+              <button onClick={() => setActiveCategoryId(cat.id)}
+                style={active ? { borderColor: cat.color, color: cat.color, backgroundColor: cat.color + '22' } : undefined}
+                className={`px-2.5 py-1 rounded-t text-[10px] font-semibold border-2 border-b-0 transition-colors ${
+                  active ? '' : 'border-transparent text-[var(--text-muted)] hover:text-[var(--text)] hover:bg-[var(--surface)]'
+                }`}>
+                <span className="mr-1">{cat.icon}</span>{cat.name}
+                <span className="ml-1.5 text-[8px] opacity-60">{count}</span>
+              </button>
+              {!cat.isBuiltIn && (
+                <button onClick={() => deleteCategory(cat.id)}
+                  className="opacity-0 group-hover/cat:opacity-100 text-[8px] text-red-400 hover:text-red-300 px-1 transition-opacity"
+                  title="刪除自訂分類">✕</button>
+              )}
+            </div>
+          )
+        })}
+        <button onClick={() => {
+            const name = window.prompt('新分類名稱（例如「自由接案」「閱讀」）：')
+            if (name?.trim()) createCategory(name)
+          }}
+          title="新增自訂分類"
+          className="shrink-0 px-2 py-1 rounded text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)] border-2 border-dashed border-[var(--border)] hover:border-[var(--gold-border)]">
+          + 新分類
+        </button>
+      </div>
+
       {/* 主題膠囊列 */}
       <div className="shrink-0 px-2 py-2 border-b border-[var(--border)] flex gap-1.5 overflow-x-auto items-center">
         {/* Phase 6: A/B 視圖切換 */}
@@ -583,6 +658,7 @@ export function TodoBoard({ sessions = [], onTriggerChat }) {
       {/* 卡片詳情抽屜 */}
       {activeCardId && (
         <CardDrawer card={cards.find(c => c.id === activeCardId)} tags={tags} themes={themes}
+          categories={categories}
           sessions={sessions}
           onClose={() => setActiveCardId(null)}
           onPatch={patchCard} onDelete={deleteCard}
@@ -973,7 +1049,7 @@ function TrashModal({ cards, tags, onClose, onRestore, onPurge }) {
   )
 }
 
-function CardDrawer({ card, tags, themes, sessions = [], onClose, onPatch, onDelete, onContinueInChat }) {
+function CardDrawer({ card, tags, themes, categories = [], sessions = [], onClose, onPatch, onDelete, onContinueInChat }) {
   const [title, setTitle] = useState(card?.title ?? '')
   const [note, setNote] = useState(card?.note ?? '')
   useEffect(() => { setTitle(card?.title ?? ''); setNote(card?.note ?? '') }, [card?.id])
@@ -1020,6 +1096,25 @@ function CardDrawer({ card, tags, themes, sessions = [], onClose, onPatch, onDel
               onBlur={() => { if (title.trim() && title !== card.title) commit({ title: title.trim() }) }}
               className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded px-2 py-1.5 text-[12px] outline-none focus:border-[var(--gold-border)]" />
           </div>
+
+          {/* P2 階段 1：分類（個人/工作） */}
+          {categories.length > 0 && (
+            <div>
+              <div className="text-[9px] uppercase tracking-widest text-[var(--text-muted)] mb-1">分類</div>
+              <div className="flex flex-wrap gap-1">
+                {categories.map(cat => {
+                  const cur = (card.categoryId ?? 'cat-personal') === cat.id
+                  return (
+                    <button key={cat.id} onClick={() => commit({ categoryId: cat.id })}
+                      style={cur ? { borderColor: cat.color, color: cat.color, backgroundColor: cat.color + '22' } : undefined}
+                      className={`text-[10px] px-2 py-0.5 rounded-full border ${cur ? '' : 'border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text)]'}`}>
+                      <span className="mr-1">{cat.icon}</span>{cat.name}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          )}
 
           <div>
             <div className="text-[9px] uppercase tracking-widest text-[var(--text-muted)] mb-1">主題</div>
