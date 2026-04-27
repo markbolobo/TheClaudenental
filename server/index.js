@@ -714,7 +714,9 @@ app.get('/api/history/:sessionId', async (request) => {
       costUsd = (byType.input * 3 + byType.output * 15 + byType.cacheRead * 0.3 + byType.cacheWrite * 3.75) / 1e6
     }
   } catch {}
-  return { ok: true, messages: messages.slice(-500), costUsd, byType, byModel }
+  // 不截斷歷史 — 對應 memory/project_tc_design_alignment_audit.md 鐵律
+  // （從前 slice(-500) 是真正讓「最早內容浮動」的元兇，已撤回）
+  return { ok: true, messages, costUsd, byType, byModel }
 })
 
 // ─── VS Code session live tail ────────────────────────────────────────────────
