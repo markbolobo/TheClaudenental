@@ -1,7 +1,13 @@
-# TheClaudenental 協作者環境設定指南（人工版）
+# [DEPRECATED — 場景 B 接卡尚未完整實作] TheClaudenental 協作者環境設定指南
 
-> 如果你有 Claude Code，直接開啟這個資料夾讓 AI 自動引導，不需要手動看這份文件。
-> 本文件適用於**沒有 AI 工具**、或需要手動排查問題的情況。
+> ⚠️ **這份文件是給「場景 B：接收 Mark 分享的卡片」協作者用的，目前 alpha 不完整。**
+>
+> **如果你是要協助打磨 codebase 的開發者**，請看 [`SETUP_FOR_DEV.md`](SETUP_FOR_DEV.md) — 這份文件不適用。
+>
+> 場景 B 還缺：對方端如何用 invite link 連到 Mark 的 server、跨網路 sync 機制等。等 P3 / P4 階段才會完整。
+
+如果你有 Claude Code，直接開啟這個資料夾讓 AI 自動引導，不需要手動看這份文件。
+本文件適用於**沒有 AI 工具**、或需要手動排查問題的情況。
 
 完成後你應該能：
 - 在自己的電腦跑起 TheClaudenental 個人駕駛艙
