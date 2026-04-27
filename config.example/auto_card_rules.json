@@ -1,0 +1,35 @@
+{
+  "$schema_version": 1,
+  "$schema_path": "docs/customization/auto_card_rules_schema.md",
+  "$ai_editable": true,
+  "$description": "TheClaudenental 自動建卡偵測規則 — Mark 打磨初版。對方 Claude 改造前先讀 $schema_path 對應的 md。",
+
+  "enabled": true,
+
+  "min_prompt_length": 8,
+  "min_score_to_create_card": 1,
+
+  "task_signals_positive": [
+    { "pattern": "立刻|請幫我|幫我|加上|補上|建立|實作|做一個|寫一個|新增|加入", "weight": 2 },
+    { "pattern": "規劃|設計|查驗|驗證|找出|查清|分析|統整|整理|重構", "weight": 2 },
+    { "pattern": "Bug|bug|報錯|壞了|不對|失敗|crash", "weight": 2 },
+    { "pattern": "下一步|接下來|要做的|todo|TODO", "weight": 1 }
+  ],
+
+  "task_signals_negative": [
+    { "pattern": "^(對|不對|是|沒錯|繼續|OK|ok|Ok|了解|收到|好)\\b", "weight": -3 },
+    { "pattern": "^(你覺得|為什麼|怎麼看|可以嗎|是不是|對嗎)", "weight": -2 },
+    { "pattern": "\\?$|？$", "weight": -1 }
+  ],
+
+  "default_column": "idea",
+  "default_tag_ids": ["tag-idea"],
+  "title_max_chars": 60,
+
+  "_examples": [
+    { "prompt": "幫我加一個 dark mode toggle", "expected": "建卡（命中 立刻|幫我）" },
+    { "prompt": "OK 繼續做下一個", "expected": "不建卡（純確認，命中 negative）" },
+    { "prompt": "你覺得這個 API 設計好嗎？", "expected": "不建卡（提問 + 問號）" },
+    { "prompt": "規劃下一個 sprint 要做什麼", "expected": "建卡（命中 規劃|下一步）" }
+  ]
+}

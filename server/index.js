@@ -406,6 +406,24 @@ app.post('/hook/UserPromptSubmit', async (request) => {
   }
   broadcast({ type: 'session', session: s })
   emitLog(e.session_id, `[Prompt] ${preview}`, 'user')
+
+  // ─── Phase 1 PoC：環境保證自動建卡（不依賴 LLM 自律）─────────────
+  // 對應 memory/project_tc_clean_tool_principle.md + auto_card_rules_schema.md
+  // 規則由 ~/.claude/tc_user_config/auto_card_rules.json 控制（首次啟動 auto-copy）
+  try {
+    if (clean) {
+      const rules = loadAutoCardRules()
+      if (rules.enabled !== false) {
+        const score = scoreTaskPrompt(clean, rules)
+        const minScore = rules.min_score_to_create_card ?? 1
+        if (score >= minScore) {
+          const card = createCardFromHook(clean, e.session_id)
+          if (card) emitLog(e.session_id, `[auto-card] +${card.column} 「${card.title.slice(0, 30)}」(score=${score})`, 'system')
+        }
+      }
+    }
+  } catch (err) { console.error('[auto-card]', err.message) }
+
   return { ok: true }
 })
 
@@ -1557,6 +1575,121 @@ function readTodos() {
   try { return JSON.parse(fs.readFileSync(TODOS_FILE, 'utf8')) } catch { return { cards: [] } }
 }
 function writeTodos(data) { fs.writeFileSync(TODOS_FILE, JSON.stringify(data, null, 2), 'utf8') }
+
+// ─── User Config（客製化值在本機，工具 repo 只有範例 + schema md）────────────
+// 對應 memory/project_tc_clean_tool_principle.md「三層分離鐵律」
+
+const USER_CONFIG_DIR = path.join(os.homedir(), '.claude', 'tc_user_config')
+const CONFIG_EXAMPLE_DIR = path.join(__dirname, '..', 'config.example')
+const AUTO_CARD_RULES_FILE = path.join(USER_CONFIG_DIR, 'auto_card_rules.json')
+
+function ensureUserConfig() {
+  try {
+    if (!fs.existsSync(USER_CONFIG_DIR)) fs.mkdirSync(USER_CONFIG_DIR, { recursive: true })
+    if (!fs.existsSync(CONFIG_EXAMPLE_DIR)) return
+    for (const f of fs.readdirSync(CONFIG_EXAMPLE_DIR)) {
+      const src = path.join(CONFIG_EXAMPLE_DIR, f)
+      const dst = path.join(USER_CONFIG_DIR, f)
+      if (!fs.existsSync(dst)) fs.copyFileSync(src, dst)
+    }
+  } catch (e) { console.error('[ensureUserConfig]', e.message) }
+}
+ensureUserConfig()
+
+const DEFAULT_AUTO_CARD_RULES = {
+  enabled: true,
+  min_prompt_length: 8,
+  min_score_to_create_card: 1,
+  task_signals_positive: [
+    { pattern: '立刻|請幫我|幫我|加上|補上|建立|實作|做一個|寫一個|新增|加入', weight: 2 },
+    { pattern: '規劃|設計|查驗|驗證|找出|查清|分析|統整|整理|重構', weight: 2 },
+    { pattern: 'Bug|bug|報錯|壞了|不對|失敗|crash', weight: 2 },
+  ],
+  task_signals_negative: [
+    { pattern: '^(對|不對|是|沒錯|繼續|OK|ok|Ok|了解|收到|好)\\b', weight: -3 },
+    { pattern: '^(你覺得|為什麼|怎麼看|可以嗎|是不是|對嗎)', weight: -2 },
+    { pattern: '\\?$|？$', weight: -1 },
+  ],
+  default_column: 'idea',
+  default_tag_ids: ['tag-idea'],
+  title_max_chars: 60,
+}
+
+let _autoCardRulesCache = null
+let _autoCardRulesMtime = 0
+function loadAutoCardRules() {
+  try {
+    if (!fs.existsSync(AUTO_CARD_RULES_FILE)) return DEFAULT_AUTO_CARD_RULES
+    const stat = fs.statSync(AUTO_CARD_RULES_FILE)
+    if (_autoCardRulesCache && stat.mtimeMs === _autoCardRulesMtime) return _autoCardRulesCache
+    const parsed = JSON.parse(fs.readFileSync(AUTO_CARD_RULES_FILE, 'utf8'))
+    _autoCardRulesCache = parsed
+    _autoCardRulesMtime = stat.mtimeMs
+    return parsed
+  } catch (e) {
+    console.error('[loadAutoCardRules]', e.message)
+    return DEFAULT_AUTO_CARD_RULES
+  }
+}
+
+function scoreTaskPrompt(text, rules) {
+  if (!text || text.length < (rules.min_prompt_length ?? 8)) return -Infinity
+  let score = 0
+  for (const s of rules.task_signals_positive ?? []) {
+    try { if (new RegExp(s.pattern).test(text)) score += s.weight ?? 1 } catch {}
+  }
+  for (const s of rules.task_signals_negative ?? []) {
+    try { if (new RegExp(s.pattern).test(text)) score += s.weight ?? -1 } catch {}
+  }
+  return score
+}
+
+// 防止重複建卡：每個 session 內，相同 prompt 前 60 字 + 5 分鐘窗口
+const _recentAutoCards = new Map() // key=`${sessionId}|${title60}`, value=ts
+function shouldSkipDuplicate(sessionId, title) {
+  const key = `${sessionId ?? 'anon'}|${title}`
+  const last = _recentAutoCards.get(key)
+  const now = Date.now()
+  if (last && now - last < 5 * 60 * 1000) return true
+  _recentAutoCards.set(key, now)
+  // GC：保留近 50 筆即可
+  if (_recentAutoCards.size > 50) {
+    const oldest = [..._recentAutoCards.entries()].sort((a, b) => a[1] - b[1])[0]
+    if (oldest) _recentAutoCards.delete(oldest[0])
+  }
+  return false
+}
+
+function createCardFromHook(prompt, sessionId) {
+  const rules = loadAutoCardRules()
+  const titleMax = rules.title_max_chars ?? 60
+  const stripped = String(prompt).replace(/[#*`>\-]/g, '').trim()
+  const firstLine = stripped.split('\n').find(l => l.trim()) ?? ''
+  const title = firstLine.slice(0, titleMax) || '未命名（hook 自動建卡）'
+  if (shouldSkipDuplicate(sessionId, title)) return null
+
+  const data = readTodos()
+  const card = {
+    id: `c${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    title,
+    column: COLUMNS.includes(rules.default_column) ? rules.default_column : 'idea',
+    themeId: null,
+    tagIds: Array.isArray(rules.default_tag_ids) ? rules.default_tag_ids : ['tag-idea'],
+    note: `## 自動建卡（hook auto）\n\nsessionId: ${sessionId ?? '(none)'}\ncreatedAt: ${new Date().toLocaleString('zh-TW', { hour12: false })}\n\n## 原始 prompt\n\n${prompt}\n`,
+    parentId: null, sessionId: sessionId ?? null,
+    lastDiscussedAt: sessionId ? Date.now() : null,
+    lastSummary: '',
+    createdAt: Date.now(), updatedAt: Date.now(), order: Date.now(),
+    categoryId: 'cat-personal',
+    sharedWith: [], sharedBy: 'u-owner', sharedAt: null,
+    kind: 'task', topicMdPath: null,
+    version: 1, deletedAt: null,
+  }
+  data.cards.push(card)
+  writeTodos(data)
+  logEvent('card.create', { id: card.id, column: card.column, title: card.title, source: 'hook-auto' })
+  return card
+}
 
 function readTodoTags() {
   try { return JSON.parse(fs.readFileSync(TODO_TAGS_FILE, 'utf8')) }
