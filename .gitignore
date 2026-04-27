@@ -1,3 +1,34 @@
 node_modules/
 dist/
 .env
+.env.*
+
+# AI 加工過程累積（協作者 Claude 私有，不該污染產品 repo）
+# 對應 CONTRIBUTING.md「AI 加工清潔原則」
+.agent/
+.claude/
+.cursor/
+scratch/
+.scratch/
+*.scratch.md
+WIP-*.md
+*.tmp.md
+docs/internal/
+docs/scratch/
+docs/draft/
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Build / cache
+.vite/
+.turbo/
+coverage/
+*.log
+*.bak
+*.bak.*
