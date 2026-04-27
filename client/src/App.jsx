@@ -1252,6 +1252,26 @@ function SortablePill({ wf, wfType, setWfType }) {
   )
 }
 
+// React state controlled thinking block — 取代 <details>，避免某些環境點擊不展開
+function ThinkingBlock({ text }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="border border-purple-700/40 rounded bg-purple-900/10 px-2 py-1">
+      <button onClick={() => setOpen(o => !o)}
+        className="w-full text-left text-[9px] text-purple-400 cursor-pointer select-none uppercase tracking-widest hover:text-purple-300 flex items-center gap-1">
+        <span className={`inline-block transition-transform ${open ? 'rotate-90' : ''}`}>▶</span>
+        💭 Thinking
+        <span className="ml-auto text-[8px] text-purple-400/50 normal-case tracking-normal">{text?.length ?? 0} chars</span>
+      </button>
+      {open && (
+        <div className="mt-1 text-[10px] text-purple-300/70 font-mono" style={{ whiteSpace: 'pre-wrap' }}>
+          {text}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) {
   const [projectPath, setProjectPath] = useState('C:/Project/RomanPrototype')
   const [input, setInput] = useState('')
@@ -1264,16 +1284,12 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
   const [wfUrl, setWfUrl]                   = useState('')
   const [wfThought, setWfThought]           = useState('')
   const [injectOnce, setInjectOnce]         = useState(false)  // B機制：單次注入偏好
-  const [pendingQueue, setPendingQueue]     = useState(() => {
-    // 從 localStorage 復原（Vite HMR / F5 / tab 卸載後重開都能接續）
-    try {
-      const raw = localStorage.getItem('tc_pending_queue')
-      if (!raw) return []
-      const parsed = JSON.parse(raw)
-      // 附件（File/Blob）無法序列化，復原後只剩文字
-      return Array.isArray(parsed) ? parsed.map(p => ({ text: p.text, attachments: [], ts: p.ts })) : []
-    } catch { return [] }
-  })
+  // 排隊機制已拿掉（2026-04-27 少爺要求），保留 state 避免大規模 refactor
+  // mount 時清掉 localStorage 死資料，防止舊資料復活 flush
+  const [pendingQueue, setPendingQueue]     = useState([])
+  useEffect(() => {
+    try { localStorage.removeItem('tc_pending_queue') } catch {}
+  }, [])
   const [fbBuffer, setFbBuffer]             = useState([])     // FB 暫存列表
   const [workflowOrder, setWorkflowOrder]   = useState([])     // 心腹 pill 排序（跨裝置同步）
   const [withEvaluation, setWithEvaluation] = useState(true)   // 決策類心腹附上評估框架（D 方案）
@@ -1653,12 +1669,8 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
       setInput('')
       return
     }
-    // Claude 思考中 → 加入 FIFO 佇列
-    if (running) {
-      setPendingQueue(q => [...q, { text, attachments: atts, ts: Date.now() }])
-      if (!overrideText) { setInput(''); setAttachments([]) }
-      return
-    }
+    // 思考中送出 → 直接送（少爺 2026-04-27 報排隊機制不好用）
+    // server / Claude Code CLI 自己處理同 session 重疊請求
     if (!overrideText) { setInput(''); setAttachments([]) }
     await doActualSend(text, atts)
   }
@@ -2442,13 +2454,8 @@ ${body}`
                 </div>
               </div>
             )}
-            {/* Thinking block */}
-            {m.role === 'thinking' && (
-              <details className="border border-purple-700/40 rounded bg-purple-900/10 px-2 py-1">
-                <summary className="text-[9px] text-purple-400 cursor-pointer select-none uppercase tracking-widest">💭 Thinking</summary>
-                <div className="mt-1 text-[10px] text-purple-300/70 font-mono" style={{ whiteSpace: 'pre-wrap' }}>{m.text}</div>
-              </details>
-            )}
+            {/* Thinking block — React state controlled，避免原生 details 在某些環境不展開 */}
+            {m.role === 'thinking' && <ThinkingBlock text={m.text} />}
             {/* Tool use */}
             {m.role === 'tool_use' && (
               <details className="border border-sky-700/40 rounded bg-sky-900/10 px-2 py-1">
@@ -2687,27 +2694,7 @@ ${d.links?.length    ? `## 內含外部連結\n${d.links.join('\n')}\n`  : ''}
           </div>
         )}
 
-        {/* 排隊訊息指示器（FIFO，可多筆） */}
-        {pendingQueue.length > 0 && (
-          <div className="flex flex-col gap-1 px-2 py-1.5 border-b border-amber-600/30 bg-amber-900/20">
-            <div className="flex items-center gap-2">
-              <span className="text-[10px] text-amber-400 shrink-0">⏳ 排隊 {pendingQueue.length} 筆</span>
-              <div className="flex-1" />
-              <button onClick={() => setPendingQueue([])}
-                className="text-[9px] text-[var(--text-muted)] hover:text-red-400 shrink-0 px-1.5 py-0.5 rounded border border-[var(--border)]"
-                title="清除全部排隊">✕ 清空</button>
-            </div>
-            {pendingQueue.map((p, i) => (
-              <div key={p.ts} className="flex items-center gap-2 pl-3">
-                <span className="text-[9px] text-amber-400/60 font-mono w-4 shrink-0">{i + 1}</span>
-                <span className="text-[10px] text-[var(--text)] flex-1 truncate font-mono">{p.text}</span>
-                <button onClick={() => setPendingQueue(q => q.filter((_, j) => j !== i))}
-                  className="text-[9px] text-[var(--text-muted)] hover:text-red-400 shrink-0 px-1 rounded"
-                  title="移除此筆">✕</button>
-              </div>
-            ))}
-          </div>
-        )}
+        {/* 排隊機制已拿掉（少爺 2026-04-27），思考中送出直接送 */}
         {/* Attachment previews */}
         {attachments.length > 0 && (
           <div className="flex flex-wrap gap-1.5 px-2 pt-2">
@@ -2788,7 +2775,7 @@ ${d.links?.length    ? `## 內含外部連結\n${d.links.join('\n')}\n`  : ''}
             onChange={e => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
-            placeholder={running ? '思考中也可以繼續輸入（送出會排隊）…' : '輸入訊息…'}
+            placeholder={running ? '思考中可繼續送出（直接送，不再排隊）…' : '輸入訊息…'}
             rows={2}
             className="flex-1 bg-[var(--surface)] border border-[var(--border)] rounded px-2 py-1.5 text-base md:text-[11px] text-[var(--text)] resize-none outline-none placeholder:text-[var(--text-muted)]"
           />
