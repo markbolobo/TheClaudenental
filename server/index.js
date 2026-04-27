@@ -1019,10 +1019,27 @@ app.get('/api/logs', async (request) => {
 
 // ─── Claude Subprocess API ───────────────────────────────────────────────────
 
-function spawnClaude(projectPath, prompt, sessionId = null) {
-  // Kill any existing process for this project
+// Server side queue — 思考中送出時不 kill 上一個，自動排隊接續
+// （少爺 2026-04-27 報「我做的事讓對話中斷」根因 = spawnClaude 開頭的 kill existing）
+const claudeRunQueue = new Map()  // projectPath → array of { prompt, sessionId }
+
+function processQueueIfIdle(projectPath) {
   const existing = claudeProcs.get(projectPath)
-  if (existing?.proc) try { existing.proc.kill() } catch {}
+  if (existing?.status === 'running') return
+  const q = claudeRunQueue.get(projectPath)
+  if (!q || q.length === 0) return
+  const next = q.shift()
+  if (q.length === 0) claudeRunQueue.delete(projectPath)
+  // 用佇列裡的 sessionId（同 session 接續）；若空則用最後一個 entry 的
+  const sid = next.sessionId ?? existing?.sessionId ?? null
+  broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath),
+    event: { type: 'system', subtype: 'queue_dequeue', queueRemaining: q.length } })
+  spawnClaude(projectPath, next.prompt, sid)
+}
+
+function spawnClaude(projectPath, prompt, sessionId = null) {
+  // ⚠️ 不再 kill existing（會中斷使用者進行中的 thinking）
+  // 呼叫端必須先檢查 claudeProcs.get(projectPath)?.status，running 時 push 到 queue 而非呼叫 spawnClaude
 
   // Pre-register before spawn so SessionStart hook can filter by cwd (race condition fix)
   const normalCwd = projectPath.replace(/\\/g, '/').toLowerCase()
@@ -1071,6 +1088,8 @@ function spawnClaude(projectPath, prompt, sessionId = null) {
     entry.status = 'done'
     broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath), event: { type: 'done', exitCode: code } })
     setTimeout(() => { if (claudeProcs.get(projectPath) === entry) claudeProcs.delete(projectPath) }, 10_000)
+    // 處理 queue 下一個（如果有）— 維持「直接送 + 不中斷」UX
+    processQueueIfIdle(projectPath)
   })
 
   return entry
@@ -1098,6 +1117,16 @@ app.post('/api/claude/run', async (request) => {
     }
   }
 
+  // 思考中（同 projectPath 已有 running process）→ push 到 queue，不 kill 上一個
+  const existing = claudeProcs.get(projectPath)
+  if (existing?.status === 'running') {
+    let q = claudeRunQueue.get(projectPath)
+    if (!q) { q = []; claudeRunQueue.set(projectPath, q) }
+    q.push({ prompt: fullPrompt, sessionId: sessionId ?? existing.sessionId ?? null })
+    broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath),
+      event: { type: 'system', subtype: 'queue_enqueue', queuePos: q.length } })
+    return { ok: true, queued: true, queuePos: q.length }
+  }
   const entry = spawnClaude(projectPath, fullPrompt, sessionId ?? null)
 
   // Clean up temp files after subprocess closes
