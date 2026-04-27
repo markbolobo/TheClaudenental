@@ -1281,40 +1281,60 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
   const attachMenuRef = useRef(null)
   const [sessionId, setSessionId] = useState(null)
   const [messages, setMessages] = useState([])
-  // ⚠️ 撤回 cap 1000（少爺 2026-04-27 報「最早內容不見」）— state 全留，DOM 用 visibleCount 控制
-  // 對應 memory/project_tc_design_alignment_audit.md「不對歷史內容自動真砍」鐵律
-  // 手動揭露：預設顯示最近 150 則；點「載入更早」每次 +100
-  // 新訊息進來 → 顯示窗口自動跟著最新（不會把新的擋住）
-  const [visibleCount, setVisibleCount] = useState(150)
-  // showAll: 一次展開全部後，即使後續新訊息進來，最早的也不會被擠出
+  // ⚠️ State 永遠完整保留（對應 memory/project_tc_design_alignment_audit.md 鐵律）
+  // 不對歷史 messages 動 slice / cap
+
+  // hiddenCount = 上方被隱藏的訊息數（絕對 index）
+  // 鎖定「最早可見訊息」的位置，新訊息進來 hiddenCount 不變 → 不會浮動
+  const [hiddenCount, setHiddenCount] = useState(0)
   const [showAllMessages, setShowAllMessages] = useState(false)
-  // 對話內搜尋：有輸入時 render filter 結果（不受 visibleCount 限制）
   const [chatSearchQuery, setChatSearchQuery] = useState('')
-  // 展開更多時保持當前可見訊息位置（不讓畫面跑掉）
+  // 第一次 messages 從 0 → N（history 載入完）時，預設只顯示最新 150 則
+  const initializedRef = useRef(false)
+  useEffect(() => {
+    if (initializedRef.current) return
+    if (messages.length > 150 && !showAllMessages) {
+      setHiddenCount(messages.length - 150)
+      initializedRef.current = true
+    } else if (messages.length > 0 && messages.length <= 150) {
+      initializedRef.current = true  // 訊息少不需要隱藏，標 init 完
+    }
+  }, [messages.length, showAllMessages])
+  // 切換 session 時 reset（messages 被清空再重載）
+  useEffect(() => {
+    initializedRef.current = false
+    setHiddenCount(0)
+    setShowAllMessages(false)
+  }, [sessionId])
+
+  // 展開更多時保持「使用者看著的訊息位置」不變
+  // 邏輯：點按鈕前 scrollTop = T（看著的訊息距 container 頂 T px）
+  //       點按鈕後 DOM 上方多了 H px → 新 scrollTop = T + H（使用者看著的訊息維持原位置）
   const preserveScrollRef = useRef(null)
   function loadMoreMessages(delta) {
     const el = scrollContainerRef.current
     if (el) preserveScrollRef.current = { scrollHeight: el.scrollHeight, scrollTop: el.scrollTop }
-    setVisibleCount(c => Math.min(messages.length, c + delta))
+    setHiddenCount(c => Math.max(0, c - delta))
   }
   function expandAllMessages() {
     const el = scrollContainerRef.current
     if (el) preserveScrollRef.current = { scrollHeight: el.scrollHeight, scrollTop: el.scrollTop }
+    setHiddenCount(0)
     setShowAllMessages(true)
   }
-  // 載入完成後補償 scrollTop（DOM 已 render 出新增的高度，把使用者視角維持原處）
+  function collapseToRecent() {
+    setShowAllMessages(false)
+    setHiddenCount(Math.max(0, messages.length - 150))
+  }
   useLayoutEffect(() => {
     if (!preserveScrollRef.current) return
     const el = scrollContainerRef.current
     if (!el) return
     const delta = el.scrollHeight - preserveScrollRef.current.scrollHeight
-    if (delta > 0) {
-      el.scrollTop = preserveScrollRef.current.scrollTop + delta
-      // 暫停一拍 smartScroll 自動跑底部，避免被 messages effect 拉走
-      isNearBottomRef.current = false
-    }
+    el.scrollTop = preserveScrollRef.current.scrollTop + delta
+    isNearBottomRef.current = false  // 暫停 smartScroll 拉底部
     preserveScrollRef.current = null
-  }, [visibleCount])
+  }, [hiddenCount])
   const bottomRef = useRef(null)
   const scrollContainerRef = useRef(null)
   const isNearBottomRef = useRef(true)
@@ -2340,13 +2360,13 @@ ${body}`
           </div>
         )}
 
-        {/* 載入更早歷史按鈕（沒搜尋時 + 沒展開全部 + 還有更早可載入）
-            點擊後保持當前看到的訊息位置（不讓畫面跳） */}
-        {!chatSearchQuery.trim() && !showAllMessages && messages.length > visibleCount && (
+        {/* 載入更早歷史按鈕（沒搜尋時 + 還有更早可載入）
+            點擊後使用者看著的訊息位置不變、上方多出更早內容 */}
+        {!chatSearchQuery.trim() && hiddenCount > 0 && (
           <div className="text-center py-2">
             <button onClick={() => loadMoreMessages(100)}
               className="text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)] px-3 py-1 rounded border border-[var(--border)] hover:border-[var(--gold-border)]">
-              ↑ 載入更早 100 則（還有 {messages.length - visibleCount} 則）
+              ↑ 載入更早 100 則（還有 {hiddenCount} 則隱藏）
             </button>
             <button onClick={expandAllMessages}
               className="ml-2 text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)] px-2 py-1">
@@ -2354,10 +2374,9 @@ ${body}`
             </button>
           </div>
         )}
-        {/* 展開全部後顯示「收合到最近 150 則」讓使用者能回到簡潔模式 */}
         {!chatSearchQuery.trim() && showAllMessages && messages.length > 150 && (
           <div className="text-center py-2">
-            <button onClick={() => { setShowAllMessages(false); setVisibleCount(150) }}
+            <button onClick={collapseToRecent}
               className="text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)] px-3 py-1 rounded border border-[var(--border)] hover:border-[var(--gold-border)]">
               ⇣ 收合到最近 150 則（目前展開全 {messages.length} 則）
             </button>
@@ -2375,7 +2394,7 @@ ${body}`
                 if (Array.isArray(m.attachments) && m.attachments.some(a => (a.name ?? '').toLowerCase().includes(q))) return true
                 return false
               })
-            : (showAllMessages ? messages : messages.slice(-visibleCount))
+            : messages.slice(hiddenCount)  // hiddenCount 鎖定「最早可見」絕對位置
 
           if (q && renderMessages.length === 0) return (
             <div className="text-[10px] text-[var(--text-muted)] text-center py-4 opacity-60">
