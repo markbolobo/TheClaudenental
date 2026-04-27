@@ -1252,20 +1252,31 @@ function SortablePill({ wf, wfType, setWfType }) {
   )
 }
 
-// React state controlled thinking block — 取代 <details>，避免某些環境點擊不展開
-function ThinkingBlock({ text }) {
-  const [open, setOpen] = useState(false)
+// React state controlled thinking block — 取代 <details>
+// 預設展開；text 為空時 fallback 顯示整個 message 物件（debug 用，定位 thinking 內容缺失原因）
+function ThinkingBlock({ text, fullMessage }) {
+  const [open, setOpen] = useState(true)
+  const hasText = typeof text === 'string' && text.length > 0
   return (
     <div className="border border-purple-700/40 rounded bg-purple-900/10 px-2 py-1">
       <button onClick={() => setOpen(o => !o)}
         className="w-full text-left text-[9px] text-purple-400 cursor-pointer select-none uppercase tracking-widest hover:text-purple-300 flex items-center gap-1">
         <span className={`inline-block transition-transform ${open ? 'rotate-90' : ''}`}>▶</span>
         💭 Thinking
-        <span className="ml-auto text-[8px] text-purple-400/50 normal-case tracking-normal">{text?.length ?? 0} chars</span>
+        <span className="ml-auto text-[8px] text-purple-400/50 normal-case tracking-normal">
+          {hasText ? `${text.length} chars` : '⚠ 無內文（debug 模式）'}
+        </span>
       </button>
       {open && (
         <div className="mt-1 text-[10px] text-purple-300/70 font-mono" style={{ whiteSpace: 'pre-wrap' }}>
-          {text}
+          {hasText ? text : (
+            <div>
+              <div className="text-yellow-300 mb-1">⚠ thinking text 為空，dump 完整 message 物件供 debug：</div>
+              <pre className="bg-black/40 p-1 rounded overflow-x-auto text-[9px]">
+                {JSON.stringify(fullMessage, null, 2)}
+              </pre>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -2455,7 +2466,7 @@ ${body}`
               </div>
             )}
             {/* Thinking block — React state controlled，避免原生 details 在某些環境不展開 */}
-            {m.role === 'thinking' && <ThinkingBlock text={m.text} />}
+            {m.role === 'thinking' && <ThinkingBlock text={m.text} fullMessage={m} />}
             {/* Tool use */}
             {m.role === 'tool_use' && (
               <details className="border border-sky-700/40 rounded bg-sky-900/10 px-2 py-1">
@@ -2790,7 +2801,7 @@ ${d.links?.length    ? `## 內含外部連結\n${d.links.join('\n')}\n`  : ''}
                   : 'bg-[var(--gold)]/20 border-[var(--gold)]/50 text-[var(--gold)] hover:bg-[var(--gold)]/30'
               }`}
               style={{ touchAction: 'manipulation' }}
-            >{running ? '排隊' : '送出'}</button>
+            >送出</button>
             {running && (
               <button onClick={handleStop}
                 onTouchEnd={e => { e.preventDefault(); handleStop() }}

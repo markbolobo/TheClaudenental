@@ -673,8 +673,16 @@ app.get('/api/history/:sessionId', async (request) => {
         }
         if (obj.type === 'assistant') {
           const c = obj.message?.content
-          const text = Array.isArray(c) ? c.filter(x=>x.type==='text').map(x=>x.text).join('') : ''
-          if (text.trim()) messages.push({ role: 'assistant', text: text.trim(), ts: obj.timestamp })
+          if (Array.isArray(c)) {
+            // 依序保留 thinking + text（之前只 filter text，導致歷史載入 thinking 全失）
+            for (const x of c) {
+              if (x.type === 'thinking' && (x.thinking ?? '').trim()) {
+                messages.push({ role: 'thinking', text: x.thinking, ts: obj.timestamp })
+              } else if (x.type === 'text' && (x.text ?? '').trim()) {
+                messages.push({ role: 'assistant', text: x.text.trim(), ts: obj.timestamp })
+              }
+            }
+          }
           if (obj.message?.usage) {
             const u   = obj.message.usage
             const mn  = obj.message.model ?? 'unknown'
