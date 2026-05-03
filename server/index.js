@@ -1580,7 +1580,7 @@ function writeTodos(data) { fs.writeFileSync(TODOS_FILE, JSON.stringify(data, nu
 // 對應 memory/project_tc_clean_tool_principle.md「三層分離鐵律」
 
 const USER_CONFIG_DIR = path.join(os.homedir(), '.claude', 'tc_user_config')
-const CONFIG_EXAMPLE_DIR = path.join(__dirname, '..', 'config.example')
+const CONFIG_EXAMPLE_DIR = path.join(import.meta.dirname, '..', 'config.example')
 const AUTO_CARD_RULES_FILE = path.join(USER_CONFIG_DIR, 'auto_card_rules.json')
 
 function ensureUserConfig() {
