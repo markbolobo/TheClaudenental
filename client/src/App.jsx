@@ -7,6 +7,8 @@ import { CSS } from '@dnd-kit/utilities'
 import { useCostEngine, BountyOverlay, BountyToast, ContractModal, fmtCost, computeDeltaCost } from './BountySystem.jsx'
 import { TodoBoard } from './TodoBoard.jsx'
 import { MetricsDashboard } from './MetricsDashboard.jsx'
+import { SommelierPanel } from './Sommelier.jsx'
+import { QAMonitorPanel } from './QAMonitor.jsx'
 import BountySettings from './BountySettings.jsx'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -19,11 +21,6 @@ const STATUS_ICON = {
   waiting:  '◐',
   error:    '✕',
   done:     '✓',
-}
-
-const GATE_LABEL = {
-  1: 'Gate 1 — Plan Review',
-  2: 'Gate 2 — Build Check',
 }
 
 // ─── (mock data removed — sessions come from server via WebSocket) ───────────
@@ -256,98 +253,6 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick,
   )
 }
 
-function GateBadge({ gate, onApprove, onForce, onBlock }) {
-  if (!gate || gate.status === 'approved') return null
-
-  const statusCls = {
-    pending: 'gate-pending',
-    force:   'gate-force',
-    blocked: 'gate-blocked',
-  }[gate.status] ?? 'gate-pending'
-
-  return (
-    <div className={`mt-1 ml-4 border rounded px-2 py-1 text-[10px] inline-flex flex-col gap-1 ${statusCls}`}>
-      <span className="font-semibold">{GATE_LABEL[gate.id] ?? `Gate ${gate.id}`}</span>
-      {gate.status === 'pending' && (
-        <div className="flex gap-1 mt-0.5">
-          <button
-            onClick={onApprove}
-            className="px-2 py-0.5 rounded bg-green-900/40 border border-green-700 text-green-300 hover:bg-green-800/60 text-[10px]"
-          >
-            驗收通過
-          </button>
-          <button
-            onClick={onForce}
-            className="px-2 py-0.5 rounded bg-purple-900/40 border border-purple-700 text-purple-300 hover:bg-purple-800/60 text-[10px]"
-          >
-            強力過件
-          </button>
-          <button
-            onClick={onBlock}
-            className="px-2 py-0.5 rounded bg-red-900/40 border border-red-700 text-red-300 hover:bg-red-800/60 text-[10px]"
-          >
-            擋下
-          </button>
-        </div>
-      )}
-    </div>
-  )
-}
-
-function TaskNode({ task, depth = 0, onGateAction }) {
-  const [collapsed, setCollapsed] = useState(false)
-  const hasChildren = task.children?.length > 0
-  const indent = depth * 16
-
-  const rowCls = {
-    active:  'border-l-2 border-green-500/50',
-    waiting: 'border-l-2 border-amber-500/50',
-    done:    'border-l-2 border-blue-500/20 opacity-60',
-    error:   'border-l-2 border-red-500/50',
-  }[task.status] ?? 'border-l-2 border-transparent'
-
-  return (
-    <div>
-      <div
-        className={`flex items-start gap-2 px-2 py-1 rounded-sm hover:bg-[var(--surface-2)] ${rowCls}`}
-        style={{ paddingLeft: `${indent + 8}px` }}
-      >
-        {hasChildren ? (
-          <button
-            onClick={() => setCollapsed(c => !c)}
-            className="text-[var(--text-muted)] text-[10px] w-3 shrink-0 mt-0.5 hover:text-[var(--text)]"
-          >
-            {collapsed ? '▶' : '▼'}
-          </button>
-        ) : (
-          <span className="w-3 shrink-0" />
-        )}
-        <StatusDot status={task.status} />
-        <div className="flex-1 min-w-0">
-          <span className={`text-xs ${task.status === 'done' ? 'line-through text-[var(--text-muted)]' : 'text-[var(--text-h)]'}`}>
-            {task.title}
-          </span>
-          {task.gate && (
-            <GateBadge
-              gate={task.gate}
-              onApprove={() => onGateAction(task.id, 'approve')}
-              onForce={() => onGateAction(task.id, 'force')}
-              onBlock={() => onGateAction(task.id, 'block')}
-            />
-          )}
-        </div>
-      </div>
-      {!collapsed && hasChildren && (
-        <div>
-          {task.children.map(child => (
-            <TaskNode key={child.id} task={child} depth={depth + 1} onGateAction={onGateAction} />
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
 const SESSION_LIMIT_MS = 5 * 60 * 60 * 1000 // 5 hours
 
 // 冷卻到期後，下一個整點 :00:01 (瀏覽器本地時區)
@@ -547,211 +452,6 @@ function HistoryPanel({ onContinue }) {
   )
 }
 
-function AnalyticsPanel({ sessions }) {
-  const totals = sessions.reduce((acc, s) => {
-    acc.input  += s.tokens?.input  ?? 0
-    acc.output += s.tokens?.output ?? 0
-    return acc
-  }, { input: 0, output: 0 })
-
-  const fmt = n => n >= 1000 ? `${(n/1000).toFixed(1)}k` : String(n)
-
-  return (
-    <div className="px-4 py-4 space-y-4">
-      <div className="grid grid-cols-2 gap-3">
-        {[
-          { label: 'Total Input', val: fmt(totals.input), sub: 'tokens' },
-          { label: 'Total Output', val: fmt(totals.output), sub: 'tokens' },
-          { label: 'Sessions', val: sessions.length, sub: 'all time' },
-          { label: 'Active', val: sessions.filter(s=>s.status==='active').length, sub: 'right now' },
-        ].map(c => (
-          <div key={c.label} className="bg-[var(--surface-2)] rounded p-3 border border-[var(--border)]">
-            <div className="text-[9px] text-[var(--text-muted)] uppercase tracking-wider">{c.label}</div>
-            <div className="text-xl text-[var(--gold)] font-semibold mt-1">{c.val}</div>
-            <div className="text-[9px] text-[var(--text-muted)]">{c.sub}</div>
-          </div>
-        ))}
-      </div>
-      <div>
-        <div className="text-[10px] text-[var(--text-muted)] uppercase tracking-wider mb-2">Per Session</div>
-        <div className="space-y-1">
-          {sessions.filter(s => s.tokens?.input || s.tokens?.output).map(s => (
-            <div key={s.id} className="flex items-center gap-2 text-[10px]">
-              <span className="truncate flex-1 text-[var(--text-h)]">{s.displayName}</span>
-              <span className="text-[var(--text-muted)]">↑{fmt(s.tokens?.input??0)}</span>
-              <span className="text-[var(--text-muted)]">↓{fmt(s.tokens?.output??0)}</span>
-            </div>
-          ))}
-          {sessions.every(s => !s.tokens?.input && !s.tokens?.output) && (
-            <div className="text-[var(--text-muted)] text-xs">Token data appears after session ends</div>
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function ClaudeMdPanel({ selected }) {
-  const [files, setFiles] = useState([])
-  const [activeFile, setActiveFile] = useState(null)
-  const [content, setContent] = useState('')
-  const [saving, setSaving] = useState(false)
-
-  useEffect(() => {
-    const cwd = selected?.cwd ?? ''
-    fetch(`/api/claudemd?cwd=${encodeURIComponent(cwd)}`).then(r=>r.json()).then(d => {
-      setFiles(d.files ?? [])
-      if (d.files?.length > 0 && !activeFile) { setActiveFile(d.files[0].path); setContent(d.files[0].content) }
-    })
-  }, [selected?.cwd])
-
-  async function save() {
-    setSaving(true)
-    await fetch('/api/claudemd', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ path: activeFile, content }) })
-    setSaving(false)
-  }
-
-  return (
-    <div className="flex flex-col h-full">
-      <div className="flex items-center gap-1 px-2 py-1 border-b border-[var(--border)] shrink-0 overflow-x-auto">
-        {files.map(f => (
-          <button key={f.path} onClick={() => { setActiveFile(f.path); setContent(f.content) }}
-            className={`px-2 py-1 rounded text-[10px] shrink-0 ${activeFile===f.path ? 'bg-[var(--gold-dim)] text-[var(--gold)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'}`}>
-            {f.path.split(/[/\\]/).pop()}
-          </button>
-        ))}
-        {files.length === 0 && <span className="text-[10px] text-[var(--text-muted)] px-2">No CLAUDE.md found</span>}
-      </div>
-      {activeFile && (
-        <>
-          <textarea value={content} onChange={e => setContent(e.target.value)}
-            className="flex-1 bg-transparent font-mono text-[11px] text-[var(--text)] p-3 resize-none focus:outline-none"
-            spellCheck={false} />
-          <div className="px-3 py-2 border-t border-[var(--border)] flex justify-between items-center shrink-0">
-            <span className="text-[9px] text-[var(--text-muted)] truncate">{activeFile}</span>
-            <button onClick={save} disabled={saving}
-              className="px-3 py-1 rounded bg-[var(--gold-dim)] border border-[var(--gold-border)] text-[var(--gold)] text-[10px] hover:bg-[var(--gold)] hover:text-black">
-              {saving ? 'Saving…' : 'Save'}
-            </button>
-          </div>
-        </>
-      )}
-    </div>
-  )
-}
-
-function AgentsPanel() {
-  const [agents, setAgents] = useState([])
-  const [editing, setEditing] = useState(null) // { name, content } or null
-  const [newName, setNewName] = useState('')
-  const [newContent, setNewContent] = useState('')
-
-  const reload = () => fetch('/api/agents').then(r=>r.json()).then(d => setAgents(d.agents ?? []))
-  useEffect(() => { reload() }, [])
-
-  async function save() {
-    const name = editing?.name ?? newName
-    const content = editing?.content ?? newContent
-    if (!name.trim()) return
-    await fetch('/api/agents', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name, content }) })
-    setEditing(null); setNewName(''); setNewContent(''); reload()
-  }
-
-  async function del(name) {
-    await fetch(`/api/agents/${encodeURIComponent(name)}`, { method:'DELETE' })
-    reload()
-  }
-
-  if (editing) return (
-    <div className="flex flex-col h-full p-3 gap-2">
-      <div className="flex items-center gap-2 shrink-0">
-        <span className="text-xs text-[var(--text-h)]">{editing.name}</span>
-        <div className="flex-1" />
-        <button onClick={() => setEditing(null)} className="text-[10px] text-[var(--text-muted)] hover:text-[var(--text)]">Cancel</button>
-        <button onClick={save} className="px-2 py-1 rounded bg-[var(--gold-dim)] border border-[var(--gold-border)] text-[var(--gold)] text-[10px]">Save</button>
-      </div>
-      <textarea value={editing.content} onChange={e => setEditing(p => ({...p, content: e.target.value}))}
-        className="flex-1 bg-[var(--surface-2)] border border-[var(--border)] rounded p-2 font-mono text-[11px] text-[var(--text)] resize-none focus:outline-none" />
-    </div>
-  )
-
-  return (
-    <div className="flex flex-col h-full">
-      <div className="flex-1 overflow-y-auto px-2 py-2 space-y-1">
-        {agents.map(a => (
-          <div key={a.name} className="flex items-center gap-2 px-2 py-2 rounded hover:bg-[var(--surface-2)]">
-            <div className="flex-1 min-w-0">
-              <div className="text-xs text-[var(--text-h)] truncate">{a.name}</div>
-              <div className="text-[9px] text-[var(--text-muted)] truncate">{a.desc}</div>
-            </div>
-            <button onClick={() => setEditing({ name: a.name, content: a.content })} className="text-[10px] text-[var(--text-muted)] hover:text-[var(--text)]">Edit</button>
-            <button onClick={() => del(a.name)} className="text-[10px] text-[var(--text-muted)] hover:text-red-400">✕</button>
-          </div>
-        ))}
-        {agents.length === 0 && <div className="text-[var(--text-muted)] text-xs text-center mt-8">No agents yet</div>}
-      </div>
-      <div className="border-t border-[var(--border)] p-3 space-y-2 shrink-0">
-        <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="Agent name"
-          className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded px-2 py-1 text-xs text-[var(--text-h)] focus:outline-none focus:border-[var(--gold)]" />
-        <textarea value={newContent} onChange={e => setNewContent(e.target.value)} placeholder="System prompt…" rows={3}
-          className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded px-2 py-1 text-xs text-[var(--text)] resize-none focus:outline-none focus:border-[var(--gold)]" />
-        <button onClick={save} className="w-full py-1 rounded bg-[var(--gold-dim)] border border-[var(--gold-border)] text-[var(--gold)] text-[10px] hover:bg-[var(--gold)] hover:text-black">
-          + Create Agent
-        </button>
-      </div>
-    </div>
-  )
-}
-
-function McpPanel() {
-  const [servers, setServers] = useState({})
-  const [name, setName] = useState('')
-  const [cmd, setCmd] = useState('')
-  const [args, setArgs] = useState('')
-
-  const reload = () => fetch('/api/mcp').then(r=>r.json()).then(d => setServers(d.servers ?? {}))
-  useEffect(() => { reload() }, [])
-
-  async function add() {
-    if (!name.trim() || !cmd.trim()) return
-    const config = { command: cmd, args: args ? args.split(' ') : [] }
-    await fetch('/api/mcp', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name, config }) })
-    setName(''); setCmd(''); setArgs(''); reload()
-  }
-
-  async function del(n) {
-    await fetch(`/api/mcp/${encodeURIComponent(n)}`, { method:'DELETE' }); reload()
-  }
-
-  return (
-    <div className="flex flex-col h-full">
-      <div className="flex-1 overflow-y-auto px-2 py-2 space-y-1">
-        {Object.entries(servers).map(([n, cfg]) => (
-          <div key={n} className="flex items-center gap-2 px-2 py-2 rounded hover:bg-[var(--surface-2)]">
-            <div className="flex-1 min-w-0">
-              <div className="text-xs text-[var(--text-h)]">{n}</div>
-              <div className="text-[9px] text-[var(--text-muted)] truncate font-mono">{cfg.command} {(cfg.args??[]).join(' ')}</div>
-            </div>
-            <button onClick={() => del(n)} className="text-[10px] text-[var(--text-muted)] hover:text-red-400">✕</button>
-          </div>
-        ))}
-        {Object.keys(servers).length === 0 && <div className="text-[var(--text-muted)] text-xs text-center mt-8">No MCP servers</div>}
-      </div>
-      <div className="border-t border-[var(--border)] p-3 space-y-2 shrink-0">
-        <input value={name} onChange={e=>setName(e.target.value)} placeholder="Server name"
-          className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded px-2 py-1 text-xs text-[var(--text-h)] focus:outline-none focus:border-[var(--gold)]" />
-        <input value={cmd} onChange={e=>setCmd(e.target.value)} placeholder="Command (e.g. npx)"
-          className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded px-2 py-1 text-xs text-[var(--text)] focus:outline-none focus:border-[var(--gold)]" />
-        <input value={args} onChange={e=>setArgs(e.target.value)} placeholder="Args (space-separated)"
-          className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded px-2 py-1 text-xs text-[var(--text)] focus:outline-none focus:border-[var(--gold)]" />
-        <button onClick={add} className="w-full py-1 rounded bg-[var(--gold-dim)] border border-[var(--gold-border)] text-[var(--gold)] text-[10px] hover:bg-[var(--gold)] hover:text-black">
-          + Add Server
-        </button>
-      </div>
-    </div>
-  )
-}
-
 function CheckpointsPanel({ selected }) {
   const [checkpoints, setCheckpoints] = useState([])
   const [msg, setMsg] = useState('')
@@ -818,7 +518,57 @@ function openInEdge(url) {
   }).catch(() => {})
 }
 
-// ReactMarkdown component override: 攔截 FB 連結走 Edge
+// ReactMarkdown component override: 攔截 FB 連結走 Edge、檔案連結走 VSCode
+// 對應 docs/customization/project_roots_schema.md
+
+const FILE_LINK_EXT_PATTERN = /\.(md|txt|cpp|h|hpp|c|inl|cs|java|kt|swift|go|rs|js|jsx|ts|tsx|vue|py|rb|php|json|yaml|yml|toml|ini|html|css|scss|less|uasset|umap|uproject|uplugin|canvas|sql|graphql|proto|sh|bash|bat|ps1)(#L\d+)?$/i
+
+function isFileLink(href) {
+  if (!href) return false
+  if (/^https?:\/\//i.test(href)) return false
+  if (/^vscode:\/\//i.test(href)) return false
+  if (/^mailto:/i.test(href)) return false
+  if (href.startsWith('#')) return false
+  return FILE_LINK_EXT_PATTERN.test(href)
+}
+
+function showTcToast(msg, level = 'info') {
+  const div = document.createElement('div')
+  div.textContent = msg
+  const bg = level === 'error' ? '#dc2626' : level === 'warn' ? '#f59e0b' : '#10b981'
+  div.style.cssText = `position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:10px 18px;border-radius:6px;background:${bg};color:white;font-size:14px;z-index:99999;box-shadow:0 4px 12px rgba(0,0,0,0.3);pointer-events:none;max-width:90vw;`
+  document.body.appendChild(div)
+  setTimeout(() => div.remove(), 2400)
+}
+
+async function openInVSCode(href) {
+  // Parse: foo/bar.md#L42 → relativePath="foo/bar.md", line=42
+  const m = href.match(/^(.+?)(?:#L(\d+))?$/i)
+  if (!m) return
+  const relativePath = m[1]
+  const line = m[2] ? parseInt(m[2], 10) : null
+
+  try {
+    const res = await fetch('/api/open-in-vscode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ relativePath, line }),
+    })
+    if (res.status === 403) {
+      showTcToast('只有 owner 能開檔', 'warn')
+      return
+    }
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}))
+      showTcToast(`開檔失敗：${j.error || res.status}`, 'error')
+      return
+    }
+    showTcToast('已通知 PC VSCode 開檔')
+  } catch (e) {
+    showTcToast(`開檔失敗：${e.message}`, 'error')
+  }
+}
+
 const mdComponents = {
   a({ href, children, ...rest }) {
     if (href && isFacebookUrl(href)) {
@@ -830,6 +580,18 @@ const mdComponents = {
           style={{ touchAction: 'manipulation' }}
           {...rest}>
           {children} <span style={{ fontSize: '0.85em', opacity: 0.7 }}>🌐</span>
+        </a>
+      )
+    }
+    if (href && isFileLink(href)) {
+      return (
+        <a href={href}
+          onClick={e => { e.preventDefault(); openInVSCode(href) }}
+          onTouchEnd={e => { e.preventDefault(); openInVSCode(href) }}
+          title="點擊在 PC VSCode 開檔（僅 owner）"
+          style={{ touchAction: 'manipulation' }}
+          {...rest}>
+          {children} <span style={{ fontSize: '0.85em', opacity: 0.7 }}>📂</span>
         </a>
       )
     }
@@ -1283,7 +1045,7 @@ function ThinkingBlock({ text, fullMessage }) {
   )
 }
 
-function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) {
+function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
   const [projectPath, setProjectPath] = useState('C:/Project/RomanPrototype')
   const [input, setInput] = useState('')
   const [running, setRunning] = useState(false)
@@ -1666,20 +1428,6 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId, onTaskCreated }) 
     const text = (overrideText ?? input).trim()
     const atts = overrideText ? [] : [...attachments]
     if (!text && atts.length === 0) return
-    // /task <title> — 直接建立 task，不送 Claude
-    if (!overrideText && text.startsWith('/task ') && atts.length === 0) {
-      const title = text.slice(6).trim()
-      if (title && selectedId) {
-        await fetch(`/api/sessions/${selectedId}/tasks`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ title, status: 'pending' }),
-        })
-        setMessages(m => [...m, { role: 'system', text: `✓ Task created: ${title}`, ts: Date.now() }])
-        onTaskCreated?.()
-      }
-      setInput('')
-      return
-    }
     // 思考中送出 → 直接送（少爺 2026-04-27 報排隊機制不好用）
     // server / Claude Code CLI 自己處理同 session 重疊請求
     if (!overrideText) { setInput(''); setAttachments([]) }
@@ -2751,29 +2499,12 @@ ${d.links?.length    ? `## 內含外部連結\n${d.links.join('\n')}\n`  : ''}
               onClick={() => setShowAttachMenu(v => !v)}
               disabled={running}
               className="w-9 h-9 md:w-7 md:h-7 flex items-center justify-center rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] hover:border-[var(--gold-border)] transition-colors text-sm disabled:opacity-40 touch-manipulation"
-              title="附加檔案 / 新增任務">+</button>
+              title="附加檔案">+</button>
             {showAttachMenu && (
               <div className="absolute bottom-full left-0 mb-1 w-44 bg-[var(--surface-2)] border border-[var(--border)] rounded shadow-lg z-20 overflow-hidden">
                 <button onClick={() => { fileInputRef.current?.click() }}
                   className="w-full text-left px-3 py-2 text-[10px] text-[var(--text)] hover:bg-[var(--surface)] flex items-center gap-2">
                   <span>⬆</span> Upload from computer
-                </button>
-                <button onClick={() => {
-                  const title = window.prompt('Task title:')
-                  if (title?.trim() && selectedId) {
-                    fetch(`/api/sessions/${selectedId}/tasks`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ title: title.trim(), status: 'pending' }),
-                    }).then(() => {
-                      setMessages(m => [...m, { role: 'system', text: `✓ Task created: ${title.trim()}`, ts: Date.now() }])
-                      onTaskCreated?.()
-                    })
-                  }
-                  setShowAttachMenu(false)
-                }}
-                  className="w-full text-left px-3 py-2 text-[10px] text-[var(--text)] hover:bg-[var(--surface)] flex items-center gap-2 border-t border-[var(--border)]">
-                  <span>✓</span> Add task
                 </button>
               </div>
             )}
@@ -3452,15 +3183,12 @@ function PromptStudioPanel() {
 const TABS = [
   { id: 'chat',      label: 'Chat' },
   { id: 'todos',     label: '待辦' },
+  { id: 'qa',        label: '🧪 QA' },
   { id: 'metrics',   label: '📊 儀表板' },
-  { id: 'tasks',     label: 'Tasks' },
+  { id: 'sommelier', label: '🍷 侍酒師' },
   { id: 'history',   label: 'History' },
   { id: 'prompt',    label: 'Prompt' },
   { id: 'prefs',     label: '規矩' },
-  { id: 'analytics', label: 'Analytics' },
-  { id: 'claudemd',  label: 'CLAUDE.md' },
-  { id: 'agents',    label: 'Agents' },
-  { id: 'mcp',       label: 'MCP' },
 ]
 
 // P2 階段 4c：協作者只能看到分享給他們的卡片，所有個人功能都隱藏
@@ -3472,6 +3200,7 @@ const MOBILE_TABS = [
   { id: 'sessions', label: 'SESSIONS', icon: '◈' },
   { id: 'chat',     label: 'CHAT',     icon: '◻' },
   { id: 'todos',    label: 'TODO',     icon: '✓' },
+  { id: 'qa',       label: 'QA',       icon: '🧪' },
   { id: 'history',  label: 'HISTORY',  icon: '◷' },
   { id: 'more',     label: 'MORE',     icon: '⋯' },
 ]
@@ -3479,6 +3208,9 @@ const MOBILE_TABS = [
 const COLLABORATOR_MOBILE_TABS = [
   { id: 'todos',    label: 'INBOX', icon: '📥' },
 ]
+
+// localStorage / URL 可能殘留已移除分頁的 tab id，採用前須驗證
+const VALID_TAB_IDS = new Set([...TABS, ...COLLABORATOR_TABS, ...MOBILE_TABS, ...COLLABORATOR_MOBILE_TABS].map(t => t.id))
 
 // ─── Mobile components ────────────────────────────────────────────────────────
 
@@ -3585,7 +3317,7 @@ function MobileSessionsPanel({ sessions, selectedId, setSelectedId, setActiveTab
 
 function MobileMorePanel({ selected, send, logs, sessions }) {
   const [sub, setSub] = useState('agent')
-  const SUB = ['agent', 'prompt', 'prefs', 'analytics', 'claude.md', 'agents', 'mcp', 'hooks']
+  const SUB = ['agent', 'prompt', 'prefs', 'hooks']
   return (
     <div className="flex flex-col h-full">
       <div className="flex overflow-x-auto border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
@@ -3620,10 +3352,6 @@ function MobileMorePanel({ selected, send, logs, sessions }) {
         )}
         {sub === 'prompt'    && <PromptStudioPanel />}
         {sub === 'prefs'     && <PreferencesPanel />}
-        {sub === 'analytics' && <AnalyticsPanel sessions={sessions} />}
-        {sub === 'claude.md'  && <ClaudeMdPanel selected={selected} />}
-        {sub === 'agents'     && <AgentsPanel />}
-        {sub === 'mcp'        && <McpPanel />}
         {sub === 'hooks'      && (
           <div className="flex-1 overflow-y-auto px-3 py-1 font-mono text-[10px]">
             {logs.length === 0 && <span className="text-[var(--text-muted)]">Waiting for events…</span>}
@@ -3746,8 +3474,11 @@ export default function App() {
   const [renameVal, setRenameVal] = useState('')
   const [activeTab, setActiveTab] = useState(() => {
     try {
+      // ?tab=qa 深連結（Edge app-mode 視窗用）優先於記憶的 tab
+      const urlTab = new URL(window.location.href).searchParams.get('tab')
+      if (urlTab && VALID_TAB_IDS.has(urlTab)) return urlTab
       const saved = localStorage.getItem('tc_active_tab')
-      if (saved) return saved
+      if (saved && VALID_TAB_IDS.has(saved)) return saved
     } catch {}
     return window.innerWidth < 768 ? 'sessions' : 'chat'
   })
@@ -4062,6 +3793,10 @@ export default function App() {
       }
     }
     if (msg.type === 'log') setLogs(prev => [...prev.slice(-200), msg])
+    // AutoQA Monitor：轉發給 QAMonitorPanel（decoupled，不佔 App state）
+    if (msg.type === 'qa_run_update') {
+      try { window.dispatchEvent(new CustomEvent('tc-qa-run-update', { detail: msg.run })) } catch {}
+    }
     if (msg.type === 'session') {
       // Auto-watch when a session becomes active
       if (msg.session?.status === 'active') autoWatch(msg.session.id)
@@ -4096,7 +3831,8 @@ export default function App() {
     }
     if (msg.type === 'session_remove') {
       setSessions(prev => prev.filter(s => s.id !== msg.sessionId))
-      setSelectedId(prev => prev === msg.sessionId ? null : prev)
+      // 少爺設計原則：CHAT 介面除非主動切換 Session / 從 History 切換聊天室，否則留著。
+      // 故不清 selectedId — 讓使用者繼續看歷史內容，即便該 session 被 server 從 active 清單移除。
     }
     if (msg.type === 'claude_stream' || msg.type === 'session_live') {
       setStreamEvents(prev => [...prev.slice(-200), { ...msg, _arrivalTs: Date.now() }])
@@ -4131,24 +3867,6 @@ export default function App() {
   })
 
   const selected = sessions.find(s => s.id === selectedId)
-
-  function handleGateAction(taskId, action) {
-    send({ type: 'gate', sessionId: selectedId, taskId, action })
-    // Optimistic update
-    setSessions(prev => prev.map(s => {
-      if (s.id !== selectedId) return s
-      function updateTask(tasks) {
-        return tasks.map(t => {
-          if (t.id === taskId && t.gate) {
-            const statusMap = { approve: 'approved', force: 'force', block: 'blocked' }
-            return { ...t, gate: { ...t.gate, status: statusMap[action] ?? action } }
-          }
-          return { ...t, children: updateTask(t.children ?? []) }
-        })
-      }
-      return { ...s, tasks: updateTask(s.tasks) }
-    }))
-  }
 
   // P2 階段 4：邀請接受頁（先擋掉主畫面，受邀者看到的第一個視覺）
   if (acceptingInvite) {
@@ -4369,18 +4087,7 @@ export default function App() {
           {/* Tab content */}
           <div className="flex-1 overflow-hidden min-h-0 flex flex-col">
             {activeTab === 'chat' && (
-              <ChatPanel streamEvents={streamEvents} chatInit={chatInit} logs={logs} selectedId={selectedId}
-                onTaskCreated={() => setActiveTab('tasks')} />
-            )}
-            {activeTab === 'tasks' && (
-              <div className="py-2 px-2 h-full">
-                {selected?.tasks?.length > 0
-                  ? selected.tasks.map(task => (
-                      <TaskNode key={task.id} task={task} onGateAction={handleGateAction} />
-                    ))
-                  : <div className="text-[var(--text-muted)] text-xs text-center mt-8">{selected ? 'No tasks yet' : 'Select a session'}</div>
-                }
-              </div>
+              <ChatPanel streamEvents={streamEvents} chatInit={chatInit} logs={logs} selectedId={selectedId} />
             )}
             {activeTab === 'todos' && (
               <TodoBoard
@@ -4396,14 +4103,12 @@ export default function App() {
                   setActiveTab('chat')
                 }} />
             )}
+            {activeTab === 'qa'      && <QAMonitorPanel selectedSessionId={selectedId} />}
             {activeTab === 'metrics' && <MetricsDashboard />}
+            {activeTab === 'sommelier' && <SommelierPanel />}
             {activeTab === 'history'   && <HistoryPanel onContinue={handleContinueInChat} />}
             {activeTab === 'prompt'    && <PromptStudioPanel />}
             {activeTab === 'prefs'     && <PreferencesPanel />}
-            {activeTab === 'analytics' && <AnalyticsPanel sessions={sessions} />}
-            {activeTab === 'claudemd'  && <ClaudeMdPanel selected={selected} />}
-            {activeTab === 'agents'    && <AgentsPanel />}
-            {activeTab === 'mcp'       && <McpPanel />}
             {/* Mobile-only tabs */}
             {activeTab === 'sessions'  && <MobileSessionsPanel sessions={sessions} selectedId={selectedId} setSelectedId={setSelectedId} setActiveTab={setActiveTab} onContinue={handleContinueInChat} autoResumeMap={autoResumeMap} onToggleAutoResume={toggleAutoResume} hitLimitSessions={hitLimitSessions} historyCosts={historyCosts}
               onCostClick={async s => {
@@ -4479,30 +4184,6 @@ export default function App() {
           <div className="px-3 py-2 border-t border-[var(--border)] flex-1 overflow-y-auto">
             <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] mb-2">Checkpoints</div>
             <CheckpointsPanel selected={selected} />
-          </div>
-
-          {/* Pending gates summary */}
-          <div className="px-3 py-2 border-t border-[var(--border)] shrink-0">
-            <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] mb-2">
-              Pending Gates
-            </div>
-            {(() => {
-              const pending = []
-              function collect(tasks) {
-                for (const t of tasks ?? []) {
-                  if (t.gate?.status === 'pending') pending.push(t)
-                  collect(t.children)
-                }
-              }
-              collect(selected?.tasks)
-              return pending.length === 0
-                ? <div className="text-[10px] text-[var(--text-muted)]">None</div>
-                : pending.map(t => (
-                  <div key={t.id} className="text-[10px] text-amber-400 pulse-amber truncate mb-1">
-                    ◐ {GATE_LABEL[t.gate.id] ?? `Gate ${t.gate.id}`}
-                  </div>
-                ))
-            })()}
           </div>
         </aside>
 

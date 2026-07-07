@@ -130,13 +130,6 @@ app.get('/ws', { websocket: true }, (socket) => {
 })
 
 function handleClientMessage(msg) {
-  if (msg.type === 'gate') {
-    const s = sessions.get(msg.sessionId)
-    if (!s) return
-    updateTaskGate(s.tasks, msg.taskId, msg.action)
-    sessions.set(s.id, s)
-    broadcast({ type: 'session', session: s })
-  }
   if (msg.type === 'input') {
     broadcast({ type: 'log', level: 'user', text: `> ${msg.text}`, ts: Date.now(), sessionId: msg.sessionId })
   }
@@ -190,17 +183,6 @@ function handleClientMessage(msg) {
   }
 }
 
-function updateTaskGate(tasks, taskId, action) {
-  for (const t of tasks ?? []) {
-    if (t.id === taskId && t.gate) {
-      const map = { approve: 'approved', force: 'force', block: 'blocked' }
-      t.gate.status = map[action] ?? action
-      return
-    }
-    updateTaskGate(t.children, taskId, action)
-  }
-}
-
 // ─── Session helpers ──────────────────────────────────────────────────────────
 
 let _persistTimer = null
@@ -217,7 +199,6 @@ function upsertSession(sessionId, patch = {}) {
       displayName: 'Session',
       status: 'active',
       startedAt: Date.now(),
-      tasks: [],
     })
   }
   const s = sessions.get(sessionId)
@@ -538,30 +519,6 @@ app.get('/api/usage/heat', async () => {
   }
 })
 
-app.post('/api/sessions/:id/tasks', async (request) => {
-  const s = upsertSession(request.params.id)
-  const task = { id: `t${Date.now()}`, ...request.body, children: [] }
-  s.tasks.push(task)
-  broadcast({ type: 'session', session: s })
-  return { ok: true, task }
-})
-
-app.patch('/api/sessions/:id/tasks/:tid', async (request) => {
-  const s = sessions.get(request.params.id)
-  if (!s) return { ok: false }
-  patchTask(s.tasks, request.params.tid, request.body)
-  broadcast({ type: 'session', session: s })
-  return { ok: true }
-})
-
-function patchTask(tasks, tid, patch) {
-  for (const t of tasks ?? []) {
-    if (t.id === tid) { Object.assign(t, patch); return true }
-    if (patchTask(t.children, tid, patch)) return true
-  }
-  return false
-}
-
 
 // ─── Session History API ──────────────────────────────────────────────────────
 
@@ -854,41 +811,6 @@ app.post('/api/session/unwatch', async (request) => {
   return { ok: true }
 })
 
-// ─── CLAUDE.md API ────────────────────────────────────────────────────────────
-
-app.get('/api/claudemd', async (request) => {
-  const cwd = request.query.cwd ?? process.cwd()
-  const candidates = [
-    path.join(cwd, 'CLAUDE.md'),
-    path.join(os.homedir(), '.claude', 'CLAUDE.md'),
-  ]
-  const files = []
-  for (const p of candidates) {
-    try {
-      const content = fs.readFileSync(p, 'utf-8')
-      files.push({ path: p, content })
-    } catch {}
-  }
-  return { files }
-})
-
-app.post('/api/claudemd', async (request) => {
-  const { path: filePath, content } = request.body
-  // Only allow writing CLAUDE.md files, block path traversal
-  if (
-    !filePath ||
-    typeof filePath !== 'string' ||
-    filePath.includes('..') ||
-    !path.basename(filePath).match(/^CLAUDE\.md$/i)
-  ) return { ok: false, error: 'invalid path' }
-  try {
-    fs.writeFileSync(filePath, content, 'utf-8')
-    return { ok: true }
-  } catch (e) {
-    return { ok: false, error: e.message }
-  }
-})
-
 // ─── Checkpoints API (git-based) ─────────────────────────────────────────────
 
 // Validate hash: only hex, 7-40 chars
@@ -951,77 +873,6 @@ app.post('/api/checkpoints/restore', async (request) => {
     const r = spawnSync('git', ['checkout', '-b', branchName, hash], { cwd, encoding: 'utf-8' })
     if (r.status !== 0) return { ok: false, error: r.stderr?.trim() }
     return { ok: true, branch: branchName }
-  } catch (e) { return { ok: false, error: e.message } }
-})
-
-// ─── Agents API ───────────────────────────────────────────────────────────────
-
-const AGENTS_DIR = path.join(CLAUDE_DIR, 'agents')
-
-app.get('/api/agents', async () => {
-  const agents = []
-  try {
-    if (!fs.existsSync(AGENTS_DIR)) return { agents }
-    for (const file of fs.readdirSync(AGENTS_DIR)) {
-      if (!file.endsWith('.md')) continue
-      const content = fs.readFileSync(path.join(AGENTS_DIR, file), 'utf-8')
-      const name = file.replace('.md', '')
-      const desc = content.split('\n').find(l => l.trim() && !l.startsWith('#')) ?? ''
-      agents.push({ name, file, desc: desc.slice(0, 80), content })
-    }
-  } catch {}
-  return { agents }
-})
-
-app.post('/api/agents', async (request) => {
-  const { name, content } = request.body
-  if (!name || !content) return { ok: false }
-  try {
-    if (!fs.existsSync(AGENTS_DIR)) fs.mkdirSync(AGENTS_DIR, { recursive: true })
-    fs.writeFileSync(path.join(AGENTS_DIR, `${name}.md`), content, 'utf-8')
-    return { ok: true }
-  } catch (e) { return { ok: false, error: e.message } }
-})
-
-app.delete('/api/agents/:name', async (request) => {
-  // Sanitize: basename only, alphanumeric + dash/underscore
-  const safeName = path.basename(request.params.name).replace(/[^a-zA-Z0-9_\-]/g, '')
-  if (!safeName) return { ok: false, error: 'invalid name' }
-  try {
-    fs.unlinkSync(path.join(AGENTS_DIR, `${safeName}.md`))
-    return { ok: true }
-  } catch (e) { return { ok: false, error: e.message } }
-})
-
-// ─── MCP API ─────────────────────────────────────────────────────────────────
-
-app.get('/api/mcp', async () => {
-  try {
-    const settings = JSON.parse(fs.readFileSync(path.join(CLAUDE_DIR, 'settings.json'), 'utf-8'))
-    return { servers: settings.mcpServers ?? {} }
-  } catch { return { servers: {} } }
-})
-
-app.post('/api/mcp', async (request) => {
-  const { name, config } = request.body
-  if (!name || typeof name !== 'string') return { ok: false, error: 'invalid name' }
-  try {
-    const filePath = path.join(CLAUDE_DIR, 'settings.json')
-    const settings = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
-    settings.mcpServers = settings.mcpServers ?? {}
-    settings.mcpServers[name] = config
-    atomicWriteJson(filePath, settings)
-    return { ok: true }
-  } catch (e) { return { ok: false, error: e.message } }
-})
-
-app.delete('/api/mcp/:name', async (request) => {
-  try {
-    const filePath = path.join(CLAUDE_DIR, 'settings.json')
-    const settings = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
-    delete (settings.mcpServers ?? {})[request.params.name]
-    atomicWriteJson(filePath, settings)
-    return { ok: true }
   } catch (e) { return { ok: false, error: e.message } }
 })
 
@@ -1582,6 +1433,7 @@ function writeTodos(data) { fs.writeFileSync(TODOS_FILE, JSON.stringify(data, nu
 const USER_CONFIG_DIR = path.join(os.homedir(), '.claude', 'tc_user_config')
 const CONFIG_EXAMPLE_DIR = path.join(import.meta.dirname, '..', 'config.example')
 const AUTO_CARD_RULES_FILE = path.join(USER_CONFIG_DIR, 'auto_card_rules.json')
+const PROJECT_ROOTS_FILE = path.join(USER_CONFIG_DIR, 'project_roots.json')
 
 function ensureUserConfig() {
   try {
@@ -2525,6 +2377,400 @@ app.post('/api/open-url', async (request) => {
   } catch (e) {
     return { ok: false, error: e.message }
   }
+})
+
+// ─── Open in VSCode (markdown link handler) ──────────────────────────────────
+// 對應 docs/customization/project_roots_schema.md
+// 對應 memory/feedback_filepath_markdown_format.md
+
+const DEFAULT_PROJECT_ROOTS_CONFIG = {
+  enabled: true,
+  project_roots: [],
+  vscode_cli: 'code',
+  allowed_extensions: ['.md', '.txt', '.cpp', '.h', '.js', '.ts', '.json'],
+  owner_only: true,
+}
+
+let _projectRootsCache = null
+let _projectRootsMtime = 0
+function loadProjectRootsConfig() {
+  try {
+    if (!fs.existsSync(PROJECT_ROOTS_FILE)) return DEFAULT_PROJECT_ROOTS_CONFIG
+    const stat = fs.statSync(PROJECT_ROOTS_FILE)
+    if (_projectRootsCache && stat.mtimeMs === _projectRootsMtime) return _projectRootsCache
+    const parsed = JSON.parse(fs.readFileSync(PROJECT_ROOTS_FILE, 'utf8'))
+    _projectRootsCache = parsed
+    _projectRootsMtime = stat.mtimeMs
+    return parsed
+  } catch (e) {
+    console.error('[loadProjectRootsConfig]', e.message)
+    return DEFAULT_PROJECT_ROOTS_CONFIG
+  }
+}
+
+app.post('/api/open-in-vscode', async (request, reply) => {
+  const cfg = loadProjectRootsConfig()
+  if (!cfg.enabled) { reply.code(503); return { ok: false, error: 'feature disabled' } }
+  if (cfg.owner_only && !requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+
+  const body = request.body ?? {}
+  const relativePath = String(body.relativePath ?? '').trim()
+  const line = (Number.isInteger(body.line) && body.line > 0) ? body.line : null
+
+  if (!relativePath) { reply.code(400); return { ok: false, error: 'missing relativePath' } }
+
+  // Path traversal block
+  if (relativePath.includes('..') || relativePath.startsWith('/') || relativePath.startsWith('\\') || /^[A-Za-z]:/.test(relativePath)) {
+    reply.code(400); return { ok: false, error: 'absolute or traversal path forbidden' }
+  }
+
+  // Extension whitelist
+  const ext = path.extname(relativePath).toLowerCase()
+  if (!cfg.allowed_extensions.includes(ext)) {
+    reply.code(400); return { ok: false, error: `extension ${ext} not in whitelist` }
+  }
+
+  // Find matching project root
+  let absPath = null
+  for (const root of (cfg.project_roots || [])) {
+    const normalizedRoot = path.resolve(root)
+    const candidate = path.resolve(normalizedRoot, relativePath)
+    // Security: candidate must still be inside normalizedRoot
+    if (candidate !== normalizedRoot && !candidate.startsWith(normalizedRoot + path.sep)) continue
+    if (fs.existsSync(candidate)) { absPath = candidate; break }
+  }
+  if (!absPath) { reply.code(404); return { ok: false, error: 'file not found in any project_root' } }
+
+  // Build VSCode arg: code -g <abs>:<line>
+  const target = line ? `${absPath}:${line}` : absPath
+  try {
+    // shell: true 為了 Windows 上 code.cmd / cursor.cmd 等 .cmd 能被 spawn 找到
+    const p = spawn(cfg.vscode_cli, ['-g', target], { detached: true, stdio: 'ignore', shell: true })
+    p.unref()
+    return { ok: true, openedPath: absPath, line }
+  } catch (e) {
+    reply.code(500); return { ok: false, error: e.message }
+  }
+})
+
+// ─── Sommelier(專案名詞圖鑑 — 侍酒師)─────────────────────────────────────────
+// 泛用檢視器:只認 ~/.claude/tc_user_config/sommelier.json 指到的資料目錄,
+// 專案知識資料本身不進 TC repo(工具乾淨化鐵律)。
+
+const SOMMELIER_CONFIG_FILE = path.join(USER_CONFIG_DIR, 'sommelier.json')
+
+function readSommelierConfig() {
+  try { return JSON.parse(fs.readFileSync(SOMMELIER_CONFIG_FILE, 'utf8')) } catch { return { version: 1, projects: [] } }
+}
+
+app.get('/api/sommelier/projects', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const cfg = readSommelierConfig()
+  return { ok: true, projects: (cfg.projects ?? []).map(p => ({ id: p.id, name: p.name })) }
+})
+
+app.get('/api/sommelier/data/:projectId', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const cfg = readSommelierConfig()
+  const proj = (cfg.projects ?? []).find(p => p.id === request.params.projectId)
+  if (!proj) { reply.code(404); return { ok: false, error: 'unknown project' } }
+  const file = path.join(proj.dataDir, 'generated', 'cpp_symbols.json')
+  try {
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'))
+    return { ok: true, data, extractCommand: proj.extractCommand ?? null }
+  } catch (e) {
+    reply.code(404)
+    return { ok: false, error: `尚無萃取資料:${e.message}`, hint: proj.extractCommand ?? null }
+  }
+})
+
+// ─── AutoQA Monitor（QA runs — 少爺可視化 QA 介面）───────────────────────────
+// 對應 RomanPrototype/.agent/knowledge/UE5.8_QAToolsets_Plan.md §5.7 + Phase M
+// 三層鐵律：run = 介面層（tc_qa_runs.json，永久保留不做 retention）；
+//           QAP md + sessionDir = 內容層；拼圖 = 元層。
+
+const QA_RUNS_FILE = path.join(os.homedir(), '.claude', 'tc_qa_runs.json')
+const QA_EVENT_TAIL_MAX = 400   // run 只留 timeline 尾段；完整 events.jsonl 在 sessionDir（內容層）
+const QA_ARTIFACT_EXTS = ['.png', '.jpg', '.jpeg', '.log', '.json', '.jsonl', '.txt', '.md']
+
+function readQaRuns() {
+  try { return JSON.parse(fs.readFileSync(QA_RUNS_FILE, 'utf8')) } catch { return { runs: [] } }
+}
+function writeQaRuns(data) { atomicWriteJson(QA_RUNS_FILE, data) }
+function qaBroadcast(run) { broadcast({ type: 'qa_run_update', run }) }
+
+const qaCountdownTimers = new Map()  // runId → timeout handle（倒數 server 端計，斷線不失效）
+
+function qaClearCountdown(runId) {
+  if (qaCountdownTimers.has(runId)) { clearTimeout(qaCountdownTimers.get(runId)); qaCountdownTimers.delete(runId) }
+}
+
+function qaArmCountdown(run) {
+  if (run.status !== 'countdown' || !run.countdownEndsAt) return
+  qaClearCountdown(run.id)
+  qaCountdownTimers.set(run.id, setTimeout(() => {
+    qaCountdownTimers.delete(run.id)
+    const data = readQaRuns()
+    const r = data.runs.find(x => x.id === run.id)
+    if (!r || r.status !== 'countdown') return
+    r.status = 'running'
+    r.startedAt = Date.now()
+    writeQaRuns(data)
+    logEvent('qa.run.autostart', { id: r.id })
+    qaBroadcast(r)
+  }, Math.max(0, run.countdownEndsAt - Date.now())))
+}
+
+// server 重啟後恢復倒數中的 run（timer 不跨進程）
+{
+  const data = readQaRuns()
+  let dirty = false
+  for (const r of data.runs) {
+    if (r.status === 'countdown' && (r.countdownEndsAt ?? 0) <= Date.now()) {
+      r.status = 'running'; r.startedAt = r.startedAt || Date.now(); dirty = true
+    }
+  }
+  if (dirty) writeQaRuns(data)
+  for (const r of data.runs) if (r.status === 'countdown') qaArmCountdown(r)
+}
+
+// Claude 宣告新 run（計畫全文上介面 → 倒數攔截窗口）
+// countdownSecs: >0 倒數自動開跑 / 0 立即開跑 / <0 必等少爺按「立即開跑」
+app.post('/api/qa/runs', async (request) => {
+  const body = request.body ?? {}
+  const countdownSecs = typeof body.countdownSecs === 'number' ? body.countdownSecs : 30
+  const run = {
+    id: `qar${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    topic: body.topic ?? '(untitled)',
+    env: body.env ?? '',
+    commit: body.commit ?? '',
+    boundSessionId: body.boundSessionId ?? null,  // M-6：綁定的 Claude 聊天室 session（會議室預約模式）
+    boundProjectPath: body.boundProjectPath ?? null,  // M-6b：spawn 喚醒需要的 cwd
+    // M-6b 喚醒模式：spawn=server 主動 resume 該聊天室 / monitor=該 session 自掛監看（避免雙重喚醒）/ none
+    wakeMode: ['spawn', 'monitor', 'none'].includes(body.wakeMode) ? body.wakeMode : (body.boundSessionId ? 'spawn' : 'none'),
+    archivedAt: null,
+    requirement: body.requirement ?? '',
+    qapPath: body.qapPath ?? '',
+    sessionDir: body.sessionDir ?? '',   // 絕對路徑；artifact 路由以此為根
+    criteria: Array.isArray(body.criteria) ? body.criteria : [],
+    items: (Array.isArray(body.items) ? body.items : []).map((it, i) => ({
+      id: it.id ?? i + 1, text: it.text ?? '', criteriaRef: it.criteriaRef ?? null,
+      scenario: it.scenario ?? '', status: 'pending', evidenceRefs: [], resultNote: '',
+    })),
+    status: 'announced',
+    countdownSecs,
+    countdownEndsAt: null,
+    createdAt: Date.now(), updatedAt: Date.now(), startedAt: null, finishedAt: null,
+    outcome: null,                        // finished 時：pass / fail / blocked；aborted 走 status
+    anomalies: [],
+    events: [], eventsTotal: 0,
+    comments: [],
+    controls: { pauseRequested: false, abortRequested: false },
+  }
+  if (countdownSecs === 0) { run.status = 'running'; run.startedAt = Date.now() }
+  else if (countdownSecs > 0) { run.status = 'countdown'; run.countdownEndsAt = Date.now() + countdownSecs * 1000 }
+  const data = readQaRuns()
+  data.runs.push(run)
+  writeQaRuns(data)
+  if (run.status === 'countdown') qaArmCountdown(run)
+  logEvent('qa.run.create', { id: run.id, topic: run.topic, status: run.status })
+  qaBroadcast(run)
+  return { ok: true, run }
+})
+
+// 歷史列表（新到舊；?limit=N 預設 50；封存的預設隱藏 ?includeArchived=1 全看）
+// 封存＝介面層移除；run 資料與 sessionDir 內容層永久保留（三層鐵律）
+app.get('/api/qa/runs', async (request) => {
+  const limit = Number(request.query?.limit ?? 50)
+  const includeArchived = request.query?.includeArchived === '1'
+  const data = readQaRuns()
+  const runs = [...data.runs]
+    .filter(r => includeArchived || !r.archivedAt)
+    .sort((a, b) => b.createdAt - a.createdAt).slice(0, limit)
+  return { ok: true, runs }
+})
+
+// 單一 run；?ackComments=1 = Claude 讀走未讀留言（標 seen）
+app.get('/api/qa/runs/:id', async (request, reply) => {
+  const data = readQaRuns()
+  const run = data.runs.find(r => r.id === request.params.id)
+  if (!run) { reply.code(404); return { ok: false, error: 'not found' } }
+  if (request.query?.ackComments === '1') {
+    let dirty = false
+    for (const c of run.comments) if (!c.seenByClaude) { c.seenByClaude = true; dirty = true }
+    // Claude 接手訊號（少爺 2026-07-06：送出 feedback/結案要看到「正在由 Claude 處理」）
+    if (run.claudeAck && run.claudeAck.state === 'pending') { run.claudeAck.state = 'working'; dirty = true }
+    if (run.claudeAck) { run.claudeAck.workingAt = Date.now(); dirty = true }
+    if (dirty) { writeQaRuns(data); qaBroadcast(run) }
+  }
+  return { ok: true, run }
+})
+
+// Claude 推進：狀態 / item 結果 / anomaly / 留言回覆 / pause-abort ack（項目邊界生效）
+app.patch('/api/qa/runs/:id', async (request, reply) => {
+  const data = readQaRuns()
+  const run = data.runs.find(r => r.id === request.params.id)
+  if (!run) { reply.code(404); return { ok: false, error: 'not found' } }
+  const body = request.body ?? {}
+  if (typeof body.status === 'string') {
+    run.status = body.status
+    if (body.status === 'running' && !run.startedAt) run.startedAt = Date.now()
+    if (body.status === 'finished' || body.status === 'aborted') run.finishedAt = Date.now()
+  }
+  if (typeof body.outcome === 'string') run.outcome = body.outcome
+  if (typeof body.sessionDir === 'string') run.sessionDir = body.sessionDir
+  if (typeof body.boundSessionId === 'string') run.boundSessionId = body.boundSessionId
+  if (typeof body.boundProjectPath === 'string') run.boundProjectPath = body.boundProjectPath
+  if (['spawn', 'monitor', 'none'].includes(body.wakeMode)) run.wakeMode = body.wakeMode
+  if (body.item && typeof body.item.id !== 'undefined') {
+    const it = run.items.find(x => x.id === body.item.id)
+    if (it) Object.assign(it, body.item)
+  }
+  // 分支迴圈（少爺 2026-07-06）：不通過 → 同 run 追加驗證任務/準則（不另開 run）
+  if (Array.isArray(body.addItems)) {
+    for (const it of body.addItems) run.items.push({
+      id: it.id ?? (run.items.length ? Math.max(...run.items.map(x => x.id)) + 1 : 1),
+      text: it.text ?? '', criteriaRef: it.criteriaRef ?? null, scenario: it.scenario ?? '',
+      status: 'pending', evidenceRefs: [], resultNote: '',
+    })
+  }
+  if (Array.isArray(body.addCriteria)) for (const c of body.addCriteria) run.criteria.push(c)
+  // 回到待放行（分支重列任務完成 → ▶ 重新出現）時清掉處理中指示（換少爺審）
+  if (body.status === 'announced') run.claudeAck = null
+  if (body.anomaly) run.anomalies.push({ t: Date.now(), ...body.anomaly })
+  if (body.commentReply && typeof body.commentReply.index === 'number') {
+    const c = run.comments[body.commentReply.index]
+    if (c) c.reply = String(body.commentReply.text ?? '')
+  }
+  if (body.ackPause) { run.controls.pauseRequested = false; run.status = 'paused' }
+  if (body.ackAbort) { run.controls.abortRequested = false; run.status = 'aborted'; run.finishedAt = Date.now() }
+  // 封存 / 還原（介面層移除；資料永久保留）
+  if (body.archived === true) run.archivedAt = Date.now()
+  if (body.archived === false) run.archivedAt = null
+  // Claude 的任何 PATCH＝正在處理（少爺可視的接手/活動訊號）
+  if (run.claudeAck) { if (run.claudeAck.state === 'pending') run.claudeAck.state = 'working'; run.claudeAck.workingAt = Date.now() }
+  // 少爺引導語（2026-07-07：接手後換成告訴少爺當下該做什麼，如「請 PIE 後將 Feedback 填入留言」；空字串=清除）
+  if (typeof body.guidance === 'string') run.guidance = body.guidance ? { text: body.guidance, t: Date.now() } : null
+  run.updatedAt = Date.now()
+  writeQaRuns(data)
+  qaBroadcast(run)
+  return { ok: true, run }
+})
+
+// Claude 批次事件（timeline 尾段上牆；完整 events.jsonl 在 sessionDir）
+app.post('/api/qa/runs/:id/events', async (request, reply) => {
+  const data = readQaRuns()
+  const run = data.runs.find(r => r.id === request.params.id)
+  if (!run) { reply.code(404); return { ok: false, error: 'not found' } }
+  const events = Array.isArray(request.body?.events) ? request.body.events : []
+  run.events.push(...events)
+  run.eventsTotal += events.length
+  if (run.events.length > QA_EVENT_TAIL_MAX) run.events = run.events.slice(-QA_EVENT_TAIL_MAX)
+  run.updatedAt = Date.now()
+  writeQaRuns(data)
+  qaBroadcast(run)
+  return { ok: true, eventsTotal: run.eventsTotal }
+})
+
+// M-6b：少爺控制動作 → server 主動喚醒綁定的聊天室（wakeMode='spawn' 時）
+// 走既有 /api/claude/run 機器：busy → 排隊；idle → spawnClaude resume 該 session
+const QA_WAKE_ACTIONS = { 'start-now': '按了「▶ 立即開跑」→ 請進入階段二（埋 LOG + 雙編譯 + 重啟 Editor）', pause: '要求暫停', resume: '要求繼續', abort: '要求中止', comment: '留言', close: '按了「✔ 結案」→ 請進入階段五（清 QAC LOG + 雙編譯 + 重啟 Editor；無頭 session 啟動 Editor 必用 Start-Process detached）' }
+function qaWakeBoundSession(run, action, text) {
+  try {
+    if (!run.boundSessionId || !['spawn', 'cli'].includes(run.wakeMode)) return
+    const detail = QA_WAKE_ACTIONS[action] ?? action
+    const prompt = `(TC QA 聯動通知) 少爺在 QA Monitor 對 run「${run.topic}」(${run.id}) ${detail}${text ? `：「${text}」` : ''}。請照 Mode C 流程繼續（QA/README.md §Mode C）。`
+    const projectPath = (run.boundProjectPath ?? 'C:/Project/RomanPrototype').replace(/\//g, path.sep)
+    if (!isSafeCwd(projectPath)) return
+    // wakeMode 'cli'（少爺 2026-07-06）：開「可視的互動式 Claude CLI 視窗」resume 該聊天室 —
+    // 同一顆 claude 執行檔，非 -p 無頭管線 → 少爺能直接看到處理過程（黑視窗問題的解）
+    if (run.wakeMode === 'cli') {
+      const _exe = getClaudeExe().replace(/'/g, "''")
+      const _path = projectPath.replace(/'/g, "''")
+      const _prompt = prompt.replace(/'/g, "''")
+      const _ps = `Start-Process -FilePath '${_exe}' -WorkingDirectory '${_path}' -ArgumentList '--resume','${run.boundSessionId}','${_prompt}'`
+      const p = spawn('powershell.exe', ['-NoProfile', '-Command', _ps], { detached: true, stdio: 'ignore' })
+      p.unref()
+      logEvent('qa.wake.cli', { id: run.id, action, sessionId: run.boundSessionId })
+      return
+    }
+    const existing = claudeProcs.get(projectPath)
+    if (existing?.status === 'running') {
+      let q = claudeRunQueue.get(projectPath)
+      if (!q) { q = []; claudeRunQueue.set(projectPath, q) }
+      q.push({ prompt, sessionId: run.boundSessionId })
+      logEvent('qa.wake.queued', { id: run.id, action, sessionId: run.boundSessionId })
+    } else {
+      spawnClaude(projectPath, prompt, run.boundSessionId)
+      logEvent('qa.wake.spawned', { id: run.id, action, sessionId: run.boundSessionId })
+    }
+  } catch (e) { logEvent('qa.wake.error', { id: run.id, action, error: String(e?.message ?? e) }) }
+}
+
+// 少爺控制：start-now / pause / resume / abort / comment / close
+// pause / abort 對跑動中的 run 只立 flag，由 emitter 在「項目邊界」執行後 ack（狀態乾淨、不硬斷 PIE）
+app.post('/api/qa/runs/:id/control', async (request, reply) => {
+  const data = readQaRuns()
+  const run = data.runs.find(r => r.id === request.params.id)
+  if (!run) { reply.code(404); return { ok: false, error: 'not found' } }
+  const { action, text, itemId } = request.body ?? {}
+  if (action === 'start-now') {
+    if (run.status === 'announced' || run.status === 'countdown') {
+      qaClearCountdown(run.id)
+      run.status = 'running'; run.startedAt = run.startedAt || Date.now(); run.countdownEndsAt = null
+    }
+  } else if (action === 'pause') {
+    if (run.status === 'countdown' || run.status === 'announced') {
+      qaClearCountdown(run.id)
+      run.status = 'announced'; run.countdownEndsAt = null   // 凍結宣告態，等少爺再按開跑
+    } else if (run.status === 'running') run.controls.pauseRequested = true
+  } else if (action === 'resume') {
+    if (run.status === 'paused') run.status = 'running'
+    run.controls.pauseRequested = false
+  } else if (action === 'abort') {
+    if (run.status === 'announced' || run.status === 'countdown') {
+      qaClearCountdown(run.id)
+      run.status = 'aborted'; run.finishedAt = Date.now()
+    } else run.controls.abortRequested = true
+  } else if (action === 'comment') {
+    run.comments.push({ t: Date.now(), itemId: itemId ?? null, text: String(text ?? ''), seenByClaude: false, reply: null })
+  } else if (action === 'close') {
+    // 少爺結案（第五階段觸發訊號）：已完成/已中止 → 結案；Claude 收到通知後清 QAC LOG + 雙編譯
+    if (run.status === 'finished' || run.status === 'aborted') { run.status = 'closed'; run.closedAt = Date.now() }
+    else { reply.code(400); return { ok: false, error: `cannot close run in status ${run.status}` } }
+  } else { reply.code(400); return { ok: false, error: `unknown action ${action}` } }
+  // 少爺動作 → 顯示「等待 Claude 接手」（Claude 第一次 API 觸碰時翻成 working — 見 PATCH/events/ackComments）
+  run.claudeAck = { action, t: Date.now(), state: 'pending' }
+  // 少爺推進了狀態 → 上一階段的引導語過期；留言＝Feedback 送達（2026-07-07 少爺：送出後要顯示新階段、不是還掛「請進 PIE」）
+  if (action !== 'comment') run.guidance = null
+  else run.guidance = { text: 'Feedback 已送出，等待 Claude 讀取分析…', t: Date.now() }
+  run.updatedAt = Date.now()
+  writeQaRuns(data)
+  logEvent('qa.run.control', { id: run.id, action })
+  qaBroadcast(run)
+  qaWakeBoundSession(run, action, action === 'comment' ? String(text ?? '') : '')
+  return { ok: true, run }
+})
+
+// 白名單靜態檔（截圖 / log 切片）：只允許 run.sessionDir 內 + 副檔名白名單
+app.get('/api/qa/runs/:id/artifact', async (request, reply) => {
+  const data = readQaRuns()
+  const run = data.runs.find(r => r.id === request.params.id)
+  if (!run || !run.sessionDir) { reply.code(404); return { ok: false, error: 'run or sessionDir not found' } }
+  const rel = String(request.query?.path ?? '')
+  if (!rel || rel.includes('..') || path.isAbsolute(rel)) { reply.code(400); return { ok: false, error: 'bad path' } }
+  const ext = path.extname(rel).toLowerCase()
+  if (!QA_ARTIFACT_EXTS.includes(ext)) { reply.code(400); return { ok: false, error: `ext ${ext} not allowed` } }
+  const root = path.resolve(run.sessionDir)
+  const abs = path.resolve(root, rel)
+  if (abs !== root && !abs.startsWith(root + path.sep)) { reply.code(400); return { ok: false, error: 'traversal forbidden' } }
+  if (!fs.existsSync(abs)) { reply.code(404); return { ok: false, error: 'file not found' } }
+  const mime = ext === '.png' ? 'image/png'
+    : (ext === '.jpg' || ext === '.jpeg') ? 'image/jpeg'
+    : ext === '.json' ? 'application/json'
+    : 'text/plain; charset=utf-8'
+  reply.type(mime)
+  return fs.readFileSync(abs)
 })
 
 // ─── Start ────────────────────────────────────────────────────────────────────
