@@ -2477,11 +2477,69 @@ app.get('/api/sommelier/data/:projectId', async (request, reply) => {
   const file = path.join(proj.dataDir, 'generated', 'cpp_symbols.json')
   try {
     const data = JSON.parse(fs.readFileSync(file, 'utf8'))
-    return { ok: true, data, extractCommand: proj.extractCommand ?? null }
+    // 架構 canvas 層（第二血肉骨架，選配）：合流 + 建 symbol→canvas 反查索引
+    let arch = null
+    const symbolCanvasIndex = {}
+    try {
+      arch = JSON.parse(fs.readFileSync(path.join(proj.dataDir, 'generated', 'arch_canvas.json'), 'utf8'))
+      for (const c of arch.canvases ?? [])
+        for (const n of c.nodes ?? [])
+          for (const ref of n.symbolRefs ?? []) {
+            (symbolCanvasIndex[ref.name] ??= []).push({
+              canvas: c.file, canvasTitle: c.title,
+              nodeId: n.id, nodeTitle: n.title, confidence: ref.confidence,
+            })
+          }
+    } catch { /* arch_canvas.json 不存在 → 只回骨架層,前端優雅降級 */ }
+    // 拼圖 memory 層（第三血肉，選配）：合流 + 建 symbol→memory 反查索引
+    let memory = null
+    const symbolMemoryIndex = {}
+    try {
+      memory = JSON.parse(fs.readFileSync(path.join(proj.dataDir, 'generated', 'memory_notes.json'), 'utf8'))
+      for (const n of memory.notes ?? [])
+        for (const ref of n.symbolRefs ?? []) {
+          (symbolMemoryIndex[ref.name] ??= []).push({ name: n.name, title: n.title, type: n.type })
+        }
+    } catch { /* memory_notes.json 不存在 → 只回前兩層 */ }
+    // 藍圖資產層（第四血肉，選配，需 Editor 側 extract_asset_graph.py 產出）：
+    // 合流 + 建 C++ 類 → 繼承它的 BP 反查索引（parentName 去 U/A/I/F/E 前綴對回 cpp symbol）
+    let assetGraph = null
+    const symbolBpIndex = {}
+    try {
+      assetGraph = JSON.parse(fs.readFileSync(path.join(proj.dataDir, 'generated', 'asset_graph.json'), 'utf8'))
+      const cppNames = new Set((data.symbols ?? []).map(s => s.name))
+      const resolveCpp = (pn) => {
+        if (!pn) return null
+        if (cppNames.has(pn)) return pn
+        for (const pre of ['U', 'A', 'I', 'F', 'E']) if (cppNames.has(pre + pn)) return pre + pn
+        return null
+      }
+      for (const bp of assetGraph.blueprints ?? []) {
+        if (bp.parentKind !== 'cpp') continue
+        const sym = resolveCpp(bp.parentName)
+        if (sym) (symbolBpIndex[sym] ??= []).push({ name: bp.name, path: bp.path, class: bp.class })
+      }
+    } catch { /* asset_graph.json 不存在 → 前三層照回,前端優雅降級 */ }
+    return { ok: true, data, arch, symbolCanvasIndex, memory, symbolMemoryIndex, assetGraph, symbolBpIndex, extractCommand: proj.extractCommand ?? null }
   } catch (e) {
     reply.code(404)
     return { ok: false, error: `尚無萃取資料:${e.message}`, hint: proj.extractCommand ?? null }
   }
+})
+
+// 重萃取（第五階段閉環）：跑 project extractCommand（離線三萃取器 cpp/arch/memory）。
+// 藍圖資產層 asset_graph 需 Editor 側 execute_python（extract_asset_graph.py），不在此端點。
+app.post('/api/sommelier/refresh/:projectId', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const cfg = readSommelierConfig()
+  const proj = (cfg.projects ?? []).find(p => p.id === request.params.projectId)
+  if (!proj?.extractCommand) { reply.code(404); return { ok: false, error: 'no extractCommand for project' } }
+  try {
+    const r = spawnSync(proj.extractCommand, { shell: true, encoding: 'utf8', timeout: 180000 })
+    const ok = r.status === 0
+    logEvent('sommelier.refresh', { projectId: proj.id, ok, code: r.status })
+    return { ok, code: r.status, stdout: (r.stdout || '').slice(-2000), stderr: (r.stderr || '').slice(-800) }
+  } catch (e) { reply.code(500); return { ok: false, error: e.message } }
 })
 
 // ─── AutoQA Monitor（QA runs — 少爺可視化 QA 介面）───────────────────────────
@@ -2674,7 +2732,7 @@ app.post('/api/qa/runs/:id/events', async (request, reply) => {
 
 // M-6b：少爺控制動作 → server 主動喚醒綁定的聊天室（wakeMode='spawn' 時）
 // 走既有 /api/claude/run 機器：busy → 排隊；idle → spawnClaude resume 該 session
-const QA_WAKE_ACTIONS = { 'start-now': '按了「▶ 立即開跑」→ 請進入階段二（埋 LOG + 雙編譯 + 重啟 Editor）', pause: '要求暫停', resume: '要求繼續', abort: '要求中止', comment: '留言', close: '按了「✔ 結案」→ 請進入階段五（清 QAC LOG + 雙編譯 + 重啟 Editor；無頭 session 啟動 Editor 必用 Start-Process detached）' }
+const QA_WAKE_ACTIONS = { 'start-now': '按了「▶ 立即開跑」→ 請進入階段二（埋 LOG + 雙編譯 + 重啟 Editor）', pause: '要求暫停', resume: '要求繼續', abort: '要求中止', comment: '留言', close: '按了「✔ 結案」→ 階段五（清 QAC LOG + 雙編譯 + 重啟 Editor；無頭啟動 Editor 用 Start-Process detached）＋維護侍酒師閉環：把本 run 需求「實作驗證後的收斂」沉澱回四種血肉（C++ code / 架構 canvas / 拼圖 memory；藍圖 md 暫跳過），Editor 開著時跑 extract_asset_graph.py 更新藍圖資產層，最後 POST /api/sommelier/refresh/roman 重萃取讓侍酒師吃到最新拼圖' }
 function qaWakeBoundSession(run, action, text) {
   try {
     if (!run.boundSessionId || !['spawn', 'cli'].includes(run.wakeMode)) return

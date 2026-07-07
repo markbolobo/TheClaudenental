@@ -85,6 +85,23 @@ function composePrompt(draft, items) {
     const commits = [...new Set(items.map(i => i.commit).filter(Boolean))]
     lines.push(`── 🍷 侍酒師選件(${proj}${commits.length ? ' @ ' + commits.join(', ') : ''})──`)
     items.forEach((it, idx) => {
+      if (it.nodeKind === 'archNode') {
+        lines.push(`${idx + 1}. 【系統節點】${it.nodeTitle} — ${it.canvasTitle}`)
+        if (it.text) lines.push(`   設計說明: ${it.text.replace(/\n+/g, ' / ').slice(0, 400)}`)
+        if (it.symbolRefs?.length) lines.push(`   關聯符號: ${it.symbolRefs.join(', ')}`)
+        return
+      }
+      if (it.nodeKind === 'memoryNote') {
+        lines.push(`${idx + 1}. 【拼圖】${it.noteTitle}（${it.noteType}）`)
+        if (it.description) lines.push(`   摘要: ${it.description}`)
+        if (it.text) lines.push(`   內容: ${it.text.replace(/\n+/g, ' / ').slice(0, 500)}`)
+        return
+      }
+      if (it.nodeKind === 'bp') {
+        lines.push(`${idx + 1}. 【藍圖】${it.bpName}（${it.bpClass}）繼承 ${it.parentName ?? '?'}`)
+        if (it.deps?.length) lines.push(`   引用資產: ${it.deps.slice(0, 14).map(d => `${d.class}:${d.name}`).join(', ')}`)
+        return
+      }
       const head = it.member
         ? `${it.symbol}::${it.member} — ${MEMBER_LABEL[it.kind] ?? it.kind}${it.reflected === false ? '(非反射)' : ''}`
         : `${it.symbol} — ${KIND_META[it.kind]?.label ?? it.kind}`
@@ -98,7 +115,368 @@ function composePrompt(draft, items) {
   return lines.join('\n')
 }
 
-export function SommelierPanel() {
+// Obsidian Canvas 顏色（1-6）→ 視覺色點
+const CANVAS_COLOR = { '1': '#e05555', '2': '#e0954f', '3': '#d9c74f', '4': '#6fc74f', '5': '#4faec7', '6': '#a86fc7' }
+const archNodeKey = (pid, canvasFile, nodeId) => `${pid}:arch:${canvasFile}:${nodeId}`
+
+// 🗺️ 架構關聯視圖 — canvas → node → 逛關聯（node→node）+ 引用符號跳骨架
+function ArchView({ arch, projectId, onJumpToSymbol, cartKeys, onToggleNodeCart }) {
+  const canvases = arch?.canvases ?? []
+  const [canvasFile, setCanvasFile] = useState(canvases[0]?.file ?? null)
+  const [nodeId, setNodeId] = useState(null)
+
+  const canvas = canvases.find(c => c.file === canvasFile)
+  const node = canvas?.nodes.find(n => n.id === nodeId)
+  const nodeEdges = useMemo(() => {
+    if (!canvas || !node) return { out: [], in: [] }
+    return {
+      out: canvas.edges.filter(e => e.fromId === node.id),
+      in: canvas.edges.filter(e => e.toId === node.id),
+    }
+  }, [canvas, node])
+
+  if (!canvases.length) return (
+    <div className="flex-1 flex items-center justify-center text-[var(--text-muted)] text-xs px-6 text-center">
+      尚無架構 canvas 資料 — 在 sommelier.json 該專案加 canvasDir 後跑刷新指令
+    </div>
+  )
+
+  return (
+    <div className="flex-1 flex min-h-0">
+      {/* 左：canvas 清單 */}
+      <div className="w-56 shrink-0 border-r border-[var(--border)] overflow-y-auto p-2">
+        <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70 px-1 mb-1">架構 Canvas（{canvases.length}）</div>
+        {canvases.map(c => (
+          <button key={c.file} onClick={() => { setCanvasFile(c.file); setNodeId(null) }}
+            className={`w-full text-left px-2 py-1 rounded text-[11px] flex items-center gap-1.5 mb-0.5 ${canvasFile === c.file ? 'bg-[var(--gold)]/10 text-[var(--gold)]' : 'text-[var(--text)] hover:bg-[var(--surface)]'}`}>
+            <span className="truncate flex-1">{c.title}</span>
+            <span className="text-[8px] text-[var(--text-muted)] shrink-0">{c.nodeCount}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* 中：node 清單 */}
+      <div className="w-64 shrink-0 border-r border-[var(--border)] overflow-y-auto p-2">
+        {canvas?.nodes.filter(n => n.kind === 'text' || n.kind === 'group').map(n => (
+          <button key={n.id} onClick={() => setNodeId(n.id)}
+            className={`w-full text-left px-2 py-1 rounded text-[11px] flex items-center gap-1.5 mb-0.5 ${nodeId === n.id ? 'bg-[var(--gold)]/10 text-[var(--gold)]' : 'text-[var(--text)] hover:bg-[var(--surface)]'}`}>
+            {n.color && <span className="w-2 h-2 rounded-full shrink-0" style={{ background: CANVAS_COLOR[n.color] ?? '#888' }} />}
+            <span className="truncate flex-1">{n.title}</span>
+            {n.symbolRefs.length > 0 && <span className="text-[8px] text-[var(--text-muted)] shrink-0">{n.symbolRefs.length}⚙</span>}
+          </button>
+        ))}
+      </div>
+
+      {/* 右：node 細節 */}
+      <div className="flex-1 overflow-y-auto p-3 min-w-0">
+        {!node ? (
+          <div className="text-[var(--text-muted)] text-[11px] leading-relaxed max-w-lg mx-auto mt-10 space-y-2">
+            <div className="text-[var(--gold)] text-sm">🗺️ 架構關聯</div>
+            <p>左欄選一張架構 canvas，中欄是它的系統節點。點任一節點看它的<b>設計說明</b>、<b>與其他系統的關聯（edge）</b>、以及它引用的 <b>C++ 符號</b>（可跳回骨架圖鑑）。</p>
+            <p>沿著關聯的箭頭可以在系統之間 node→node 逛。看到相關節點點 🛒 把整個系統節點（含設計說明＋關聯符號）加入選件。</p>
+          </div>
+        ) : (
+          <div className="max-w-3xl space-y-3">
+            {/* 節點頭 */}
+            <div className="flex items-center gap-2 flex-wrap">
+              {node.color && <span className="w-3 h-3 rounded-full shrink-0" style={{ background: CANVAS_COLOR[node.color] ?? '#888' }} />}
+              <code className="text-base text-[var(--text)]">{node.title}</code>
+              <span className="text-[9px] text-[var(--text-muted)]">{canvas.title}</span>
+              <button onClick={() => onToggleNodeCart(canvas, node)}
+                className={`text-[9px] px-1.5 py-0.5 rounded border ${cartKeys.has(archNodeKey(projectId, canvas.file, node.id)) ? 'border-[var(--gold)]/60 text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] hover:border-[var(--gold)]/50'}`}>
+                {cartKeys.has(archNodeKey(projectId, canvas.file, node.id)) ? '🛒✓ 已在購物車' : '🛒 加入系統節點'}
+              </button>
+            </div>
+
+            {/* 設計說明 */}
+            {node.text && (
+              <div className="text-[11px] text-[var(--text)] whitespace-pre-wrap border-l-2 border-[var(--gold)]/30 pl-2 max-h-80 overflow-y-auto">{node.text}</div>
+            )}
+
+            {/* 系統關聯 edges */}
+            {(nodeEdges.out.length > 0 || nodeEdges.in.length > 0) && (
+              <div className="space-y-1">
+                <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">系統關聯（點跳目標節點）</div>
+                {nodeEdges.out.map(e => (
+                  <button key={e.id} onClick={() => setNodeId(e.toId)}
+                    className="w-full text-left text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)] flex items-center gap-1 flex-wrap">
+                    <span className="text-[var(--gold)]/60 shrink-0">→</span>
+                    {e.label && <span className="text-[var(--text)]">[{e.label}]</span>}
+                    <code className="text-[var(--gold)]/80">{e.toTitle}</code>
+                  </button>
+                ))}
+                {nodeEdges.in.map(e => (
+                  <button key={e.id} onClick={() => setNodeId(e.fromId)}
+                    className="w-full text-left text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)] flex items-center gap-1 flex-wrap">
+                    <code className="text-[var(--gold)]/80">{e.fromTitle}</code>
+                    {e.label && <span className="text-[var(--text)]">[{e.label}]</span>}
+                    <span className="text-[var(--gold)]/60 shrink-0">→ 本節點</span>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* 引用的 C++ 符號 */}
+            {node.symbolRefs.length > 0 && (
+              <div className="space-y-1">
+                <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">引用的 C++ 符號（點跳骨架圖鑑）</div>
+                <div className="flex flex-wrap gap-1">
+                  {node.symbolRefs.map(r => (
+                    <button key={r.name} onClick={() => onJumpToSymbol(r.name)} title={`${r.symbolKind} · ${r.confidence}`}
+                      className={`text-[10px] px-1.5 py-0.5 rounded border ${r.confidence === 'backtick' ? 'border-[var(--gold)]/40 text-[var(--gold)]/90' : 'border-[var(--border)] text-[var(--text-muted)]'} hover:border-[var(--gold)] hover:text-[var(--gold)]`}>
+                      <code>{r.name}</code>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+const MEMORY_TYPE_META = {
+  feedback:  { icon: '🧭', label: '紀律回饋' },
+  project:   { icon: '📋', label: '專案進行' },
+  reference: { icon: '📎', label: '參照' },
+  user:      { icon: '👤', label: '業主' },
+  note:      { icon: '📝', label: '筆記' },
+}
+const memoryNoteKey = (pid, noteName) => `${pid}:mem:${noteName}`
+
+// 📓 拼圖視圖 — type 分組 → note → 逛拼圖網（[[link]]）+ 引用符號/canvas 跳轉
+function MemoryView({ memory, projectId, onJumpToSymbol, onJumpToCanvas, cartKeys, onToggleNoteCart }) {
+  const notes = memory?.notes ?? []
+  const [noteName, setNoteName] = useState(null)
+  const [q, setQ] = useState('')
+
+  const byName = useMemo(() => new Map(notes.map(n => [n.name, n])), [notes])
+  const grouped = useMemo(() => {
+    const g = new Map()
+    const ql = q.trim().toLowerCase()
+    for (const n of notes) {
+      if (ql && !n.name.toLowerCase().includes(ql) && !n.title.toLowerCase().includes(ql)
+        && !(n.description ?? '').toLowerCase().includes(ql) && !n.text.toLowerCase().includes(ql)) continue
+      if (!g.has(n.type)) g.set(n.type, [])
+      g.get(n.type).push(n)
+    }
+    return g
+  }, [notes, q])
+
+  const note = noteName ? byName.get(noteName) : null
+
+  if (!notes.length) return (
+    <div className="flex-1 flex items-center justify-center text-[var(--text-muted)] text-xs px-6 text-center">
+      尚無拼圖 memory 資料 — 在 sommelier.json 該專案加 memoryDir 後跑刷新指令
+    </div>
+  )
+
+  return (
+    <div className="flex-1 flex min-h-0">
+      {/* 左：type 分組 + 搜尋 */}
+      <div className="w-72 shrink-0 border-r border-[var(--border)] overflow-y-auto p-2">
+        <input value={q} onChange={e => setQ(e.target.value)} placeholder="搜尋拼圖（名稱/摘要/內文）…"
+          className="w-full bg-transparent border border-[var(--border)] focus:border-[var(--gold)]/60 rounded px-2 py-1 text-[11px] text-[var(--text)] outline-none mb-2" />
+        {[...grouped.entries()].sort((a, b) => b[1].length - a[1].length).map(([type, arr]) => (
+          <div key={type} className="mb-1">
+            <div className="px-1 py-0.5 text-[10px] uppercase tracking-widest text-[var(--gold)]/70">
+              {MEMORY_TYPE_META[type]?.icon} {MEMORY_TYPE_META[type]?.label ?? type} <span className="text-[8px]">({arr.length})</span>
+            </div>
+            {arr.map(n => (
+              <button key={n.name} onClick={() => setNoteName(n.name)}
+                className={`w-full text-left pl-4 pr-2 py-0.5 rounded text-[11px] flex items-center gap-1 ${noteName === n.name ? 'bg-[var(--gold)]/10 text-[var(--gold)]' : 'text-[var(--text)] hover:bg-[var(--surface)]'}`}>
+                <span className="truncate flex-1">{n.title}</span>
+                {n.symbolRefs.length > 0 && <span className="text-[8px] text-[var(--text-muted)] shrink-0">{n.symbolRefs.length}⚙</span>}
+              </button>
+            ))}
+          </div>
+        ))}
+      </div>
+
+      {/* 右：note 細節 */}
+      <div className="flex-1 overflow-y-auto p-3 min-w-0">
+        {!note ? (
+          <div className="text-[var(--text-muted)] text-[11px] leading-relaxed max-w-lg mx-auto mt-10 space-y-2">
+            <div className="text-[var(--gold)] text-sm">📓 拼圖</div>
+            <p>左欄是專案的持久記憶，按類型分組。點任一拼圖看內容、它引用的 <b>C++ 符號</b>與<b>架構 canvas</b>（可跳），以及它連到的<b>其他拼圖</b>（[[link]]，可 node→node 逛拼圖網）。</p>
+            <p>看到相關拼圖點 🛒 加入選件，結帳時把「你我沉澱過的經驗」一起帶進 prompt。</p>
+          </div>
+        ) : (
+          <div className="max-w-3xl space-y-3">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--gold)]/40 text-[var(--gold)]">{MEMORY_TYPE_META[note.type]?.icon} {MEMORY_TYPE_META[note.type]?.label ?? note.type}</span>
+              <code className="text-base text-[var(--text)]">{note.title}</code>
+              <button onClick={() => onToggleNoteCart(note)}
+                className={`text-[9px] px-1.5 py-0.5 rounded border ${cartKeys.has(memoryNoteKey(projectId, note.name)) ? 'border-[var(--gold)]/60 text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] hover:border-[var(--gold)]/50'}`}>
+                {cartKeys.has(memoryNoteKey(projectId, note.name)) ? '🛒✓ 已在購物車' : '🛒 加入拼圖'}
+              </button>
+            </div>
+            {note.description && <div className="text-[10px] text-[var(--text-muted)] italic">{note.description}</div>}
+            {note.text && <div className="text-[11px] text-[var(--text)] whitespace-pre-wrap border-l-2 border-[var(--gold)]/30 pl-2 max-h-96 overflow-y-auto">{note.text}</div>}
+
+            {/* 連到的拼圖 [[links]] — 逛拼圖網 */}
+            {note.memoryLinks.length > 0 && (
+              <div className="space-y-1">
+                <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">連到的拼圖（點跳）</div>
+                <div className="flex flex-wrap gap-1">
+                  {note.memoryLinks.map(l => {
+                    const exists = byName.has(l)
+                    return <button key={l} disabled={!exists} onClick={() => exists && setNoteName(l)}
+                      className={`text-[10px] px-1.5 py-0.5 rounded border ${exists ? 'border-[var(--border)] text-[var(--text-muted)] hover:border-[var(--gold)] hover:text-[var(--gold)]' : 'border-[var(--border)]/40 text-[var(--text-muted)]/40 cursor-default'}`}>
+                      [[{l}]]</button>
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* 引用的 C++ 符號 + 架構 canvas */}
+            {(note.symbolRefs.length > 0 || note.canvasRefs.length > 0) && (
+              <div className="space-y-1">
+                <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">引用（點跳）</div>
+                <div className="flex flex-wrap gap-1">
+                  {note.symbolRefs.map(r => (
+                    <button key={r.name} onClick={() => onJumpToSymbol(r.name)}
+                      className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:border-[var(--gold)] hover:text-[var(--gold)]"><code>{r.name}</code></button>
+                  ))}
+                  {note.canvasRefs.map(c => (
+                    <button key={c.file} onClick={() => onJumpToCanvas(c.file)}
+                      className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--gold)]/30 text-[var(--gold)]/80 hover:border-[var(--gold)]">🗺️ {c.title}</button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+const bpKey = (pid, bpPath) => `${pid}:bp:${bpPath}`
+const ASSET_CLASS_ICON = {
+  Material: '🎨', MaterialInstanceConstant: '🎨', MaterialFunction: '🎨', Texture2D: '🖼',
+  SoundWave: '🔊', SoundCue: '🔊', NiagaraSystem: '✨', NiagaraEmitter: '✨', ParticleSystem: '✨',
+  SkeletalMesh: '🦴', StaticMesh: '📦', AnimMontage: '🎬', AnimSequence: '🎬', PoseSearchDatabase: '🔍', WidgetBlueprint: '🖥',
+}
+
+// 🎨 藍圖資產視圖 — BP 繼承樹（按父類分組）+ 引用的末端資產 + 繼承 C++ 跳骨架
+function AssetView({ assetGraph, projectId, onJumpToSymbol, cartKeys, onToggleBpCart }) {
+  const bps = assetGraph?.blueprints ?? []
+  const [bpPath, setBpPath] = useState(null)
+  const [q, setQ] = useState('')
+  const bp = bps.find(b => b.path === bpPath)
+
+  const grouped = useMemo(() => {
+    const g = new Map()
+    const ql = q.trim().toLowerCase()
+    for (const b of bps) {
+      if (ql && !b.name.toLowerCase().includes(ql) && !(b.parentName ?? '').toLowerCase().includes(ql)) continue
+      const key = b.parentKind === 'cpp' ? `C++ ◆ ${b.parentName}` : b.parentKind === 'bp' ? `BP ◇ ${b.parentName}` : '（無父類）'
+      if (!g.has(key)) g.set(key, [])
+      g.get(key).push(b)
+    }
+    return g
+  }, [bps, q])
+
+  const depsByClass = useMemo(() => {
+    const m = {}
+    for (const d of bp?.deps ?? []) (m[d.class] ??= []).push(d)
+    return m
+  }, [bp])
+
+  if (!bps.length) return (
+    <div className="flex-1 flex items-center justify-center text-[var(--text-muted)] text-xs px-6 text-center">
+      尚無藍圖資產資料 — Editor 開著時跑 extract_asset_graph.py（透過 MCP execute_python）產出 asset_graph.json
+    </div>
+  )
+  const stats = assetGraph?.stats?.byClass ?? {}
+
+  return (
+    <div className="flex-1 flex min-h-0">
+      {/* 左：搜尋 + BP 繼承樹（按父類分組）*/}
+      <div className="w-72 shrink-0 border-r border-[var(--border)] overflow-y-auto p-2">
+        <input value={q} onChange={e => setQ(e.target.value)} placeholder="搜尋藍圖 / 父類…"
+          className="w-full bg-transparent border border-[var(--border)] focus:border-[var(--gold)]/60 rounded px-2 py-1 text-[11px] text-[var(--text)] outline-none mb-2" />
+        {[...grouped.entries()].sort((a, b) => b[1].length - a[1].length).map(([grp, arr]) => (
+          <div key={grp} className="mb-1">
+            <div className="px-1 py-0.5 text-[10px] text-[var(--gold)]/70 truncate">{grp} <span className="text-[8px]">({arr.length})</span></div>
+            {arr.map(b => (
+              <button key={b.path} onClick={() => setBpPath(b.path)}
+                className={`w-full text-left pl-3 pr-2 py-0.5 rounded text-[11px] flex items-center gap-1 ${bpPath === b.path ? 'bg-[var(--gold)]/10 text-[var(--gold)]' : 'text-[var(--text)] hover:bg-[var(--surface)]'}`}>
+                <span className="truncate flex-1">{b.name}</span>
+                {b.deps?.length > 0 && <span className="text-[8px] text-[var(--text-muted)] shrink-0">{b.deps.length}📎</span>}
+              </button>
+            ))}
+          </div>
+        ))}
+      </div>
+
+      {/* 右：BP 細節 或 資產總覽 */}
+      <div className="flex-1 overflow-y-auto p-3 min-w-0">
+        {!bp ? (
+          <div className="text-[var(--text-muted)] text-[11px] leading-relaxed max-w-xl mx-auto mt-8 space-y-3">
+            <div className="text-[var(--gold)] text-sm">🎨 藍圖資產</div>
+            <p>左欄是專案的藍圖，按父類分組（C++ ◆ 可跳骨架圖鑑 / BP ◇ 繼承鏈）。點任一藍圖看它繼承的類、以及它引用的材質 / 音效 / 特效 / Mesh 等末端資產。</p>
+            <div>
+              <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70 mb-1">資產總覽（全專案 {assetGraph?.stats?.totalAssets ?? '?'} 項）</div>
+              <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
+                {Object.entries(stats).slice(0, 18).map(([c, n]) => (
+                  <div key={c} className="flex items-center gap-1 text-[10px]">
+                    <span>{ASSET_CLASS_ICON[c] ?? '·'}</span>
+                    <span className="truncate flex-1 text-[var(--text)]">{c}</span>
+                    <span className="text-[var(--text-muted)]">{n}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="max-w-3xl space-y-3">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--gold)]/40 text-[var(--gold)]">{bp.class}</span>
+              <code className="text-base text-[var(--text)]">{bp.name}</code>
+              <button onClick={() => onToggleBpCart(bp)}
+                className={`text-[9px] px-1.5 py-0.5 rounded border ${cartKeys.has(bpKey(projectId, bp.path)) ? 'border-[var(--gold)]/60 text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] hover:border-[var(--gold)]/50'}`}>
+                {cartKeys.has(bpKey(projectId, bp.path)) ? '🛒✓ 已在購物車' : '🛒 加入藍圖'}
+              </button>
+            </div>
+            <div className="text-[10px] text-[var(--text-muted)]">
+              路徑：<code>{bp.path}</code>
+            </div>
+            {bp.parentName && (
+              <div className="text-[11px]">繼承自：
+                {bp.parentKind === 'cpp'
+                  ? <button onClick={() => onJumpToSymbol(bp.parentName)} className="ml-1 text-[var(--gold)]/90 hover:underline"><code>◆ {bp.parentName}</code>（C++）</button>
+                  : <code className="ml-1 text-[var(--text-muted)]">◇ {bp.parentName}（BP）</code>}
+              </div>
+            )}
+            {/* 引用的末端資產（按類別分組）*/}
+            {bp.deps?.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">引用的末端資產（{bp.deps.length}）</div>
+                {Object.entries(depsByClass).sort((a, b) => b[1].length - a[1].length).map(([cls, arr]) => (
+                  <div key={cls}>
+                    <div className="text-[10px] text-[var(--text-muted)] mb-0.5">{ASSET_CLASS_ICON[cls] ?? '·'} {cls}（{arr.length}）</div>
+                    <div className="flex flex-wrap gap-1">
+                      {arr.map(d => (
+                        <span key={d.path} title={d.path} className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--border)] text-[var(--text)]">{d.name}</span>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {!bp.deps?.length && <div className="text-[10px] text-[var(--text-muted)]">（此藍圖非核心 BP_，未展開末端資產依賴）</div>}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+export function SommelierPanel({ onGoToChat }) {
   const [projects, setProjects] = useState([])
   const [projectId, setProjectId] = useState(null)
   const [payload, setPayload] = useState(null)   // { data, extractCommand }
@@ -106,6 +484,7 @@ export function SommelierPanel() {
   const [loading, setLoading] = useState(true)
   const [query, setQuery] = useState('')
   const [selectedName, setSelectedName] = useState(null)
+  const [mode, setMode] = useState('skeleton')   // skeleton 骨架圖鑑 | arch 架構關聯
   const [collapsed, setCollapsed] = useState(() => new Set())
   const [notice, setNotice] = useState('')
   const searchRef = useRef(null)
@@ -166,6 +545,12 @@ export function SommelierPanel() {
   }, [cartOpen])
 
   const data = payload?.data
+  const arch = payload?.arch
+  const symbolCanvasIndex = payload?.symbolCanvasIndex ?? {}
+  const memory = payload?.memory
+  const symbolMemoryIndex = payload?.symbolMemoryIndex ?? {}
+  const assetGraph = payload?.assetGraph
+  const symbolBpIndex = payload?.symbolBpIndex ?? {}
   const symbols = data?.symbols ?? []
 
   const byName = useMemo(() => {
@@ -277,6 +662,53 @@ export function SommelierPanel() {
     flash(`已加入條目:${sym.name}`, 1500)
   }
 
+  // 架構節點 → 選件（帶設計說明 + 關聯符號）
+  const toggleCartNode = (canvas, node) => {
+    const key = archNodeKey(projectId, canvas.file, node.id)
+    if (cartKeys.has(key)) { setCart(c => c.filter(i => i.key !== key)); return }
+    setCart(c => [...c, {
+      key, project: data?.project, nodeKind: 'archNode',
+      canvas: canvas.file, canvasTitle: canvas.title,
+      nodeTitle: node.title, text: node.text,
+      symbolRefs: node.symbolRefs.map(r => r.name),
+    }])
+    flash(`已加入系統節點：${node.title}`, 1500)
+  }
+
+  // 架構視圖點 C++ 符號 → 跳回骨架圖鑑該條目
+  const jumpToSymbol = (name) => {
+    let target = name
+    if (!byName.has(target))
+      for (const pre of ['U', 'A', 'I', 'F', 'E']) if (byName.has(pre + name)) { target = pre + name; break }
+    if (!byName.has(target)) { flash(`骨架圖鑑中查無 ${name}（可能是非反射 / 未萃取）`); return }
+    setMode('skeleton'); setSelectedName(target); setQuery('')
+  }
+  // 拼圖視圖點 canvas 引用 → 切架構關聯視圖
+  const jumpToCanvas = () => setMode('arch')
+
+  // 拼圖 → 選件（帶摘要 + 內文）
+  const toggleCartNote = (note) => {
+    const key = memoryNoteKey(projectId, note.name)
+    if (cartKeys.has(key)) { setCart(c => c.filter(i => i.key !== key)); return }
+    setCart(c => [...c, {
+      key, project: data?.project, nodeKind: 'memoryNote',
+      noteName: note.name, noteTitle: note.title, noteType: note.type,
+      description: note.description, text: note.text,
+    }])
+    flash(`已加入拼圖：${note.title}`, 1500)
+  }
+
+  // 藍圖 → 選件（帶父類 + 引用資產）
+  const toggleCartBp = (b) => {
+    const key = bpKey(projectId, b.path)
+    if (cartKeys.has(key)) { setCart(c => c.filter(i => i.key !== key)); return }
+    setCart(c => [...c, {
+      key, project: data?.project, nodeKind: 'bp',
+      bpName: b.name, bpClass: b.class, parentName: b.parentName, deps: b.deps ?? [],
+    }])
+    flash(`已加入藍圖：${b.name}`, 1500)
+  }
+
   const composed = useMemo(() => composePrompt(draft, cart), [draft, cart])
 
   const checkout = () => {
@@ -298,13 +730,18 @@ export function SommelierPanel() {
   }
   const sendToChat = async (sessionId, projectPath) => {
     setShowSendMenu(false)
+    const _path = projectPath ?? 'C:/Project/RomanPrototype'
     const r = await fetch('/api/claude/run', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ projectPath: projectPath ?? 'C:/Project/RomanPrototype', prompt: composed, sessionId: sessionId ?? null }),
+      body: JSON.stringify({ projectPath: _path, prompt: composed, sessionId: sessionId ?? null }),
     }).then(r => r.json()).catch(() => ({ ok: false }))
-    flash(r.ok
-      ? (r.queued ? `📨 已排入該聊天室佇列（第 ${r.queuePos} 位）` : (sessionId ? '📨 已送入聊天室 — 到 CHAT 分頁看回應' : '➕ 新聊天室已建立 — 到 CHAT 分頁看回應'))
-      : '送入失敗 — 請改用複製', 6000)
+    if (!r.ok) { flash('送入失敗 — 請改用複製', 6000); return }
+    // 少爺 2026-07-07：送入/開新聊天室＝侍酒師工作完成 → 清空購物車與描述 + 無接縫導到 Chat（同 History Continue）
+    setCart([])
+    setDraft('')
+    setCartOpen(false)
+    flash(r.queued ? `📨 已排入佇列（第 ${r.queuePos} 位）— 已切到 Chat` : '📨 已送入 — 已切到 Chat', 4000)
+    onGoToChat?.({ sessionId: sessionId ?? r.sessionId ?? null, projectPath: _path })
   }
 
   // 成員按 region 分節(維持首次出現順序;無 region 的排最前)
@@ -348,10 +785,18 @@ export function SommelierPanel() {
             </button>
           </>
         )}
+        <div className="flex rounded border border-[var(--border)] overflow-hidden shrink-0">
+          <button onClick={() => setMode('skeleton')} className={`px-2 py-0.5 text-[10px] ${mode === 'skeleton' ? 'bg-[var(--gold)]/20 text-[var(--gold)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'}`}>🍷 骨架圖鑑</button>
+          <button onClick={() => setMode('arch')} className={`px-2 py-0.5 text-[10px] ${mode === 'arch' ? 'bg-[var(--gold)]/20 text-[var(--gold)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'}`}>🗺️ 架構關聯</button>
+          <button onClick={() => setMode('memory')} className={`px-2 py-0.5 text-[10px] ${mode === 'memory' ? 'bg-[var(--gold)]/20 text-[var(--gold)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'}`}>📓 拼圖</button>
+          <button onClick={() => setMode('asset')} className={`px-2 py-0.5 text-[10px] ${mode === 'asset' ? 'bg-[var(--gold)]/20 text-[var(--gold)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'}`}>🎨 藍圖資產</button>
+        </div>
         <div className="flex-1" />
-        <input ref={searchRef} value={query} onChange={e => setQuery(e.target.value)}
-          placeholder="搜尋名詞 / 成員 / 註解(中文可)… 快捷鍵 /"
-          className="w-64 max-w-full bg-transparent border border-[var(--border)] focus:border-[var(--gold)]/60 rounded px-2 py-1 text-[11px] text-[var(--text)] outline-none" />
+        {mode === 'skeleton' && (
+          <input ref={searchRef} value={query} onChange={e => setQuery(e.target.value)}
+            placeholder="搜尋名詞 / 成員 / 註解(中文可)… 快捷鍵 /"
+            className="w-64 max-w-full bg-transparent border border-[var(--border)] focus:border-[var(--gold)]/60 rounded px-2 py-1 text-[11px] text-[var(--text)] outline-none" />
+        )}
         <button onClick={() => setCartOpen(o => !o)}
           className={`text-[11px] px-2 py-1 rounded border ${cart.length ? 'border-[var(--gold)]/60 text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)]'} hover:border-[var(--gold)]`}
           title="選件購物車">
@@ -363,6 +808,16 @@ export function SommelierPanel() {
       {error && <div className="shrink-0 px-3 py-2 text-[10px] text-red-400 whitespace-pre-wrap">{error}</div>}
 
       <div className="flex-1 flex min-h-0">
+        {mode === 'arch' ? (
+          <ArchView arch={arch} projectId={projectId} onJumpToSymbol={jumpToSymbol}
+            cartKeys={cartKeys} onToggleNodeCart={toggleCartNode} />
+        ) : mode === 'memory' ? (
+          <MemoryView memory={memory} projectId={projectId} onJumpToSymbol={jumpToSymbol}
+            onJumpToCanvas={jumpToCanvas} cartKeys={cartKeys} onToggleNoteCart={toggleCartNote} />
+        ) : mode === 'asset' ? (
+          <AssetView assetGraph={assetGraph} projectId={projectId} onJumpToSymbol={jumpToSymbol}
+            cartKeys={cartKeys} onToggleBpCart={toggleCartBp} />
+        ) : (<>
         {/* 左:樹 / 搜尋結果 */}
         <div className="w-72 shrink-0 border-r border-[var(--border)] overflow-y-auto p-2">
           {hits ? (
@@ -475,6 +930,45 @@ export function SommelierPanel() {
                 <div className="mt-2 text-[11px] text-[var(--text)] whitespace-pre-wrap border-l-2 border-[var(--gold)]/30 pl-2">{selected.comment}</div>
               )}
 
+              {/* 🗺️ 架構脈絡：這個符號出現在哪些架構 canvas 系統節點 */}
+              {symbolCanvasIndex[selected.name]?.length > 0 && (
+                <div className="mt-3 space-y-1">
+                  <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">🗺️ 架構脈絡（出現在這些系統節點）</div>
+                  {symbolCanvasIndex[selected.name].map((ref, i) => (
+                    <button key={i} onClick={() => setMode('arch')}
+                      className="block w-full text-left text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)]">
+                      <span className="text-[var(--gold)]/60">{ref.canvasTitle}</span> → {ref.nodeTitle}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* 📓 拼圖脈絡：這個符號沉澱在哪些記憶 */}
+              {symbolMemoryIndex[selected.name]?.length > 0 && (
+                <div className="mt-3 space-y-1">
+                  <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">📓 拼圖脈絡（沉澱在這些記憶）</div>
+                  {symbolMemoryIndex[selected.name].slice(0, 8).map((ref, i) => (
+                    <button key={i} onClick={() => setMode('memory')}
+                      className="block w-full text-left text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)]">
+                      <span className="text-[var(--gold)]/60">{MEMORY_TYPE_META[ref.type]?.icon ?? '📓'}</span> {ref.title}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* 🎨 藍圖脈絡：這個 C++ 類被哪些藍圖繼承 */}
+              {symbolBpIndex[selected.name]?.length > 0 && (
+                <div className="mt-3 space-y-1">
+                  <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">🎨 藍圖脈絡（被這些藍圖繼承）</div>
+                  {symbolBpIndex[selected.name].slice(0, 10).map((ref, i) => (
+                    <button key={i} onClick={() => setMode('asset')}
+                      className="block w-full text-left text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)]">
+                      ◇ {ref.name} <span className="text-[8px]">({ref.class})</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
               {/* 成員(pragma region 分節)*/}
               <div className="mt-3 space-y-3">
                 {regionGroups.map(([region, members]) => (
@@ -502,6 +996,7 @@ export function SommelierPanel() {
           )}
         </div>
 
+        </>)}
         {/* 右:購物車抽屜 */}
         {cartOpen && (
           <div className="absolute inset-y-0 right-0 w-96 max-w-[92vw] z-10 bg-[var(--surface)] border-l border-[var(--gold)]/30 shadow-2xl flex flex-col">
@@ -531,13 +1026,19 @@ export function SommelierPanel() {
                   {cart.map(it => (
                     <div key={it.key} className="flex items-start gap-2 px-2 py-1 rounded border border-[var(--border)]">
                       <span className="text-[9px] text-[var(--text-muted)] w-3 text-center shrink-0">
-                        {it.member ? (MEMBER_ICON[it.kind] ?? '·') : (KIND_META[it.kind]?.icon ?? '◆')}
+                        {it.nodeKind === 'archNode' ? '🗺️' : it.nodeKind === 'memoryNote' ? '📓' : it.nodeKind === 'bp' ? '🎨' : it.member ? (MEMBER_ICON[it.kind] ?? '·') : (KIND_META[it.kind]?.icon ?? '◆')}
                       </span>
                       <div className="flex-1 min-w-0">
                         <code className="text-[10px] text-[var(--text)] break-all">
-                          {it.member ? `${it.symbol}::${it.member}` : it.symbol}
+                          {it.nodeKind === 'archNode' ? it.nodeTitle : it.nodeKind === 'memoryNote' ? it.noteTitle : it.nodeKind === 'bp' ? it.bpName : it.member ? `${it.symbol}::${it.member}` : it.symbol}
                         </code>
-                        {it.comment && <div className="text-[9px] text-[var(--text-muted)] truncate">{it.comment.split('\n')[0]}</div>}
+                        {it.nodeKind === 'archNode'
+                          ? <div className="text-[9px] text-[var(--text-muted)] truncate">{it.canvasTitle}</div>
+                          : it.nodeKind === 'memoryNote'
+                          ? <div className="text-[9px] text-[var(--text-muted)] truncate">{it.description || MEMORY_TYPE_META[it.noteType]?.label}</div>
+                          : it.nodeKind === 'bp'
+                          ? <div className="text-[9px] text-[var(--text-muted)] truncate">{it.bpClass} · 繼承 {it.parentName}</div>
+                          : it.comment && <div className="text-[9px] text-[var(--text-muted)] truncate">{it.comment.split('\n')[0]}</div>}
                       </div>
                       <button onClick={() => setCart(c => c.filter(x => x.key !== it.key))}
                         className="text-[10px] text-[var(--text-muted)] hover:text-red-400 shrink-0" title="移除">✕</button>

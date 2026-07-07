@@ -4105,7 +4105,7 @@ export default function App() {
             )}
             {activeTab === 'qa'      && <QAMonitorPanel selectedSessionId={selectedId} />}
             {activeTab === 'metrics' && <MetricsDashboard />}
-            {activeTab === 'sommelier' && <SommelierPanel />}
+            {activeTab === 'sommelier' && <SommelierPanel onGoToChat={handleContinueInChat} />}
             {activeTab === 'history'   && <HistoryPanel onContinue={handleContinueInChat} />}
             {activeTab === 'prompt'    && <PromptStudioPanel />}
             {activeTab === 'prefs'     && <PreferencesPanel />}
