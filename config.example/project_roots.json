@@ -1,0 +1,29 @@
+{
+  "$schema_version": 1,
+  "$schema_path": "docs/customization/project_roots_schema.md",
+  "$ai_editable": true,
+  "$description": "TheClaudenental — 點 markdown 檔案連結觸發本機 VSCode 開檔的設定。對方 Claude 改造前先讀 $schema_path 對應的 md。",
+
+  "enabled": true,
+
+  "project_roots": [
+    "C:/Project/MyProject"
+  ],
+
+  "vscode_cli": "code",
+
+  "allowed_extensions": [
+    ".md", ".txt",
+    ".cpp", ".h", ".hpp", ".c", ".inl",
+    ".cs", ".java", ".kt", ".swift", ".go", ".rs",
+    ".js", ".jsx", ".ts", ".tsx", ".vue",
+    ".py", ".rb", ".php",
+    ".json", ".yaml", ".yml", ".toml", ".ini", ".env.example",
+    ".html", ".css", ".scss", ".less",
+    ".uasset", ".umap", ".uproject", ".uplugin",
+    ".sql", ".graphql", ".proto",
+    ".sh", ".bash", ".bat", ".ps1"
+  ],
+
+  "owner_only": true
+}
