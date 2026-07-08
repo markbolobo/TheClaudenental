@@ -120,10 +120,22 @@ const CANVAS_COLOR = { '1': '#e05555', '2': '#e0954f', '3': '#d9c74f', '4': '#6f
 const archNodeKey = (pid, canvasFile, nodeId) => `${pid}:arch:${canvasFile}:${nodeId}`
 
 // 🗺️ 架構關聯視圖 — canvas → node → 逛關聯（node→node）+ 引用符號跳骨架
-function ArchView({ arch, projectId, onJumpToSymbol, cartKeys, onToggleNodeCart }) {
+function ArchView({ arch, projectId, query, onJumpToSymbol, cartKeys, onToggleNodeCart }) {
   const canvases = arch?.canvases ?? []
   const [canvasFile, setCanvasFile] = useState(canvases[0]?.file ?? null)
   const [nodeId, setNodeId] = useState(null)
+
+  // 常駐搜尋（query 由父層傳入）：canvas 命中(標題/檔名/含命中節點)、node 命中(標題/內文/引用符號)
+  const ql = (query ?? '').trim().toLowerCase()
+  const nodeMatch = (n) => !ql || (n.title ?? '').toLowerCase().includes(ql) || (n.text ?? '').toLowerCase().includes(ql) || (n.symbolRefs ?? []).some(r => r.name.toLowerCase().includes(ql))
+  const filteredCanvases = ql ? canvases.filter(c => c.title.toLowerCase().includes(ql) || c.file.toLowerCase().includes(ql) || c.nodes.some(nodeMatch)) : canvases
+  // query 有值且當前 canvas 未命中 → 自動跳到第一個命中的 canvas（搜「玩家能力」直達 PlayerAbilities）
+  useEffect(() => {
+    if (ql && filteredCanvases.length && !filteredCanvases.some(c => c.file === canvasFile)) {
+      setCanvasFile(filteredCanvases[0].file); setNodeId(null)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ql])
 
   const canvas = canvases.find(c => c.file === canvasFile)
   const node = canvas?.nodes.find(n => n.id === nodeId)
@@ -145,8 +157,8 @@ function ArchView({ arch, projectId, onJumpToSymbol, cartKeys, onToggleNodeCart 
     <div className="flex-1 flex min-h-0">
       {/* 左：canvas 清單 */}
       <div className="w-56 shrink-0 border-r border-[var(--border)] overflow-y-auto p-2">
-        <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70 px-1 mb-1">架構 Canvas（{canvases.length}）</div>
-        {canvases.map(c => (
+        <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70 px-1 mb-1">架構 Canvas（{filteredCanvases.length}{ql ? `/${canvases.length}` : ''}）</div>
+        {filteredCanvases.map(c => (
           <button key={c.file} onClick={() => { setCanvasFile(c.file); setNodeId(null) }}
             className={`w-full text-left px-2 py-1 rounded text-[11px] flex items-center gap-1.5 mb-0.5 ${canvasFile === c.file ? 'bg-[var(--gold)]/10 text-[var(--gold)]' : 'text-[var(--text)] hover:bg-[var(--surface)]'}`}>
             <span className="truncate flex-1">{c.title}</span>
@@ -157,7 +169,7 @@ function ArchView({ arch, projectId, onJumpToSymbol, cartKeys, onToggleNodeCart 
 
       {/* 中：node 清單 */}
       <div className="w-64 shrink-0 border-r border-[var(--border)] overflow-y-auto p-2">
-        {canvas?.nodes.filter(n => n.kind === 'text' || n.kind === 'group').map(n => (
+        {canvas?.nodes.filter(n => (n.kind === 'text' || n.kind === 'group') && nodeMatch(n)).map(n => (
           <button key={n.id} onClick={() => setNodeId(n.id)}
             className={`w-full text-left px-2 py-1 rounded text-[11px] flex items-center gap-1.5 mb-0.5 ${nodeId === n.id ? 'bg-[var(--gold)]/10 text-[var(--gold)]' : 'text-[var(--text)] hover:bg-[var(--surface)]'}`}>
             {n.color && <span className="w-2 h-2 rounded-full shrink-0" style={{ background: CANVAS_COLOR[n.color] ?? '#888' }} />}
@@ -247,15 +259,14 @@ const MEMORY_TYPE_META = {
 const memoryNoteKey = (pid, noteName) => `${pid}:mem:${noteName}`
 
 // 📓 拼圖視圖 — type 分組 → note → 逛拼圖網（[[link]]）+ 引用符號/canvas 跳轉
-function MemoryView({ memory, projectId, onJumpToSymbol, onJumpToCanvas, cartKeys, onToggleNoteCart }) {
+function MemoryView({ memory, projectId, query, onJumpToSymbol, onJumpToCanvas, cartKeys, onToggleNoteCart }) {
   const notes = memory?.notes ?? []
   const [noteName, setNoteName] = useState(null)
-  const [q, setQ] = useState('')
 
   const byName = useMemo(() => new Map(notes.map(n => [n.name, n])), [notes])
   const grouped = useMemo(() => {
     const g = new Map()
-    const ql = q.trim().toLowerCase()
+    const ql = (query ?? '').trim().toLowerCase()
     for (const n of notes) {
       if (ql && !n.name.toLowerCase().includes(ql) && !n.title.toLowerCase().includes(ql)
         && !(n.description ?? '').toLowerCase().includes(ql) && !n.text.toLowerCase().includes(ql)) continue
@@ -263,7 +274,7 @@ function MemoryView({ memory, projectId, onJumpToSymbol, onJumpToCanvas, cartKey
       g.get(n.type).push(n)
     }
     return g
-  }, [notes, q])
+  }, [notes, query])
 
   const note = noteName ? byName.get(noteName) : null
 
@@ -275,10 +286,8 @@ function MemoryView({ memory, projectId, onJumpToSymbol, onJumpToCanvas, cartKey
 
   return (
     <div className="flex-1 flex min-h-0">
-      {/* 左：type 分組 + 搜尋 */}
+      {/* 左：type 分組（搜尋走常駐搜尋欄）*/}
       <div className="w-72 shrink-0 border-r border-[var(--border)] overflow-y-auto p-2">
-        <input value={q} onChange={e => setQ(e.target.value)} placeholder="搜尋拼圖（名稱/摘要/內文）…"
-          className="w-full bg-transparent border border-[var(--border)] focus:border-[var(--gold)]/60 rounded px-2 py-1 text-[11px] text-[var(--text)] outline-none mb-2" />
         {[...grouped.entries()].sort((a, b) => b[1].length - a[1].length).map(([type, arr]) => (
           <div key={type} className="mb-1">
             <div className="px-1 py-0.5 text-[10px] uppercase tracking-widest text-[var(--gold)]/70">
@@ -362,15 +371,14 @@ const ASSET_CLASS_ICON = {
 }
 
 // 🎨 藍圖資產視圖 — BP 繼承樹（按父類分組）+ 引用的末端資產 + 繼承 C++ 跳骨架
-function AssetView({ assetGraph, projectId, onJumpToSymbol, cartKeys, onToggleBpCart }) {
+function AssetView({ assetGraph, projectId, query, onJumpToSymbol, cartKeys, onToggleBpCart }) {
   const bps = assetGraph?.blueprints ?? []
   const [bpPath, setBpPath] = useState(null)
-  const [q, setQ] = useState('')
   const bp = bps.find(b => b.path === bpPath)
 
   const grouped = useMemo(() => {
     const g = new Map()
-    const ql = q.trim().toLowerCase()
+    const ql = (query ?? '').trim().toLowerCase()
     for (const b of bps) {
       if (ql && !b.name.toLowerCase().includes(ql) && !(b.parentName ?? '').toLowerCase().includes(ql)) continue
       const key = b.parentKind === 'cpp' ? `C++ ◆ ${b.parentName}` : b.parentKind === 'bp' ? `BP ◇ ${b.parentName}` : '（無父類）'
@@ -378,7 +386,7 @@ function AssetView({ assetGraph, projectId, onJumpToSymbol, cartKeys, onToggleBp
       g.get(key).push(b)
     }
     return g
-  }, [bps, q])
+  }, [bps, query])
 
   const depsByClass = useMemo(() => {
     const m = {}
@@ -395,10 +403,8 @@ function AssetView({ assetGraph, projectId, onJumpToSymbol, cartKeys, onToggleBp
 
   return (
     <div className="flex-1 flex min-h-0">
-      {/* 左：搜尋 + BP 繼承樹（按父類分組）*/}
+      {/* 左：BP 繼承樹（按父類分組，搜尋走常駐搜尋欄）*/}
       <div className="w-72 shrink-0 border-r border-[var(--border)] overflow-y-auto p-2">
-        <input value={q} onChange={e => setQ(e.target.value)} placeholder="搜尋藍圖 / 父類…"
-          className="w-full bg-transparent border border-[var(--border)] focus:border-[var(--gold)]/60 rounded px-2 py-1 text-[11px] text-[var(--text)] outline-none mb-2" />
         {[...grouped.entries()].sort((a, b) => b[1].length - a[1].length).map(([grp, arr]) => (
           <div key={grp} className="mb-1">
             <div className="px-1 py-0.5 text-[10px] text-[var(--gold)]/70 truncate">{grp} <span className="text-[8px]">({arr.length})</span></div>
@@ -792,11 +798,13 @@ export function SommelierPanel({ onGoToChat }) {
           <button onClick={() => setMode('asset')} className={`px-2 py-0.5 text-[10px] ${mode === 'asset' ? 'bg-[var(--gold)]/20 text-[var(--gold)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'}`}>🎨 藍圖資產</button>
         </div>
         <div className="flex-1" />
-        {mode === 'skeleton' && (
-          <input ref={searchRef} value={query} onChange={e => setQuery(e.target.value)}
-            placeholder="搜尋名詞 / 成員 / 註解(中文可)… 快捷鍵 /"
-            className="w-64 max-w-full bg-transparent border border-[var(--border)] focus:border-[var(--gold)]/60 rounded px-2 py-1 text-[11px] text-[var(--text)] outline-none" />
-        )}
+        {/* 常駐搜尋欄（四視圖共用；placeholder 隨視圖變）*/}
+        <input ref={searchRef} value={query} onChange={e => setQuery(e.target.value)}
+          placeholder={mode === 'skeleton' ? '搜尋名詞 / 成員 / 註解(中文可)… 快捷鍵 /'
+            : mode === 'arch' ? '搜尋架構 canvas / 節點 / 引用符號…'
+            : mode === 'memory' ? '搜尋拼圖（名稱 / 摘要 / 內文）…'
+            : '搜尋藍圖 / 父類…'}
+          className="w-64 max-w-full bg-transparent border border-[var(--border)] focus:border-[var(--gold)]/60 rounded px-2 py-1 text-[11px] text-[var(--text)] outline-none" />
         <button onClick={() => setCartOpen(o => !o)}
           className={`text-[11px] px-2 py-1 rounded border ${cart.length ? 'border-[var(--gold)]/60 text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)]'} hover:border-[var(--gold)]`}
           title="選件購物車">
@@ -809,13 +817,13 @@ export function SommelierPanel({ onGoToChat }) {
 
       <div className="flex-1 flex min-h-0">
         {mode === 'arch' ? (
-          <ArchView arch={arch} projectId={projectId} onJumpToSymbol={jumpToSymbol}
+          <ArchView arch={arch} projectId={projectId} query={query} onJumpToSymbol={jumpToSymbol}
             cartKeys={cartKeys} onToggleNodeCart={toggleCartNode} />
         ) : mode === 'memory' ? (
-          <MemoryView memory={memory} projectId={projectId} onJumpToSymbol={jumpToSymbol}
+          <MemoryView memory={memory} projectId={projectId} query={query} onJumpToSymbol={jumpToSymbol}
             onJumpToCanvas={jumpToCanvas} cartKeys={cartKeys} onToggleNoteCart={toggleCartNote} />
         ) : mode === 'asset' ? (
-          <AssetView assetGraph={assetGraph} projectId={projectId} onJumpToSymbol={jumpToSymbol}
+          <AssetView assetGraph={assetGraph} projectId={projectId} query={query} onJumpToSymbol={jumpToSymbol}
             cartKeys={cartKeys} onToggleBpCart={toggleCartBp} />
         ) : (<>
         {/* 左:樹 / 搜尋結果 */}
