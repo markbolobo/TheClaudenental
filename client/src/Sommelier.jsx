@@ -482,9 +482,13 @@ function AssetView({ assetGraph, projectId, query, onJumpToSymbol, cartKeys, onT
   )
 }
 
-export function SommelierPanel({ onGoToChat }) {
-  const [projects, setProjects] = useState([])
-  const [projectId, setProjectId] = useState(null)
+export function SommelierPanel({ onGoToChat, projects: projectsProp = null, activeProjectId = null, onSelectProject = null, onManageProjects = null }) {
+  // 跨專案切換：App 傳入共享狀態時用它（與 QA 分頁同步切換）；未傳入則退回面板內自管（獨立使用相容）
+  const [projectsLocal, setProjectsLocal] = useState([])
+  const [projectIdLocal, setProjectIdLocal] = useState(null)
+  const projects = projectsProp ?? projectsLocal
+  const projectId = projectsProp ? activeProjectId : projectIdLocal
+  const setProjectId = projectsProp ? (onSelectProject ?? (() => {})) : setProjectIdLocal
   const [payload, setPayload] = useState(null)   // { data, extractCommand }
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -503,9 +507,21 @@ export function SommelierPanel({ onGoToChat }) {
     try { return JSON.parse(localStorage.getItem(CART_STORE_KEY))?.draft ?? '' } catch { return '' }
   })
   const [cartOpen, setCartOpen] = useState(false)
+  const [attachments, setAttachments] = useState([])  // [{name,dataUrl,type}]：結帳送入聊天室時一併傳給 Claude 分析
+  const attachInputRef = useRef(null)
   useEffect(() => {
     try { localStorage.setItem(CART_STORE_KEY, JSON.stringify({ items: cart, draft })) } catch {}
   }, [cart, draft])
+
+  function handleAttachFiles(e) {
+    const files = Array.from(e.target.files ?? [])
+    for (const file of files) {
+      const reader = new FileReader()
+      reader.onload = ev => setAttachments(prev => [...prev, { name: file.name, dataUrl: ev.target.result, type: file.type }])
+      reader.readAsDataURL(file)
+    }
+    e.target.value = ''
+  }
 
   const flash = useCallback((msg, ms = 4000) => {
     setNotice(msg)
@@ -513,14 +529,22 @@ export function SommelierPanel({ onGoToChat }) {
   }, [])
 
   useEffect(() => {
+    // App 已傳入共享專案清單 → 不重複抓；清單空時顯示設定提示
+    if (projectsProp) {
+      if (projectsProp.length === 0) { setLoading(false); setError('尚未設定任何專案 — 編輯 ~/.claude/tc_user_config/sommelier.json') }
+      return
+    }
     fetch('/api/sommelier/projects').then(r => r.json())
       .then(d => {
-        setProjects(d.projects ?? [])
-        if (d.projects?.length) setProjectId(d.projects[0].id)
+        setProjectsLocal(d.projects ?? [])
+        if (d.projects?.length) setProjectIdLocal(d.projects[0].id)
         else { setLoading(false); setError('尚未設定任何專案 — 編輯 ~/.claude/tc_user_config/sommelier.json') }
       })
       .catch(e => { setLoading(false); setError(String(e)) })
-  }, [])
+  }, [projectsProp])
+
+  // 專案切換（含從 QA 分頁切的）→ 清掉上一專案的選取，避免跨專案殘留
+  useEffect(() => { setSelectedName(null) }, [projectId])
 
   useEffect(() => {
     if (!projectId) return
@@ -739,13 +763,17 @@ export function SommelierPanel({ onGoToChat }) {
     const _path = projectPath ?? 'C:/Project/RomanPrototype'
     const r = await fetch('/api/claude/run', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ projectPath: _path, prompt: composed, sessionId: sessionId ?? null }),
+      body: JSON.stringify({ projectPath: _path, prompt: composed, sessionId: sessionId ?? null, attachments }),
     }).then(r => r.json()).catch(() => ({ ok: false }))
     if (!r.ok) { flash('送入失敗 — 請改用複製', 6000); return }
-    // 少爺 2026-07-07：送入/開新聊天室＝侍酒師工作完成 → 清空購物車與描述 + 無接縫導到 Chat（同 History Continue）
+    // 少爺 2026-07-07：送入/開新聊天室＝侍酒師工作完成 → 清空購物車與描述(+附檔) + 無接縫導到 Chat（同 History Continue）
     setCart([])
     setDraft('')
+    setAttachments([])
     setCartOpen(false)
+    // ⚠️ onGoToChat 會切分頁 unmount Sommelier，[cart,draft] 持久化 effect 可能來不及跑 → 直接同步清 localStorage，
+    // 避免 remount 時 draft 從舊值 re-hydrate（少爺 2026-07-08：cart 清了 draft 沒清的不對稱 bug 根因）
+    try { localStorage.setItem(CART_STORE_KEY, JSON.stringify({ items: [], draft: '' })) } catch {}
     flash(r.queued ? `📨 已排入佇列（第 ${r.queuePos} 位）— 已切到 Chat` : '📨 已送入 — 已切到 Chat', 4000)
     onGoToChat?.({ sessionId: sessionId ?? r.sessionId ?? null, projectPath: _path })
   }
@@ -779,6 +807,10 @@ export function SommelierPanel({ onGoToChat }) {
           </select>
         )}
         {projects.length === 1 && <span className="text-[10px] text-[var(--text)]">{projects[0].name}</span>}
+        {onManageProjects && (
+          <button onClick={onManageProjects} title="高桌會：分館（專案）認可管理"
+            className="text-[10px] px-1 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] hover:border-[var(--gold)]/50">🏛</button>
+        )}
         {data && (
           <>
             <span className={`text-[9px] px-1.5 py-0.5 rounded border ${stale > 7 ? 'border-amber-500/50 text-amber-400' : 'border-[var(--border)] text-[var(--text-muted)]'}`}
@@ -1024,6 +1056,18 @@ export function SommelierPanel({ onGoToChat }) {
                 <textarea value={draft} onChange={e => setDraft(e.target.value)} rows={4}
                   placeholder="例:野蠻人要對玩家套用移動的權重,我想沿用/擴充下面選的機制…"
                   className="w-full bg-transparent border border-[var(--border)] focus:border-[var(--gold)]/60 rounded px-2 py-1.5 text-[11px] text-[var(--text)] outline-none resize-y" />
+                {/* 附加檔案給 Claude 分析(仿 CHAT Upload from computer;結帳送入聊天室時一併傳) */}
+                <div className="mt-1 flex flex-wrap items-center gap-1">
+                  <button onClick={() => attachInputRef.current?.click()}
+                    className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] hover:border-[var(--gold)]/60">⬆ 附加檔案</button>
+                  <input ref={attachInputRef} type="file" multiple accept="image/*,.pdf,.txt,.md,.json,.csv" className="hidden" onChange={handleAttachFiles} />
+                  {attachments.map((a, i) => (
+                    <span key={i} className="text-[9px] px-1.5 py-0.5 rounded bg-[var(--surface)] border border-[var(--border)] text-[var(--text)] flex items-center gap-1">
+                      📎 {a.name}
+                      <button onClick={() => setAttachments(prev => prev.filter((_, j) => j !== i))} className="text-[var(--text-muted)] hover:text-red-400" title="移除">✕</button>
+                    </span>
+                  ))}
+                </div>
               </div>
 
               {/* 選件列表 */}

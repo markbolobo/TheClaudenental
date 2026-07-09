@@ -3180,15 +3180,117 @@ function PromptStudioPanel() {
   )
 }
 
+// ─── 高桌會（The High Table）：分館（專案）認可管理 ─────────────────────────
+// 認可的分館出現在仕酒師與 QA 的下拉選單；除聖（Deconsecrated）只從介面移除，資料與設定永久保留。
+// 專案庫 SSOT = ~/.claude/tc_user_config/sommelier.json（工具乾淨化：專案資料不進 TC repo）
+function HighTableModal({ onClose, onChanged }) {
+  const [list, setList] = useState(null)   // null = 載入中
+  const [picked, setPicked] = useState(null)   // { path, name, candidates }：選好的專案資料夾（path/name 皆可改）
+  const [err, setErr] = useState('')
+  const reload = useCallback(() => {
+    fetch('/api/projects/registry').then(r => r.json())
+      .then(d => { if (d.ok) setList(d.projects ?? []); else setErr(d.error ?? '讀取失敗') })
+      .catch(e => setErr(String(e)))
+  }, [])
+  useEffect(() => { reload() }, [reload])
+
+  async function toggle(p) {
+    await fetch(`/api/projects/registry/${p.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: !p.enabled }) }).catch(() => {})
+    reload(); onChanged?.()
+  }
+  // 開館 Step 1：瀏覽器原生選資料夾（同 CHAT「Upload from computer」族的 Windows 選擇視窗）
+  // → 資料夾名稱自動成為暫定顯示名稱（可改）；瀏覽器不給絕對路徑 → server 按名稱在 project_roots 反查
+  async function browse() {
+    setErr('')
+    if (!window.showDirectoryPicker) { setPicked({ path: '', name: '', candidates: [] }); return }  // 手機/非安全來源不支援 → 手動填
+    let _handle = null
+    try { _handle = await window.showDirectoryPicker() } catch { return }  // 使用者取消選擇
+    const name = _handle.name
+    const r = await fetch('/api/projects/resolve-folder', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) })
+      .then(x => x.json()).catch(() => ({ ok: false }))
+    const matches = r.ok ? (r.matches ?? []) : []
+    setPicked({ path: matches[0] ?? '', name, candidates: matches })
+    if (!matches.length) setErr(`在 project_roots 找不到「${name}」的路徑，請手動填入完整路徑`)
+  }
+  // 開館 Step 2：套用 → server 自動建立仕酒師資料層 + 背景首次萃取；QA 綁 id 即用
+  async function add() {
+    if (!picked?.path?.trim()) { setErr('請先確認專案完整路徑'); return }
+    const name = picked.name.trim() || picked.path.trim().split(/[\\/]/).filter(Boolean).pop()
+    const id = name.toLowerCase().replace(/[^a-z0-9_-]/g, '') || `proj${Date.now()}`
+    const r = await fetch('/api/projects/registry', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, name, projectPath: picked.path.trim() }) })
+      .then(x => x.json()).catch(e => ({ ok: false, error: String(e) }))
+    if (!r.ok) { setErr(r.error ?? '開館失敗'); return }
+    setPicked(null); setErr('')
+    reload(); onChanged?.()
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center" onClick={onClose}>
+      <div className="w-[26rem] max-h-[70vh] overflow-y-auto bg-[var(--surface)] border border-[var(--border)] rounded-lg p-4 shadow-2xl" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-1">
+          <div className="text-[var(--gold)] text-xs tracking-widest uppercase">🏛 高桌會 The High Table</div>
+          <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text)] text-sm leading-none">✕</button>
+        </div>
+        <div className="text-[10px] text-[var(--text-muted)] mb-3">分館（專案）認可管理 — 認可的分館出現在仕酒師與 QA；除聖（Deconsecrated）僅從介面移除，資料永久保留</div>
+        {!list && !err && <div className="text-[10px] text-[var(--text-muted)]">讀取中…</div>}
+        {list?.map(p => (
+          <div key={p.id} className="flex items-center justify-between py-1.5 border-b border-[var(--border)]/50">
+            <div className="min-w-0 mr-2">
+              <div className={`text-[11px] truncate ${p.enabled ? '' : 'text-[var(--text-muted)] line-through'}`}>{p.name}</div>
+              <div className="text-[9px] text-[var(--text-muted)] truncate">{p.id}{p.dataDir ? ` · ${p.dataDir}` : ''}</div>
+            </div>
+            <button onClick={() => toggle(p)} title={p.enabled ? '除聖：從仕酒師/QA 下拉移除（資料保留）' : '重新認可：回到仕酒師/QA 下拉'}
+              className={`shrink-0 text-[9px] px-2 py-0.5 rounded border ${p.enabled ? 'border-[var(--gold)]/60 text-[var(--gold)] hover:border-red-500/50 hover:text-red-400' : 'border-[var(--border)] text-[var(--text-muted)] hover:border-[var(--gold)]/50 hover:text-[var(--gold)]'}`}>
+              {p.enabled ? '✓ 認可中' : '已除聖'}
+            </button>
+          </div>
+        ))}
+        <div className="mt-3">
+          {!picked && (
+            <button onClick={browse}
+              className="w-full text-[10px] px-2 py-1.5 rounded border border-[var(--gold)]/60 text-[var(--gold)] hover:bg-[var(--gold)]/10">
+              📂 選擇專案資料夾開館
+            </button>
+          )}
+          {picked && (
+            <div className="border border-[var(--border)] rounded p-2">
+              <input value={picked.path} onChange={e => setPicked({ ...picked, path: e.target.value })} placeholder="專案完整路徑（自動反查，可改）"
+                className="w-full bg-transparent border border-[var(--border)] rounded text-[9px] px-1.5 py-1 text-[var(--text)]" />
+              {picked.candidates?.length > 1 && (
+                <div className="mt-1 flex flex-wrap gap-1">
+                  {picked.candidates.map(c => (
+                    <button key={c} onClick={() => setPicked({ ...picked, path: c })} title={c}
+                      className={`text-[9px] px-1.5 py-0.5 rounded border truncate max-w-full ${picked.path === c ? 'border-[var(--gold)]/60 text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)]'}`}>
+                      {c}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div className="flex gap-1 mt-1">
+                <input value={picked.name} onChange={e => setPicked({ ...picked, name: e.target.value })} placeholder="顯示名稱（自動帶資料夾名，可改）"
+                  className="flex-1 min-w-0 bg-transparent border border-[var(--border)] rounded text-[10px] px-1.5 py-1 text-[var(--text)]" />
+                <button onClick={add} className="shrink-0 text-[10px] px-2 rounded border border-[var(--gold)]/60 text-[var(--gold)] hover:bg-[var(--gold)]/10">開館</button>
+                <button onClick={() => setPicked(null)} className="shrink-0 text-[10px] px-2 rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text)]">取消</button>
+              </div>
+            </div>
+          )}
+        </div>
+        {err && <div className="mt-1 text-[9px] text-red-400">{err}</div>}
+        <div className="mt-2 text-[9px] text-[var(--text-muted)]">開館即自動建立該分館的仕酒師資料層並背景首次萃取；QA 隨 id 即用。進階欄位（dataDir / extractCommand）在 ~/.claude/tc_user_config/sommelier.json</div>
+      </div>
+    </div>
+  )
+}
+
 const TABS = [
   { id: 'chat',      label: 'Chat' },
-  { id: 'todos',     label: '待辦' },
-  { id: 'qa',        label: '🧪 QA' },
-  { id: 'metrics',   label: '📊 儀表板' },
   { id: 'sommelier', label: '🍷 侍酒師' },
+  { id: 'qa',        label: '🧪 QA' },
+  { id: 'todos',     label: '待辦' },
+  { id: 'metrics',   label: '📊 儀表板' },
   { id: 'history',   label: 'History' },
-  { id: 'prompt',    label: 'Prompt' },
   { id: 'prefs',     label: '規矩' },
+  { id: 'prompt',    label: 'Prompt' },
 ]
 
 // P2 階段 4c：協作者只能看到分享給他們的卡片，所有個人功能都隱藏
@@ -3485,6 +3587,23 @@ export default function App() {
   useEffect(() => {
     try { localStorage.setItem('tc_active_tab', activeTab) } catch {}
   }, [activeTab])
+  // 跨專案切換（仕酒師 / QA 綁專案、共用同一 active 專案；任一邊切換兩邊受惠）
+  const [tcProjects, setTcProjects] = useState([])
+  const [activeProjectId, setActiveProjectId] = useState(() => {
+    try { return localStorage.getItem('tc_active_project') || null } catch { return null }
+  })
+  const [showHighTable, setShowHighTable] = useState(false)  // 高桌會：分館（專案）認可管理
+  const reloadTcProjects = useCallback(() => {
+    fetch('/api/sommelier/projects').then(r => r.json()).then(d => {
+      const list = d.projects ?? []
+      setTcProjects(list)
+      setActiveProjectId(prev => (prev && list.some(p => p.id === prev)) ? prev : (list[0]?.id ?? null))
+    }).catch(() => {})
+  }, [])
+  useEffect(() => { reloadTcProjects() }, [reloadTcProjects])
+  useEffect(() => {
+    try { if (activeProjectId) localStorage.setItem('tc_active_project', activeProjectId) } catch {}
+  }, [activeProjectId])
   const [streamEvents, setStreamEvents] = useState([])
   const [chatInit, setChatInit] = useState(null)
   // Ref tracking current chat projectPath for stream watcher (avoids stale sessions lookup)
@@ -3927,6 +4046,9 @@ export default function App() {
           onClose={() => setContractModal(null)}
         />
       )}
+      {showHighTable && (
+        <HighTableModal onClose={() => setShowHighTable(false)} onChanged={reloadTcProjects} />
+      )}
       {showBountySettings && (
         <BountySettings
           onClose={() => setShowBountySettings(false)}
@@ -4103,9 +4225,9 @@ export default function App() {
                   setActiveTab('chat')
                 }} />
             )}
-            {activeTab === 'qa'      && <QAMonitorPanel selectedSessionId={selectedId} />}
+            {activeTab === 'qa'      && <QAMonitorPanel selectedSessionId={selectedId} onGoToChat={handleContinueInChat} projects={tcProjects} activeProjectId={activeProjectId} onSelectProject={setActiveProjectId} onManageProjects={() => setShowHighTable(true)} />}
             {activeTab === 'metrics' && <MetricsDashboard />}
-            {activeTab === 'sommelier' && <SommelierPanel onGoToChat={handleContinueInChat} />}
+            {activeTab === 'sommelier' && <SommelierPanel onGoToChat={handleContinueInChat} projects={tcProjects} activeProjectId={activeProjectId} onSelectProject={setActiveProjectId} onManageProjects={() => setShowHighTable(true)} />}
             {activeTab === 'history'   && <HistoryPanel onContinue={handleContinueInChat} />}
             {activeTab === 'prompt'    && <PromptStudioPanel />}
             {activeTab === 'prefs'     && <PreferencesPanel />}

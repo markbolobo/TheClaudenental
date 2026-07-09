@@ -964,6 +964,22 @@ function spawnClaude(projectPath, prompt, sessionId = null) {
   return entry
 }
 
+// base64 attachments([{name,dataUrl}]) → 存 temp 檔，回傳寫成功的路徑陣列（供 append 到 prompt 讓 Claude 讀）。
+// 共用給 CHAT(/api/claude/run) 與 QA Run comment(/control) 與 Sommelier 送入聊天室。
+function saveAttachmentFiles(attachments) {
+  const paths = []
+  if (!Array.isArray(attachments)) return paths
+  for (const att of attachments) {
+    if (!att?.dataUrl || !att?.name) continue
+    const m = att.dataUrl.match(/^data:([^;]+);base64,(.+)$/)
+    if (!m) continue
+    const ext = path.extname(att.name) || '.bin'
+    const tmpPath = path.join(os.tmpdir(), `claud_att_${crypto.randomBytes(6).toString('hex')}${ext}`)
+    try { fs.writeFileSync(tmpPath, Buffer.from(m[2], 'base64')); paths.push(tmpPath) } catch {}
+  }
+  return paths
+}
+
 app.post('/api/claude/run', async (request) => {
   const { projectPath: rawPath, prompt, sessionId, attachments } = request.body
   if (!prompt && !(attachments?.length)) return { ok: false, error: 'missing prompt' }
@@ -971,20 +987,9 @@ app.post('/api/claude/run', async (request) => {
   if (!isSafeCwd(projectPath)) return { ok: false, error: 'invalid projectPath' }
 
   // Save base64 attachments to temp files and append their paths to the prompt
-  const tempFiles = []
+  const tempFiles = saveAttachmentFiles(attachments)
   let fullPrompt = prompt ?? ''
-  if (Array.isArray(attachments) && attachments.length) {
-    for (const att of attachments) {
-      if (!att.dataUrl || !att.name) continue
-      const m = att.dataUrl.match(/^data:([^;]+);base64,(.+)$/)
-      if (!m) continue
-      const ext = path.extname(att.name) || '.bin'
-      const tmpPath = path.join(os.tmpdir(), `claud_att_${crypto.randomBytes(6).toString('hex')}${ext}`)
-      fs.writeFileSync(tmpPath, Buffer.from(m[2], 'base64'))
-      tempFiles.push(tmpPath)
-      fullPrompt += `\n${tmpPath}`
-    }
-  }
+  for (const tmpPath of tempFiles) fullPrompt += `\n${tmpPath}`
 
   // 思考中（同 projectPath 已有 running process）→ push 到 queue，不 kill 上一個
   const existing = claudeProcs.get(projectPath)
@@ -2466,7 +2471,100 @@ function readSommelierConfig() {
 app.get('/api/sommelier/projects', async (request, reply) => {
   if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
   const cfg = readSommelierConfig()
-  return { ok: true, projects: (cfg.projects ?? []).map(p => ({ id: p.id, name: p.name })) }
+  // 高桌會認可制：enabled=false（除聖）的分館不出現在仕酒師/QA 下拉；資料永久保留
+  return { ok: true, projects: (cfg.projects ?? []).filter(p => p.enabled !== false).map(p => ({ id: p.id, name: p.name })) }
+})
+
+// ─── 高桌會（The High Table — 分館/專案認可管理）────────────────────────────
+// 專案庫 SSOT = sommelier.json；認可=出現在仕酒師/QA、除聖(enabled:false)=介面移除、資料保留
+
+app.get('/api/projects/registry', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const cfg = readSommelierConfig()
+  return { ok: true, projects: (cfg.projects ?? []).map(p => ({ id: p.id, name: p.name, dataDir: p.dataDir ?? '', enabled: p.enabled !== false })) }
+})
+
+// 開館 — 前端用瀏覽器原生 showDirectoryPicker（同 CHAT「Upload from computer」族）選資料夾；
+// 瀏覽器安全限制只給「資料夾名稱」不給絕對路徑 → 此端點按名稱在 project_roots.json 的
+// 目錄樹（各 root 上層起、深度 3）反查絕對路徑候選，前端一中就自動帶入、多中給選、零中手動填
+app.post('/api/projects/resolve-folder', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const name = String(request.body?.name ?? '').trim()
+  if (!name) { reply.code(400); return { ok: false, error: 'name required' } }
+  let rootsCfg = {}
+  try { rootsCfg = JSON.parse(fs.readFileSync(PROJECT_ROOTS_FILE, 'utf8')) } catch { /* 無設定 → 空清單 */ }
+  const roots = new Set()
+  for (const r of (rootsCfg.project_roots ?? [])) {
+    const abs = path.resolve(r)
+    roots.add(abs)
+    roots.add(path.dirname(abs))   // 上層（如 C:/Project）也掃，涵蓋兄弟/姪層專案
+  }
+  const SKIP = new Set(['node_modules', 'Intermediate', 'Binaries', 'Saved', 'DerivedDataCache', 'Content', 'Source', 'Engine', 'Plugins', 'Config', 'Build', '__ExternalActors__', '__ExternalObjects__'])
+  const target = name.toLowerCase()
+  const matches = new Set()
+  const walk = (dir, depth) => {
+    if (depth > 3 || matches.size >= 8) return
+    let entries = []
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { return }
+    for (const e of entries) {
+      if (!e.isDirectory() || SKIP.has(e.name) || e.name.startsWith('.')) continue
+      const full = path.join(dir, e.name)
+      if (e.name.toLowerCase() === target) { matches.add(full); continue }
+      walk(full, depth + 1)
+    }
+  }
+  for (const r of roots) if (path.basename(r).toLowerCase() === target) matches.add(r)
+  for (const r of roots) walk(r, 1)
+  // 淺路徑優先（真專案通常在 root 淺層；資料夾同名的資料層/備份多在深層）
+  const sorted = [...matches].sort((a, b) => a.split(path.sep).length - b.split(path.sep).length)
+  return { ok: true, matches: sorted }
+})
+
+// 開館（新增分館）：帶 projectPath 時自動建立仕酒師資料層（GameMechanics/<資料夾名>/sommelier 慣例）
+// + cpp 萃取指令 + 背景跑首次萃取；QA 綁 project id 即用，無需另建。手動欄位（id/name/dataDir/extractCommand）仍相容。
+app.post('/api/projects/registry', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const body = request.body ?? {}
+  const id = String(body.id ?? '').trim()
+  if (!id) { reply.code(400); return { ok: false, error: 'id required' } }
+  const cfg = readSommelierConfig()
+  cfg.projects ??= []
+  if (cfg.projects.some(p => p.id === id)) { reply.code(409); return { ok: false, error: `id「${id}」已存在` } }
+  const proj = { id, name: String(body.name ?? '').trim() || id }
+  if (typeof body.dataDir === 'string' && body.dataDir.trim()) proj.dataDir = body.dataDir.trim()
+  if (typeof body.extractCommand === 'string' && body.extractCommand.trim()) proj.extractCommand = body.extractCommand.trim()
+  if (typeof body.projectPath === 'string' && body.projectPath.trim()) {
+    const projPath = body.projectPath.trim()
+    proj.projectPath = projPath
+    const folderName = path.basename(projPath)
+    if (!proj.dataDir) proj.dataDir = `C:/Project/MasterBrain/GameMechanics/${folderName}/sommelier`
+    try { fs.mkdirSync(path.join(proj.dataDir, 'generated'), { recursive: true }) } catch { /* 已存在 */ }
+    if (!proj.extractCommand) proj.extractCommand = `node C:/Project/MasterBrain/.agent/scripts/extract_ue_cpp_symbols.mjs --project "${projPath}" --name "${proj.name}" --out "${proj.dataDir}/generated/cpp_symbols.json"`
+  }
+  cfg.projects.push(proj)
+  atomicWriteJson(SOMMELIER_CONFIG_FILE, cfg)
+  logEvent('projects.registry.add', { id, projectPath: proj.projectPath ?? null })
+  // 開館即自動萃取（背景 fire-and-forget）：完成後仕酒師即可讀；失敗不擋開館（介面有刷新鈕可重跑）
+  if (proj.extractCommand) {
+    setImmediate(() => {
+      try { const r = spawn(proj.extractCommand, { shell: true, stdio: 'ignore', detached: true }); r.unref() } catch { /* 萃取失敗交介面刷新鈕 */ }
+    })
+  }
+  return { ok: true }
+})
+
+// 認可 / 除聖切換（enabled）＋ 改顯示名稱
+app.patch('/api/projects/registry/:id', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const cfg = readSommelierConfig()
+  const proj = (cfg.projects ?? []).find(p => p.id === request.params.id)
+  if (!proj) { reply.code(404); return { ok: false, error: 'unknown project' } }
+  const body = request.body ?? {}
+  if (typeof body.enabled === 'boolean') proj.enabled = body.enabled
+  if (typeof body.name === 'string' && body.name.trim()) proj.name = body.name.trim()
+  atomicWriteJson(SOMMELIER_CONFIG_FILE, cfg)
+  logEvent('projects.registry.update', { id: proj.id, enabled: proj.enabled !== false })
+  return { ok: true }
 })
 
 app.get('/api/sommelier/data/:projectId', async (request, reply) => {
@@ -2604,6 +2702,7 @@ app.post('/api/qa/runs', async (request) => {
     commit: body.commit ?? '',
     boundSessionId: body.boundSessionId ?? null,  // M-6：綁定的 Claude 聊天室 session（會議室預約模式）
     boundProjectPath: body.boundProjectPath ?? null,  // M-6b：spawn 喚醒需要的 cwd
+    project: typeof body.project === 'string' ? body.project : null,  // 跨專案：sommelier.json projects[].id；null=早期 run 前端視為 roman
     // M-6b 喚醒模式：spawn=server 主動 resume 該聊天室 / monitor=該 session 自掛監看（避免雙重喚醒）/ none
     wakeMode: ['spawn', 'monitor', 'none'].includes(body.wakeMode) ? body.wakeMode : (body.boundSessionId ? 'spawn' : 'none'),
     archivedAt: null,
@@ -2679,6 +2778,8 @@ app.patch('/api/qa/runs/:id', async (request, reply) => {
   if (typeof body.sessionDir === 'string') run.sessionDir = body.sessionDir
   if (typeof body.boundSessionId === 'string') run.boundSessionId = body.boundSessionId
   if (typeof body.boundProjectPath === 'string') run.boundProjectPath = body.boundProjectPath
+  if (typeof body.project === 'string') run.project = body.project
+
   if (['spawn', 'monitor', 'none'].includes(body.wakeMode)) run.wakeMode = body.wakeMode
   if (body.item && typeof body.item.id !== 'undefined') {
     const it = run.items.find(x => x.id === body.item.id)
@@ -2733,11 +2834,12 @@ app.post('/api/qa/runs/:id/events', async (request, reply) => {
 // M-6b：少爺控制動作 → server 主動喚醒綁定的聊天室（wakeMode='spawn' 時）
 // 走既有 /api/claude/run 機器：busy → 排隊；idle → spawnClaude resume 該 session
 const QA_WAKE_ACTIONS = { 'start-now': '按了「▶ 立即開跑」→ 請進入階段二（埋 LOG + 雙編譯 + 重啟 Editor）', pause: '要求暫停', resume: '要求繼續', abort: '要求中止', comment: '留言', close: '按了「✔ 結案」→ 階段五（清 QAC LOG + 雙編譯 + 重啟 Editor；無頭啟動 Editor 用 Start-Process detached）＋維護侍酒師閉環：把本 run 需求「實作驗證後的收斂」沉澱回四種血肉（C++ code / 架構 canvas / 拼圖 memory；藍圖 md 暫跳過），Editor 開著時跑 extract_asset_graph.py 更新藍圖資產層，最後 POST /api/sommelier/refresh/roman 重萃取讓侍酒師吃到最新拼圖' }
-function qaWakeBoundSession(run, action, text) {
+function qaWakeBoundSession(run, action, text, attachPaths = []) {
   try {
     if (!run.boundSessionId || !['spawn', 'cli'].includes(run.wakeMode)) return
     const detail = QA_WAKE_ACTIONS[action] ?? action
-    const prompt = `(TC QA 聯動通知) 少爺在 QA Monitor 對 run「${run.topic}」(${run.id}) ${detail}${text ? `：「${text}」` : ''}。請照 Mode C 流程繼續（QA/README.md §Mode C）。`
+    let prompt = `(TC QA 聯動通知) 少爺在 QA Monitor 對 run「${run.topic}」(${run.id}) ${detail}${text ? `：「${text}」` : ''}。請照 Mode C 流程繼續（QA/README.md §Mode C）。`
+    for (const _p of (Array.isArray(attachPaths) ? attachPaths : [])) prompt += `\n${_p}`
     const projectPath = (run.boundProjectPath ?? 'C:/Project/RomanPrototype').replace(/\//g, path.sep)
     if (!isSafeCwd(projectPath)) return
     // wakeMode 'cli'（少爺 2026-07-06）：開「可視的互動式 Claude CLI 視窗」resume 該聊天室 —
@@ -2771,7 +2873,8 @@ app.post('/api/qa/runs/:id/control', async (request, reply) => {
   const data = readQaRuns()
   const run = data.runs.find(r => r.id === request.params.id)
   if (!run) { reply.code(404); return { ok: false, error: 'not found' } }
-  const { action, text, itemId } = request.body ?? {}
+  const { action, text, itemId, attachments } = request.body ?? {}
+  let _attachPaths = []   // comment 附檔存成 temp 檔的路徑，append 到喚醒 prompt 讓 Claude 讀
   if (action === 'start-now') {
     if (run.status === 'announced' || run.status === 'countdown') {
       qaClearCountdown(run.id)
@@ -2791,7 +2894,10 @@ app.post('/api/qa/runs/:id/control', async (request, reply) => {
       run.status = 'aborted'; run.finishedAt = Date.now()
     } else run.controls.abortRequested = true
   } else if (action === 'comment') {
-    run.comments.push({ t: Date.now(), itemId: itemId ?? null, text: String(text ?? ''), seenByClaude: false, reply: null })
+    _attachPaths = saveAttachmentFiles(attachments)
+    const _attNames = (Array.isArray(attachments) ? attachments : []).map(a => a?.name).filter(Boolean)
+    const _commentText = String(text ?? '') + (_attNames.length ? ` 📎 ${_attNames.join(', ')}` : '')
+    run.comments.push({ t: Date.now(), itemId: itemId ?? null, text: _commentText, seenByClaude: false, reply: null })
   } else if (action === 'close') {
     // 少爺結案（第五階段觸發訊號）：已完成/已中止 → 結案；Claude 收到通知後清 QAC LOG + 雙編譯
     if (run.status === 'finished' || run.status === 'aborted') { run.status = 'closed'; run.closedAt = Date.now() }
@@ -2806,7 +2912,7 @@ app.post('/api/qa/runs/:id/control', async (request, reply) => {
   writeQaRuns(data)
   logEvent('qa.run.control', { id: run.id, action })
   qaBroadcast(run)
-  qaWakeBoundSession(run, action, action === 'comment' ? String(text ?? '') : '')
+  qaWakeBoundSession(run, action, action === 'comment' ? String(text ?? '') : '', _attachPaths)
   return { ok: true, run }
 })
 

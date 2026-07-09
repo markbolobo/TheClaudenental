@@ -31,12 +31,18 @@ function StatusBadge({ status }) {
   )
 }
 
-export function QAMonitorPanel({ selectedSessionId = null }) {
+export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, projects = [], activeProjectId = null, onSelectProject = null, onManageProjects = null }) {
   const [runs, setRuns] = useState([])
   const [selectedRunId, setSelectedRunId] = useState(null)
+  // 跨專案：run 未帶 project 欄位者為早期羅馬 run → 視為 'roman'（QA 綁專案；下拉選單與仕酒師共用 active 專案）
+  const runMatchesProject = useCallback(
+    (r) => !activeProjectId || (r.project ?? 'roman') === activeProjectId,
+    [activeProjectId])
   const [now, setNow] = useState(Date.now())
   const [commentText, setCommentText] = useState('')
   const [commentItemId, setCommentItemId] = useState('')
+  const [qaAttach, setQaAttach] = useState([])   // [{name,dataUrl,type}]：feedback 附檔，一併傳給 Claude 分析
+  const qaAttachRef = useRef(null)
   const [lightbox, setLightbox] = useState(null)   // artifact url 放大檢視
   const selectedRunIdRef = useRef(null)
   useEffect(() => { selectedRunIdRef.current = selectedRunId }, [selectedRunId])
@@ -45,15 +51,25 @@ export function QAMonitorPanel({ selectedSessionId = null }) {
     fetch('/api/qa/runs?limit=100').then(r => r.json()).then(d => {
       const list = d.runs ?? []
       setRuns(list)
-      // 預設選最新的「進行中」run；沒有就選最新一筆
+      // 預設選最新的「進行中」run；沒有就選最新一筆（只在當前專案範圍內選）
       if (!selectedRunIdRef.current) {
-        const live = list.find(r => ['announced', 'countdown', 'running', 'paused'].includes(r.status))
-        setSelectedRunId((live ?? list[0])?.id ?? null)
+        const pool = list.filter(runMatchesProject)
+        const live = pool.find(r => ['announced', 'countdown', 'running', 'paused'].includes(r.status))
+        setSelectedRunId((live ?? pool[0])?.id ?? null)
       }
     }).catch(() => {})
-  }, [])
+  }, [runMatchesProject])
 
   useEffect(() => { reload() }, [reload])
+
+  // 切專案：選中 run 不屬於新專案 → 改選該專案最新（進行中優先）
+  useEffect(() => {
+    const cur = runs.find(r => r.id === selectedRunIdRef.current)
+    if (cur && runMatchesProject(cur)) return
+    const pool = runs.filter(r => !r.archivedAt && runMatchesProject(r))
+    const live = pool.find(r => ['announced', 'countdown', 'running', 'paused'].includes(r.status))
+    setSelectedRunId((live ?? pool[0])?.id ?? null)
+  }, [activeProjectId])  // eslint-disable-line react-hooks/exhaustive-deps
 
   // ws 即時更新（App.jsx 轉發）+ 10s 輪詢保險
   useEffect(() => {
@@ -100,11 +116,24 @@ export function QAMonitorPanel({ selectedSessionId = null }) {
     }).catch(() => {})
   }
 
+  function handleQaAttach(e) {
+    const files = Array.from(e.target.files ?? [])
+    for (const file of files) {
+      const reader = new FileReader()
+      reader.onload = ev => setQaAttach(prev => [...prev, { name: file.name, dataUrl: ev.target.result, type: file.type }])
+      reader.readAsDataURL(file)
+    }
+    e.target.value = ''
+  }
+
   async function sendComment() {
     const text = commentText.trim()
-    if (!text) return
-    await control('comment', { text, itemId: commentItemId ? Number(commentItemId) : null })
+    if (!text && qaAttach.length === 0) return
+    await control('comment', { text, itemId: commentItemId ? Number(commentItemId) : null, attachments: qaAttach })
     setCommentText('')
+    setQaAttach([])
+    // 少爺 2026-07-08：送出 Feedback＝QA 手動階段完成 → 無縫切到 Chat 看 Claude 處理（同 History Continue / 仕酒師送入聊天室）
+    if (run?.boundSessionId) onGoToChat?.({ sessionId: run.boundSessionId, projectPath: run.boundProjectPath ?? null })
   }
 
   const artifactUrl = (rel) => `/api/qa/runs/${run?.id}/artifact?path=${encodeURIComponent(rel)}`
@@ -118,12 +147,26 @@ export function QAMonitorPanel({ selectedSessionId = null }) {
       {/* C 歷史區（左欄） */}
       <aside className="w-52 shrink-0 border-r border-[var(--border)] bg-[var(--surface)] overflow-y-auto">
         <div className="px-3 py-2 text-[10px] uppercase tracking-widest text-[var(--text-muted)] border-b border-[var(--border)]">
+          {/* 跨專案下拉選單：與仕酒師共用 active 專案，任一邊切換兩邊受惠；🏛 = 高桌會分館認可管理 */}
+          <div className="flex items-center gap-1 mb-1">
+            {projects.length > 1 && (
+              <select value={activeProjectId ?? ''} onChange={e => onSelectProject?.(e.target.value)}
+                className="flex-1 min-w-0 bg-transparent border border-[var(--border)] rounded text-[10px] px-1 py-0.5 text-[var(--text)] normal-case tracking-normal">
+                {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+            )}
+            {projects.length === 1 && <span className="flex-1 text-[10px] text-[var(--text)] normal-case tracking-normal">{projects[0].name}</span>}
+            {onManageProjects && (
+              <button onClick={onManageProjects} title="高桌會：分館（專案）認可管理"
+                className="shrink-0 text-[10px] px-1 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] hover:border-[var(--gold)]/50 normal-case">🏛</button>
+            )}
+          </div>
           QA Runs（永久保留）
         </div>
-        {runs.length === 0 && (
+        {runs.filter(r => !r.archivedAt && runMatchesProject(r)).length === 0 && (
           <div className="px-3 py-4 text-[10px] text-[var(--text-muted)] text-center">尚無 QA run</div>
         )}
-        {runs.filter(r => !r.archivedAt).map(r => (
+        {runs.filter(r => !r.archivedAt && runMatchesProject(r)).map(r => (
           <div key={r.id} onClick={() => setSelectedRunId(r.id)}
             className={`relative w-full text-left px-3 py-2 border-b border-[var(--border)]/50 hover:bg-white/5 cursor-pointer group ${
               r.id === selectedRunId ? 'bg-white/10' : ''}`}>
@@ -374,6 +417,16 @@ export function QAMonitorPanel({ selectedSessionId = null }) {
                   )}
                 </div>
               ))}
+              {qaAttach.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1 mt-1">
+                  {qaAttach.map((a, i) => (
+                    <span key={i} className="text-[9px] px-1.5 py-0.5 rounded bg-black/30 border border-[var(--border)] text-[var(--text)] flex items-center gap-1">
+                      📎 {a.name}
+                      <button onClick={() => setQaAttach(prev => prev.filter((_, j) => j !== i))} className="text-[var(--text-muted)] hover:text-red-400" title="移除">✕</button>
+                    </span>
+                  ))}
+                </div>
+              )}
               <div className="flex gap-2 mt-1">
                 <input value={commentItemId} onChange={e => setCommentItemId(e.target.value)}
                   placeholder="項目#" className="w-14 bg-black/30 border border-[var(--border)] rounded px-2 py-1 text-[11px]" />
@@ -381,6 +434,9 @@ export function QAMonitorPanel({ selectedSessionId = null }) {
                   onKeyDown={e => { if (e.key === 'Enter') sendComment() }}
                   placeholder="對這輪 QA 留言…（Enter 送出）"
                   className="flex-1 bg-black/30 border border-[var(--border)] rounded px-2 py-1 text-[11px]" />
+                <button onClick={() => qaAttachRef.current?.click()} title="附加檔案給 Claude 分析"
+                  className="text-[11px] px-2 py-1 rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] hover:border-[var(--gold)]/50">📎</button>
+                <input ref={qaAttachRef} type="file" multiple accept="image/*,.pdf,.txt,.md,.json,.csv" className="hidden" onChange={handleQaAttach} />
                 <button onClick={sendComment}
                   className="text-[11px] px-3 py-1 rounded border border-[var(--gold)]/50 text-[var(--gold)] hover:bg-[var(--gold)]/10">送出</button>
               </div>
