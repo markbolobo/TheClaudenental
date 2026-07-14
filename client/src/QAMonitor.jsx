@@ -3,6 +3,8 @@
 // A 計畫區（目的+方法）/ B 即時區（進度+截圖+異常）/ C 歷史區 + 留言雙向
 // ws 更新走 window 'tc-qa-run-update' 自訂事件（App.jsx handleServerMessage 一行轉發，不侵入既有結構）
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { MODEL_OPTIONS, EFFORT_OPTIONS } from './modelOptions.js'
+import { confirmIfLiveInteractive } from './liveSessionGuard.js'
 
 const STATUS_META = {
   announced: { label: '待放行', cls: 'text-yellow-400 border-yellow-500/50' },
@@ -40,6 +42,14 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
     [activeProjectId])
   const [now, setNow] = useState(Date.now())
   const [commentText, setCommentText] = useState('')
+  // 少爺 2026-07-14：QA 留言可選喚醒 Claude 子進程的 AI 模型＋強度（空字串=預設；記憶在 localStorage）
+  const [qaModel, setQaModel] = useState(() => localStorage.getItem('tc_qa_model') ?? '')
+  useEffect(() => { try { localStorage.setItem('tc_qa_model', qaModel) } catch {} }, [qaModel])
+  const [qaEffort, setQaEffort] = useState(() => localStorage.getItem('tc_qa_effort') ?? '')
+  useEffect(() => { try { localStorage.setItem('tc_qa_effort', qaEffort) } catch {} }, [qaEffort])
+  // 少爺 2026-07-14：喚醒改開「可視互動 CLI 視窗」盯進度（VS Code 已開分頁不會跟外部無頭進程同步——這是看得到的替代）
+  const [qaWakeVisible, setQaWakeVisible] = useState(() => localStorage.getItem('tc_qa_wake_visible') === '1')
+  useEffect(() => { try { localStorage.setItem('tc_qa_wake_visible', qaWakeVisible ? '1' : '0') } catch {} }, [qaWakeVisible])
   const [commentItemId, setCommentItemId] = useState('')
   const [qaAttach, setQaAttach] = useState([])   // [{name,dataUrl,type}]：feedback 附檔，一併傳給 Claude 分析
   const qaAttachRef = useRef(null)
@@ -109,11 +119,11 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
   }, [run?.status])
 
   async function control(action, extra = {}) {
-    if (!run) return
-    await fetch(`/api/qa/runs/${run.id}/control`, {
+    if (!run) return null
+    return await fetch(`/api/qa/runs/${run.id}/control`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action, ...extra }),
-    }).catch(() => {})
+    }).then(r => r.json()).catch(() => null)
   }
 
   function handleQaAttach(e) {
@@ -129,11 +139,16 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
   async function sendComment() {
     const text = commentText.trim()
     if (!text && qaAttach.length === 0) return
-    await control('comment', { text, itemId: commentItemId ? Number(commentItemId) : null, attachments: qaAttach })
+    // 少爺 2026-07-14「警示＋照送」：spawn 模式卻綁著 VS Code 活 session（錯配——活 session 應走 monitor）→ 確認後才喚醒
+    if (run?.wakeMode === 'spawn' && run?.boundSessionId)
+      if (!(await confirmIfLiveInteractive(run.boundSessionId, '無頭喚醒'))) return
+    const _res = await control('comment', { text, itemId: commentItemId ? Number(commentItemId) : null, attachments: qaAttach, model: qaModel || null, effort: qaEffort || null, wakeVisible: qaWakeVisible })
     setCommentText('')
     setQaAttach([])
     // 少爺 2026-07-08：送出 Feedback＝QA 手動階段完成 → 無縫切到 Chat 看 Claude 處理（同 History Continue / 仕酒師送入聊天室）
-    if (run?.boundSessionId) onGoToChat?.({ sessionId: run.boundSessionId, projectPath: run.boundProjectPath ?? null })
+    // 少爺 2026-07-14：未綁定 run 也導過去——server 會像「開新聊天室」spawn 接手並自動綁回，Chat 面板 sessionId=null 照樣收直播
+    const _run = _res?.run ?? run
+    onGoToChat?.({ sessionId: _run?.boundSessionId ?? null, projectPath: _run?.boundProjectPath ?? 'C:/Project/RomanPrototype' })
   }
 
   const artifactUrl = (rel) => `/api/qa/runs/${run?.id}/artifact?path=${encodeURIComponent(rel)}`
@@ -207,6 +222,10 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
                 <span className="text-sm text-[var(--gold)] font-semibold">{run.topic}</span>
                 <StatusBadge status={run.status} />
                 <span className="text-[10px] text-[var(--text-muted)]">{run.env}</span>
+                {/* 少爺 2026-07-14 環境戳記標準欄位（有填才顯示；舊 run 只有 env 自由文字照舊） */}
+                {run.map && <span className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)]">🗺 {run.map}</span>}
+                {run.buildConfig && <span className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)]">⚙ {run.buildConfig}</span>}
+                {run.branch && <span className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] font-mono">⎇ {run.branch}</span>}
                 {run.commit && <span className="text-[10px] text-[var(--text-muted)] font-mono">@{run.commit.slice(0, 8)}</span>}
                 {run.boundSessionId && (
                   <span title={`綁定聊天室 ${run.boundSessionId}`}
@@ -334,6 +353,33 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
                   </table>
                 </div>
               )}
+              {/* 🧩 拼圖結合（少爺 2026-07-14）：依據拼圖=Claude 這輪理解的來源外顯；拼圖沉澱=結案後驗證過的理解回寫了哪些檔 */}
+              {(run.knowledge?.length > 0 || run.knowledgeUpdated?.length > 0) && (
+                <div className="mt-2 pt-2 border-t border-[var(--border)]/50 space-y-1.5">
+                  {run.knowledge?.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-1">
+                      <span className="text-[9px] uppercase tracking-widest text-[var(--text-muted)] mr-1">🧩 依據拼圖</span>
+                      {run.knowledge.map((k, i) => (
+                        <span key={i} title={k}
+                          className="text-[9px] px-1.5 py-0.5 rounded border border-purple-500/40 text-purple-300 font-mono">
+                          {k.split('/').pop()}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {run.knowledgeUpdated?.length > 0 && (
+                    <div className="space-y-0.5">
+                      <span className="text-[9px] uppercase tracking-widest text-[var(--text-muted)]">🧩 拼圖沉澱（結案回寫）</span>
+                      {run.knowledgeUpdated.map((u, i) => (
+                        <div key={i} className="text-[10px] pl-2 text-[var(--text)]/90">
+                          <span className="font-mono text-green-400" title={u.path}>{u.path.split('/').pop()}</span>
+                          {u.summary && <span className="text-[var(--text-muted)]"> — {u.summary}</span>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* B 即時區 */}
@@ -428,6 +474,19 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
                 </div>
               )}
               <div className="flex gap-2 mt-1">
+                <select value={qaModel} onChange={e => setQaModel(e.target.value)} title="留言喚醒 Claude 時使用的 AI 模型"
+                  className="shrink-0 bg-black/30 border border-[var(--border)] rounded px-1 py-1 text-[10px] text-[var(--text-muted)] focus:outline-none focus:border-[var(--gold)]/50">
+                  {MODEL_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+                <select value={qaEffort} onChange={e => setQaEffort(e.target.value)} title="模型強度（claude --effort）"
+                  className="shrink-0 bg-black/30 border border-[var(--border)] rounded px-1 py-1 text-[10px] text-[var(--text-muted)] focus:outline-none focus:border-[var(--gold)]/50">
+                  {EFFORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+                <label title="喚醒改開可視的互動 Claude CLI 視窗盯進度（同專案已有無頭進程在跑時自動退回無頭排隊，避免同 session 雙寫）"
+                  className={`shrink-0 flex items-center gap-1 text-[10px] cursor-pointer select-none px-1.5 rounded border ${qaWakeVisible ? 'border-[var(--gold)]/60 text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)]'}`}>
+                  <input type="checkbox" checked={qaWakeVisible} onChange={e => setQaWakeVisible(e.target.checked)} className="accent-[var(--gold)] w-3 h-3" />
+                  👁 視窗
+                </label>
                 <input value={commentItemId} onChange={e => setCommentItemId(e.target.value)}
                   placeholder="項目#" className="w-14 bg-black/30 border border-[var(--border)] rounded px-2 py-1 text-[11px]" />
                 <input value={commentText} onChange={e => setCommentText(e.target.value)}

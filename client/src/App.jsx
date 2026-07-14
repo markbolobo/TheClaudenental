@@ -10,6 +10,8 @@ import { MetricsDashboard } from './MetricsDashboard.jsx'
 import { SommelierPanel } from './Sommelier.jsx'
 import { QAMonitorPanel } from './QAMonitor.jsx'
 import BountySettings from './BountySettings.jsx'
+import { MODEL_OPTIONS, EFFORT_OPTIONS } from './modelOptions.js'
+import { confirmIfLiveInteractive } from './liveSessionGuard.js'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -215,7 +217,7 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick,
           {(session.status === 'sleeping' || hitLimit) && (
             <button
               onClick={e => { e.stopPropagation(); onToggleAutoResume?.() }}
-              title={autoResumeArmed ? '自動繼續 ON — 點擊取消' : '設定整點自動繼續'}
+              title={autoResumeArmed ? '自動繼續 ON — 點擊取消（無頭續跑：VS Code 分頁不會即時顯示，之後重開分頁可見）' : '設定整點自動繼續（無頭續跑：VS Code 分頁不會即時顯示，之後重開分頁可見）'}
               className={`flex items-center gap-0.5 text-[9px] px-1 leading-none rounded border transition-colors ${
                 autoResumeArmed
                   ? 'border-amber-500/80 text-amber-400 pulse-amber'
@@ -1047,6 +1049,15 @@ function ThinkingBlock({ text, fullMessage }) {
 
 function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
   const [projectPath, setProjectPath] = useState('C:/Project/RomanPrototype')
+  // 少爺 2026-07-14：Chat 可選 AI 模型＋強度（空字串=預設；記憶在 localStorage 跨開啟保留）
+  const [chatModel, setChatModel] = useState(() => localStorage.getItem('tc_chat_model') ?? '')
+  useEffect(() => { try { localStorage.setItem('tc_chat_model', chatModel) } catch {} }, [chatModel])
+  const [chatEffort, setChatEffort] = useState(() => localStorage.getItem('tc_chat_effort') ?? '')
+  useEffect(() => { try { localStorage.setItem('tc_chat_effort', chatEffort) } catch {} }, [chatEffort])
+  // 少爺 2026-07-14：本次需求是否啟用 QA 流程（一次性勾選——送出後自動關，避免誤觸連發 QA）
+  const [qaFlowOnce, setQaFlowOnce] = useState(false)
+  // 少爺 2026-07-14「警示＋照送」：已確認過的活 session 不重複警示（取消的不記，下次再問）
+  const liveWarnedRef = useRef(new Set())
   const [input, setInput] = useState('')
   const [running, setRunning] = useState(false)
   const [attachments, setAttachments] = useState([])  // [{ name, dataUrl, type }]
@@ -1142,6 +1153,19 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
   const runningRef = useRef(false)
   // Guards against processing the same streamEvent twice (useEffect re-runs on dep change)
   const lastEvTsRef = useRef(0)
+  // 少爺 2026-07-15 修 Chat 重複：跨來源內容指紋（claude_stream 與 session_live 對同句話各推一次、
+  // 或監看重播時，第二次直接丟棄）。上限 400 筆滾動清理。
+  const seenFpRef = useRef(new Set())
+  const fpOf = (m) => `${m.role}|${m.toolId ?? ''}|${(m.text ?? m.output ?? '').trim().slice(0, 160)}`
+  const markFp = (m) => {
+    const _fp = fpOf(m)
+    seenFpRef.current.add(_fp)
+    if (seenFpRef.current.size > 400) {
+      const _it = seenFpRef.current.values()
+      for (let i = 0; i < 100; i++) seenFpRef.current.delete(_it.next().value)
+    }
+    return _fp
+  }
 
   // Apply chatInit when it changes (from History "Continue in Chat" / session click / TODO drag-trigger)
   // 用 localStorage 持久化已消費的 ts，避免 ChatPanel mount/unmount/F5 後重複預填
@@ -1256,10 +1280,14 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
       // ── session_live: VS Code live tail (incremental only) ───────────────
       if (ev.type === 'session_live' && ev.sessionId === sessionId) {
         if (runningRef.current) continue  // web run active — claude_stream is source of truth
+        // 內容指紋去重（少爺 2026-07-15）：claude_stream 已顯示過或監看重播的同句話直接略過
+        const fresh = (ev.messages ?? []).filter(m => !seenFpRef.current.has(fpOf(m)))
+        if (!fresh.length) continue
+        for (const m of fresh) markFp(m)
         setMessages(prev => {
           const existingToolKeys = new Set(prev.filter(m => m.toolId).map(m => `${m.role}:${m.toolId}`))
           let next = [...prev]
-          for (const m of ev.messages ?? []) {
+          for (const m of fresh) {
             const msg = { ...m, live: true }
             if (msg.toolId) {
               const key = `${msg.role}:${msg.toolId}`
@@ -1289,6 +1317,9 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
         // Other tabs' init events arrive with ev.sessionId=null (bypassing the sessionId filter)
         // and must not hijack this panel's session context.
         if (runningRef.current) setSessionId(event.session_id)
+      } else if (event.type === 'system' && event.subtype === 'spawn_config') {
+        // 少爺 2026-07-14：顯示本次子進程實際帶的模型/強度（effort 在別處無任何可觀察痕跡）
+        setMessages(m => [...m, { role: 'result', text: `🚀 啟動參數：模型 ${event.model ?? '預設'}｜強度 ${event.effort ?? '預設'}`, ts: Date.now() }])
       } else if (event.type === 'content_block_start') {
         const t = event.content_block?.type
         if (t === 'thinking') { liveBlockRef.current = { type: 'thinking', text: '' }; liveUpdated = true }
@@ -1314,6 +1345,8 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
           else if (b.type === 'tool_use')
             newMsgs.push({ role: 'tool_use', toolName: b.name, input: b.input, toolId: b.id, ts: Date.now() })
         }
+        // 登記指紋：session_live 之後對同內容的重播（監看 tail）會被濾掉（少爺 2026-07-15）
+        for (const m of newMsgs) markFp(m)
         if (newMsgs.length) setMessages(m => [...m, ...newMsgs])
       } else if (event.type === 'user') {
         const blocks = event.message?.content ?? []
@@ -1326,6 +1359,7 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
               : String(b.content ?? '').slice(0, 300)
             if (!output.trim()) continue
             const resultMsg = { role: 'tool_result', toolId: b.tool_use_id, output, ts: Date.now() }
+            markFp(resultMsg)
             const idx = next.map(m => m.toolId).lastIndexOf(b.tool_use_id)
             if (idx >= 0) next = [...next.slice(0, idx + 1), resultMsg, ...next.slice(idx + 1)]
             else next = [...next, resultMsg]
@@ -1394,6 +1428,11 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
   }
 
   async function doActualSend(text, atts) {
+    // 少爺 2026-07-14「警示＋照送」：續聊目標是 VS Code 活 session → 每 session 首次送出前確認（取消則下次再問）
+    if (sessionId && !liveWarnedRef.current.has(sessionId)) {
+      if (!(await confirmIfLiveInteractive(sessionId, '續聊'))) return
+      liveWarnedRef.current.add(sessionId)
+    }
     const rawPrompt = text || (atts.length ? '請查看附件' : '')
     const prefText  = localStorage.getItem(PREF_TEXT_KEY) || ''
     const prompt    = (injectOnce && prefText)
@@ -1407,7 +1446,7 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
     try {
       const res = await fetch('/api/claude/run', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectPath, prompt, sessionId, attachments: atts }),
+        body: JSON.stringify({ projectPath, prompt, sessionId, attachments: atts, model: chatModel || null, effort: chatEffort || null, qaFlow: qaFlowOnce }),
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok || !data.ok) {
@@ -1417,6 +1456,8 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
       } else {
         // ✅ Chat 真正送出 → 落實 pending todo transition（純方向 B 核心）
         commitPendingTodoTransition()
+        // QA 流程勾選是一次性的——成功送出即歸位
+        if (qaFlowOnce) setQaFlowOnce(false)
       }
     } catch (err) {
       setRunning(false); runningRef.current = false
@@ -2100,6 +2141,19 @@ ${body}`
           onChange={e => { setProjectPath(e.target.value); setSessionId(null); setMessages([]) }}
           className="flex-1 bg-transparent text-base md:text-[10px] text-[var(--text)] font-mono outline-none border-b border-[var(--border)] pb-0.5"
         />
+        <select value={chatModel} onChange={e => setChatModel(e.target.value)} title="這個聊天室送出時使用的 AI 模型"
+          className="shrink-0 bg-[var(--surface-2)] border border-[var(--border)] rounded px-1.5 py-0.5 text-[10px] text-[var(--text)] focus:outline-none focus:border-[var(--gold-border)]">
+          {MODEL_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+        <select value={chatEffort} onChange={e => setChatEffort(e.target.value)} title="模型強度（claude --effort）"
+          className="shrink-0 bg-[var(--surface-2)] border border-[var(--border)] rounded px-1.5 py-0.5 text-[10px] text-[var(--text)] focus:outline-none focus:border-[var(--gold-border)]">
+          {EFFORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+        <label title="下一則訊息附掛 Mode C QA 流程指令（送出後自動取消勾選）"
+          className={`shrink-0 flex items-center gap-1 text-[9px] cursor-pointer select-none px-1.5 py-0.5 rounded border ${qaFlowOnce ? 'border-[var(--gold)]/60 text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)]'}`}>
+          <input type="checkbox" checked={qaFlowOnce} onChange={e => setQaFlowOnce(e.target.checked)} className="accent-[var(--gold)] w-3 h-3" />
+          🧪 QA 流程
+        </label>
         {sessionId && (
           <span className="text-[9px] text-[var(--text-muted)] font-mono shrink-0">{sessionId.slice(0,8)}</span>
         )}

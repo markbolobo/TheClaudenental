@@ -1,4 +1,6 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
+import { MODEL_OPTIONS, EFFORT_OPTIONS } from './modelOptions.js'
+import { confirmIfLiveInteractive, fetchLiveInteractiveIds } from './liveSessionGuard.js'
 
 // ─── Sommelier 侍酒師 — 專案名詞圖鑑(P0:C++ 骨架層 + P1:選件購物車)─────────
 // 室內設計圖式層級瀏覽:模組 → 種類 → 類別 → (pragma region 分節的)成員。
@@ -751,19 +753,31 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
   // 結帳出口 2/3（少爺 2026-07-06）：送入既有聊天室 / 直接開新聊天室（走 /api/claude/run）
   const [showSendMenu, setShowSendMenu] = useState(false)
   const [chatSessions, setChatSessions] = useState([])
+  // 少爺 2026-07-14：送入/開新聊天室可選 AI 模型＋強度（空字串=預設；記憶在 localStorage）
+  const [sendModel, setSendModel] = useState(() => localStorage.getItem('tc_sommelier_model') ?? '')
+  useEffect(() => { try { localStorage.setItem('tc_sommelier_model', sendModel) } catch {} }, [sendModel])
+  const [sendEffort, setSendEffort] = useState(() => localStorage.getItem('tc_sommelier_effort') ?? '')
+  useEffect(() => { try { localStorage.setItem('tc_sommelier_effort', sendEffort) } catch {} }, [sendEffort])
+  // 少爺 2026-07-14：本次需求是否啟用 QA 流程（一次性勾選——送出後自動關）
+  const [qaFlow, setQaFlow] = useState(false)
   const openSendMenu = async () => {
     if (!cart.length && !draft.trim()) { flash('購物車是空的——先點選名詞或寫描述'); return }
     // 少爺 2026-07-06：要像 History 那樣列「全部」聊天室 → 改用 /api/history（掃全部 transcript、mtime 新到舊）
     const d = await fetch('/api/history').then(r => r.json()).catch(() => null)
     setChatSessions(d?.sessions ?? [])
+    // 少爺 2026-07-14「警示＋照送」：標記哪些是 VS Code 開著的活 session（送入前會再確認）
+    setLiveIds(await fetchLiveInteractiveIds())
     setShowSendMenu(v => !v)
   }
+  const [liveIds, setLiveIds] = useState(new Set())
   const sendToChat = async (sessionId, projectPath) => {
+    // 少爺 2026-07-14「警示＋照送」：目標是 VS Code 活 session → 確認後才送
+    if (!(await confirmIfLiveInteractive(sessionId, '送入'))) { setShowSendMenu(false); return }
     setShowSendMenu(false)
     const _path = projectPath ?? 'C:/Project/RomanPrototype'
     const r = await fetch('/api/claude/run', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ projectPath: _path, prompt: composed, sessionId: sessionId ?? null, attachments }),
+      body: JSON.stringify({ projectPath: _path, prompt: composed, sessionId: sessionId ?? null, attachments, model: sendModel || null, effort: sendEffort || null, qaFlow }),
     }).then(r => r.json()).catch(() => ({ ok: false }))
     if (!r.ok) { flash('送入失敗 — 請改用複製', 6000); return }
     // 少爺 2026-07-07：送入/開新聊天室＝侍酒師工作完成 → 清空購物車與描述(+附檔) + 無接縫導到 Chat（同 History Continue）
@@ -771,6 +785,7 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
     setDraft('')
     setAttachments([])
     setCartOpen(false)
+    setQaFlow(false)  // QA 流程勾選是一次性的——成功送出即歸位
     // ⚠️ onGoToChat 會切分頁 unmount Sommelier，[cart,draft] 持久化 effect 可能來不及跑 → 直接同步清 localStorage，
     // 避免 remount 時 draft 從舊值 re-hydrate（少爺 2026-07-08：cart 清了 draft 沒清的不對稱 bug 根因）
     try { localStorage.setItem(CART_STORE_KEY, JSON.stringify({ items: [], draft: '' })) } catch {}
@@ -1113,7 +1128,22 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
                 className="w-full py-2 rounded border border-[var(--gold)]/60 text-[var(--gold)] text-[11px] tracking-widest uppercase hover:bg-[var(--gold)]/10">
                 🧾 結帳 — 複製組合 Prompt
               </button>
-              {/* 結帳出口 2/3（少爺 2026-07-06）：送入聊天室 / 開新聊天室 */}
+              {/* 結帳出口 2/3（少爺 2026-07-06）：送入聊天室 / 開新聊天室；2026-07-14 加 AI 模型/強度選擇 + QA 流程勾選 */}
+              <div className="flex items-center gap-1.5">
+                <select value={sendModel} onChange={e => setSendModel(e.target.value)} title="送入/開新聊天室時使用的 AI 模型"
+                  className="shrink-0 bg-transparent border border-[var(--border)] rounded px-1 py-0.5 text-[9px] text-[var(--text-muted)] focus:outline-none focus:border-[var(--gold)]/60">
+                  {MODEL_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+                <select value={sendEffort} onChange={e => setSendEffort(e.target.value)} title="模型強度（claude --effort）"
+                  className="shrink-0 bg-transparent border border-[var(--border)] rounded px-1 py-0.5 text-[9px] text-[var(--text-muted)] focus:outline-none focus:border-[var(--gold)]/60">
+                  {EFFORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+                <label title="這個需求附掛 Mode C QA 流程指令（送出後自動取消勾選）"
+                  className={`shrink-0 flex items-center gap-1 text-[9px] cursor-pointer select-none px-1.5 py-0.5 rounded border ${qaFlow ? 'border-[var(--gold)]/60 text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)]'}`}>
+                  <input type="checkbox" checked={qaFlow} onChange={e => setQaFlow(e.target.checked)} className="accent-[var(--gold)] w-3 h-3" />
+                  🧪 QA
+                </label>
+              </div>
               <div className="flex gap-2">
                 <button onClick={openSendMenu}
                   className="flex-1 py-1.5 rounded border border-blue-500/50 text-blue-400 text-[10px] tracking-widest uppercase hover:bg-blue-500/10">
@@ -1132,6 +1162,10 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
                   {chatSessions.map(s => (
                     <button key={s.sessionId} onClick={() => sendToChat(s.sessionId, s.cwd ?? null)}
                       className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-white/5 border-b border-[var(--border)]/50">
+                      {liveIds.has(s.sessionId) && (
+                        <span title="VS Code 開著的活 session——送入會先確認（無頭喚醒該分頁不會即時顯示、有雙寫風險）"
+                          className="text-[8px] px-1 mr-1 rounded border border-green-500/40 text-green-400">🟢 VS Code</span>
+                      )}
                       <span className="text-[var(--text)]">{s.title}</span>
                       <span className="ml-1 text-[var(--text-muted)]">
                         {new Date(s.mtime).toLocaleDateString()}{s.cwd ? ` · ${s.cwd.split(/[\\/]/).pop()}` : ''}

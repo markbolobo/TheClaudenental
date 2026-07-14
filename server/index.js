@@ -96,6 +96,21 @@ function loadPersistedSessions() {
 
 loadPersistedSessions()
 
+// ─── subprocessSids 持久化（少爺 2026-07-14）───────────────────────────────────
+// 純記憶體 Set 在 server 重啟後清空 → 還活著的孤兒喚醒進程的 hook 事件被誤註冊成互動 session
+// （汙染 sessions 清單、也讓「活 session 警示」誤報）。持久化＋開機回濾根治。
+const SUBPROC_SIDS_FILE = path.join(os.homedir(), '.claude', 'tc_subprocess_sids.json')
+function persistSubprocessSids() {
+  try { atomicWriteJson(SUBPROC_SIDS_FILE, [...subprocessSids]) } catch {}
+}
+try {
+  for (const _sid of JSON.parse(fs.readFileSync(SUBPROC_SIDS_FILE, 'utf-8'))) {
+    subprocessSids.add(_sid)
+    // 開機回濾：先前被誤註冊進 sessions 的 TC 子進程 session 一併清掉
+    if (sessions.has(_sid)) sessions.delete(_sid)
+  }
+} catch {}
+
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 
 // A. Health endpoint — dashboard 可顯示連線數 / sessions 數 / 記憶體
@@ -293,7 +308,9 @@ app.post('/hook/Stop', async (request) => {
 app.post('/hook/SessionEnd', async (request) => {
   const e = request.body
   forwardToClaudia(e, 'SessionEnd')
-  if (subprocessSids.has(e.session_id)) { subprocessSids.delete(e.session_id); return { ok: true } }
+  // TC 出身的 sid 永久標記不刪（少爺 2026-07-14）：同 sid 可能有多顆進程（喚醒＋孤兒），
+  // 一顆 SessionEnd 就除名會讓另一顆還活著的事件被誤註冊成互動 session
+  if (subprocessSids.has(e.session_id)) return { ok: true }
   setStatus(e.session_id, 'done')
   emitLog(e.session_id, `[SessionEnd]`)
   return { ok: true }
@@ -369,6 +386,7 @@ app.post('/hook/PermissionRequest', async (request) => {
 app.post('/hook/UserPromptSubmit', async (request) => {
   const e = request.body
   forwardToClaudia(e, 'UserPromptSubmit')
+  if (subprocessSids.has(e.session_id)) return { ok: true }
   const raw = e.prompt ?? ''
   // Strip leading XML system tags (e.g. <task-notification>, <system-reminder>)
   const clean = raw.replace(/^(\s*<[^>]+>[\s\S]*?<\/[^>]+>\s*)+/, '').trim()
@@ -769,6 +787,17 @@ function parseNewLines(filePath, fromLine) {
   return null
 }
 
+// session_live 單一出口（少爺 2026-07-15 修 Chat 重複：4 處 broadcast 收斂到這）——
+// TC 自己 spawn 的子進程「跑動中」時不發 session_live：它的 stdout 已走 claude_stream 直播，
+// 檔案監看再發一次＝同句話雙路上畫面（重複的架構性來源）。進程結束後恢復（外部寫入照常直播）。
+function emitSessionLive(sessionId, messages) {
+  if (subprocessSids.has(sessionId)) {
+    for (const [, e] of claudeProcs)
+      if (e.sessionId === sessionId && e.status === 'running') return
+  }
+  broadcast({ type: 'session_live', sessionId, messages })
+}
+
 // Immediately flush new JSONL lines for a session (called by hooks for real-time updates)
 function flushSessionLive(sessionId) {
   const entry = watchedSessions.get(sessionId)
@@ -776,7 +805,7 @@ function flushSessionLive(sessionId) {
   const result = parseNewLines(entry.filePath, entry.lineCount)
   if (!result || !result.messages.length) return
   entry.lineCount = result.lineCount
-  broadcast({ type: 'session_live', sessionId, messages: result.messages })
+  emitSessionLive(sessionId, result.messages)
 }
 
 app.post('/api/session/watch', async (request) => {
@@ -798,7 +827,7 @@ app.post('/api/session/watch', async (request) => {
     const result = parseNewLines(filePath, entry.lineCount)
     if (!result || !result.messages.length) return
     entry.lineCount = result.lineCount
-    broadcast({ type: 'session_live', sessionId, messages: result.messages })
+    emitSessionLive(sessionId, result.messages)
   })
   watchedSessions.set(sessionId, { watcher, filePath, lineCount })
   return { ok: true }
@@ -903,10 +932,33 @@ function processQueueIfIdle(projectPath) {
   const sid = next.sessionId ?? existing?.sessionId ?? null
   broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath),
     event: { type: 'system', subtype: 'queue_dequeue', queueRemaining: q.length } })
-  spawnClaude(projectPath, next.prompt, sid)
+  spawnClaude(projectPath, next.prompt, sid, next.model ?? null, next.effort ?? null, next.onInit ?? null)
 }
 
-function spawnClaude(projectPath, prompt, sessionId = null) {
+// 少爺 2026-07-14：模型強度白名單（claude CLI --effort 支援值）
+const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max']
+
+// ─── Session 模型/強度偏好（少爺 2026-07-14：仕酒師/Chat 選的模型強度要跟著聊天室——
+//     CLI 的 --model/--effort 是每次啟動參數不進 session，續聊/QA 喚醒沒明選時 server 沿用此偏好）───
+const SESSION_PREFS_FILE = path.join(os.homedir(), '.claude', 'tc_session_prefs.json')
+function readSessionPrefs() {
+  try { return JSON.parse(fs.readFileSync(SESSION_PREFS_FILE, 'utf8')) } catch { return {} }
+}
+function setSessionPrefs(sessionId, model, effort) {
+  if (!sessionId || (!model && !effort)) return
+  const _prefs = readSessionPrefs()
+  const _cur = _prefs[sessionId] ?? {}
+  _prefs[sessionId] = { model: model ?? _cur.model ?? null, effort: effort ?? _cur.effort ?? null, updatedAt: Date.now() }
+  atomicWriteJson(SESSION_PREFS_FILE, _prefs)
+}
+function getSessionPrefs(sessionId) {
+  return sessionId ? (readSessionPrefs()[sessionId] ?? null) : null
+}
+
+// 少爺 2026-07-14：仕酒師/Chat 勾選「啟用 QA 流程」→ 需求 prompt 尾端附掛 Mode C 指令（流程 SSOT 在 skill 與 QA/README，不在此重抄）
+const QA_FLOW_DIRECTIVE = '\n\n(TC QA 流程) 少爺勾選了「啟用 QA 流程」——本需求必須走 Mode C 協作驗證收尾：照 theclaudenental_operator skill 的「QA Run 操作 SOP（Mode C）」與專案 QA/README.md §Mode C，從 Step 0 開 QA Run（POST /api/qa/runs，必綁 boundSessionId=本 session id、wakeMode:"spawn"、boundProjectPath、project），列 QAPC 計畫（操作步驟＋預期 LOG 劇本＋LOG 埋點計畫）供少爺在 QA 分頁審查；少爺按 ▶ 之前零編譯零埋 LOG。'
+
+function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort = null, onInit = null) {
   // ⚠️ 不再 kill existing（會中斷使用者進行中的 thinking）
   // 呼叫端必須先檢查 claudeProcs.get(projectPath)?.status，running 時 push 到 queue 而非呼叫 spawnClaude
 
@@ -920,11 +972,20 @@ function spawnClaude(projectPath, prompt, sessionId = null) {
     '--dangerously-skip-permissions',
     '-p', prompt,
   ]
+  if (effort) args.unshift('--effort', effort)
+  if (model) args.unshift('--model', model)
   if (sessionId) args.unshift('--resume', sessionId)
 
   const proc = spawn(getClaudeExe(), args, { cwd: projectPath, stdio: ['ignore', 'pipe', 'pipe'] })
-  const entry = { proc, sessionId, projectPath, status: 'running' }
+  const entry = { proc, sessionId, projectPath, status: 'running', model, effort }
   claudeProcs.set(projectPath, entry)
+
+  // 少爺 2026-07-14：spawn 參數可觀察化——落 log + 推 Chat 面板顯示（effort 在 init/transcript 皆無痕跡，這裡是唯一觀察點）
+  if (model || effort) {
+    logEvent('claude.spawn.config', { projectPath: normalizePath(projectPath), sessionId, model: model ?? null, effort: effort ?? null })
+    broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath), sessionId: sessionId ?? null,
+      event: { type: 'system', subtype: 'spawn_config', model: model ?? null, effort: effort ?? null } })
+  }
 
   let buf = ''
   proc.stdout.on('data', chunk => {
@@ -939,7 +1000,12 @@ function spawnClaude(projectPath, prompt, sessionId = null) {
         if (event.type === 'system' && event.subtype === 'init') {
           entry.sessionId = event.session_id
           subprocessSids.add(event.session_id)
+          persistSubprocessSids()
           pendingSpawnCwds.delete(normalCwd)
+          // 新聊天室的 model/effort 選擇在拿到 session id 後記成偏好，續聊/QA 喚醒沿用
+          setSessionPrefs(event.session_id, entry.model ?? null, entry.effort ?? null)
+          // 呼叫端要拿新 session id 做後續綁定時用（少爺 2026-07-14：QA 未綁定 run 自動開新聊天室並綁回）
+          if (onInit) try { onInit(event.session_id) } catch {}
         }
         // Skip hook noise
         if (event.type === 'system' && (event.subtype === 'hook_started' || event.subtype === 'hook_response')) continue
@@ -981,27 +1047,37 @@ function saveAttachmentFiles(attachments) {
 }
 
 app.post('/api/claude/run', async (request) => {
-  const { projectPath: rawPath, prompt, sessionId, attachments } = request.body
+  const { projectPath: rawPath, prompt, sessionId, attachments, model, effort, qaFlow } = request.body
   if (!prompt && !(attachments?.length)) return { ok: false, error: 'missing prompt' }
   const projectPath = rawPath?.replace(/\//g, path.sep) // normalize to OS path sep
   if (!isSafeCwd(projectPath)) return { ok: false, error: 'invalid projectPath' }
+  // 少爺 2026-07-14：CHAT / 仕酒師送入聊天室可指定 AI 模型（alias 或全名，交給 claude CLI 驗證）＋模型強度
+  // 明選優先；續聊沒明選 → 沿用該聊天室記住的偏好；有明選則回寫偏好（聊天室從此改用）
+  const _bodyModel = (typeof model === 'string' && model.trim()) ? model.trim() : null
+  const _bodyEffort = EFFORT_LEVELS.includes(effort) ? effort : null
+  const _prefs = sessionId ? getSessionPrefs(sessionId) : null
+  const _model = _bodyModel ?? _prefs?.model ?? null
+  const _effort = _bodyEffort ?? _prefs?.effort ?? null
+  if (sessionId && (_bodyModel || _bodyEffort)) setSessionPrefs(sessionId, _bodyModel, _bodyEffort)
 
   // Save base64 attachments to temp files and append their paths to the prompt
   const tempFiles = saveAttachmentFiles(attachments)
   let fullPrompt = prompt ?? ''
   for (const tmpPath of tempFiles) fullPrompt += `\n${tmpPath}`
+  // 少爺 2026-07-14：勾選啟用 QA 流程 → 需求尾端附掛 Mode C 指令
+  if (qaFlow === true) fullPrompt += QA_FLOW_DIRECTIVE
 
   // 思考中（同 projectPath 已有 running process）→ push 到 queue，不 kill 上一個
   const existing = claudeProcs.get(projectPath)
   if (existing?.status === 'running') {
     let q = claudeRunQueue.get(projectPath)
     if (!q) { q = []; claudeRunQueue.set(projectPath, q) }
-    q.push({ prompt: fullPrompt, sessionId: sessionId ?? existing.sessionId ?? null })
+    q.push({ prompt: fullPrompt, sessionId: sessionId ?? existing.sessionId ?? null, model: _model, effort: _effort })
     broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath),
       event: { type: 'system', subtype: 'queue_enqueue', queuePos: q.length } })
     return { ok: true, queued: true, queuePos: q.length }
   }
-  const entry = spawnClaude(projectPath, fullPrompt, sessionId ?? null)
+  const entry = spawnClaude(projectPath, fullPrompt, sessionId ?? null, _model, _effort)
 
   // Clean up temp files after subprocess closes
   if (tempFiles.length) {
@@ -1154,7 +1230,7 @@ function scanJsonlSessions() {
                 const result = parseNewLines(fp2, entry.lineCount)
                 if (!result || !result.messages.length) return
                 entry.lineCount = result.lineCount
-                broadcast({ type: 'session_live', sessionId: sid, messages: result.messages })
+                emitSessionLive(sid, result.messages)
               })
               watchedSessions.set(sid, { watcher, filePath: fp2, lineCount })
             }
@@ -1183,6 +1259,8 @@ function scanJsonlSessions() {
             } catch {}
           }
           if (!hasActivity) continue   // skip empty/init-only files
+          // TC 自己 spawn 的子進程 session 不進互動 sessions 清單（少爺 2026-07-14：掃描器漏掉這道濾網＝孤兒被誤註冊的根因）
+          if (subprocessSids.has(sid)) continue
           // Determine if session looks "active" (file modified < 3 min ago and no result event at end)
           const recentlyWritten = now - st.mtimeMs < 3 * 60 * 1000
           const lastLine = lines[lines.length - 1] ?? ''
@@ -1211,7 +1289,7 @@ function scanJsonlSessions() {
                 const result = parseNewLines(fp2, entry.lineCount)
                 if (!result || !result.messages.length) return
                 entry.lineCount = result.lineCount
-                broadcast({ type: 'session_live', sessionId: sid, messages: result.messages })
+                emitSessionLive(sid, result.messages)
               })
               watchedSessions.set(sid, { watcher, filePath: fp2, lineCount })
             }
@@ -2700,6 +2778,13 @@ app.post('/api/qa/runs', async (request) => {
     topic: body.topic ?? '(untitled)',
     env: body.env ?? '',
     commit: body.commit ?? '',
+    // 少爺 2026-07-14「環境戳記標準化＋拼圖結合」：branch/map/buildConfig 分欄（不再塞 env 自由文字）；
+    // knowledge=本輪依據拼圖清單（Claude 的理解來源外顯）、knowledgeUpdated=結案沉澱回寫（驗證後修正了哪些理解）
+    branch: typeof body.branch === 'string' ? body.branch : '',
+    map: typeof body.map === 'string' ? body.map : '',
+    buildConfig: typeof body.buildConfig === 'string' ? body.buildConfig : '',
+    knowledge: Array.isArray(body.knowledge) ? body.knowledge.map(k => String(k)) : [],
+    knowledgeUpdated: [],
     boundSessionId: body.boundSessionId ?? null,  // M-6：綁定的 Claude 聊天室 session（會議室預約模式）
     boundProjectPath: body.boundProjectPath ?? null,  // M-6b：spawn 喚醒需要的 cwd
     project: typeof body.project === 'string' ? body.project : null,  // 跨專案：sommelier.json projects[].id；null=早期 run 前端視為 roman
@@ -2794,6 +2879,15 @@ app.patch('/api/qa/runs/:id', async (request, reply) => {
     })
   }
   if (Array.isArray(body.addCriteria)) for (const c of body.addCriteria) run.criteria.push(c)
+  // 少爺 2026-07-14 環境戳記標準欄位：announce 舊路徑建的 run 可事後 PATCH 補填
+  for (const _k of ['env', 'commit', 'branch', 'map', 'buildConfig'])
+    if (typeof body[_k] === 'string') run[_k] = body[_k]
+  // 少爺 2026-07-14 拼圖結合：knowledge=依據拼圖全量更新；knowledgeUpdated=結案沉澱逐筆追加（舊 run 無欄位先補）
+  if (Array.isArray(body.knowledge)) run.knowledge = body.knowledge.map(k => String(k))
+  if (Array.isArray(body.knowledgeUpdated)) {
+    if (!Array.isArray(run.knowledgeUpdated)) run.knowledgeUpdated = []
+    for (const u of body.knowledgeUpdated) run.knowledgeUpdated.push({ path: String(u?.path ?? ''), summary: String(u?.summary ?? ''), t: Date.now() })
+  }
   // 回到待放行（分支重列任務完成 → ▶ 重新出現）時清掉處理中指示（換少爺審）
   if (body.status === 'announced') run.claudeAck = null
   if (body.anomaly) run.anomalies.push({ t: Date.now(), ...body.anomaly })
@@ -2834,21 +2928,48 @@ app.post('/api/qa/runs/:id/events', async (request, reply) => {
 // M-6b：少爺控制動作 → server 主動喚醒綁定的聊天室（wakeMode='spawn' 時）
 // 走既有 /api/claude/run 機器：busy → 排隊；idle → spawnClaude resume 該 session
 const QA_WAKE_ACTIONS = { 'start-now': '按了「▶ 立即開跑」→ 請進入階段二（埋 LOG + 雙編譯 + 重啟 Editor）', pause: '要求暫停', resume: '要求繼續', abort: '要求中止', comment: '留言', close: '按了「✔ 結案」→ 階段五（清 QAC LOG + 雙編譯 + 重啟 Editor；無頭啟動 Editor 用 Start-Process detached）＋維護侍酒師閉環：把本 run 需求「實作驗證後的收斂」沉澱回四種血肉（C++ code / 架構 canvas / 拼圖 memory；藍圖 md 暫跳過），Editor 開著時跑 extract_asset_graph.py 更新藍圖資產層，最後 POST /api/sommelier/refresh/roman 重萃取讓侍酒師吃到最新拼圖' }
-function qaWakeBoundSession(run, action, text, attachPaths = []) {
+function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, effort = null, wakeVisible = false) {
   try {
-    if (!run.boundSessionId || !['spawn', 'cli'].includes(run.wakeMode)) return
+    // monitor 模式＝該 session 自掛監看，不可 spawn（雙寫 transcript）；其餘一律喚醒
+    if (run.wakeMode === 'monitor') return
+    // 少爺 2026-07-14「QA 送出＝仕酒師同做法」：未綁定聊天室（或 wakeMode none）不再沉默——
+    // 像「開新聊天室」spawn 新 session 接手，並在 init 拿到 session id 後自動綁回 run（自癒「沒綁定＝按鈕聾的」）
+    const _unbound = !run.boundSessionId
+    // 留言沒明選模型/強度 → 沿用該聊天室記住的偏好（少爺 2026-07-14）
+    const _sessPrefs = getSessionPrefs(run.boundSessionId)
+    const _model = model ?? _sessPrefs?.model ?? null
+    const _effort = effort ?? _sessPrefs?.effort ?? null
     const detail = QA_WAKE_ACTIONS[action] ?? action
     let prompt = `(TC QA 聯動通知) 少爺在 QA Monitor 對 run「${run.topic}」(${run.id}) ${detail}${text ? `：「${text}」` : ''}。請照 Mode C 流程繼續（QA/README.md §Mode C）。`
+    if (_unbound) prompt += `\n（本 run 原無綁定聊天室，你是新開接手的 session、已自動綁定為本 run 的處理聊天室。請先 GET http://127.0.0.1:3001/api/qa/runs/${run.id}?ackComments=1 讀完整 run 內容與留言再照 SOP 處理。）`
     for (const _p of (Array.isArray(attachPaths) ? attachPaths : [])) prompt += `\n${_p}`
     const projectPath = (run.boundProjectPath ?? 'C:/Project/RomanPrototype').replace(/\//g, path.sep)
-    if (!isSafeCwd(projectPath)) return
+    if (!isSafeCwd(projectPath)) { logEvent('qa.wake.error', { id: run.id, action, error: `unsafe cwd ${projectPath}` }); return }
+    // 新開接手的 session 在 init 後綁回 run（之後的留言/結案就走正常 resume）
+    const _onInit = _unbound ? (sid) => {
+      const _data = readQaRuns()
+      const _r = _data.runs.find(x => x.id === run.id)
+      if (!_r) return
+      _r.boundSessionId = sid
+      _r.wakeMode = 'spawn'
+      if (!_r.boundProjectPath) _r.boundProjectPath = normalizePath(projectPath)
+      _r.updatedAt = Date.now()
+      writeQaRuns(_data)
+      qaBroadcast(_r)
+      logEvent('qa.wake.autobind', { id: run.id, sessionId: sid })
+    } : null
     // wakeMode 'cli'（少爺 2026-07-06）：開「可視的互動式 Claude CLI 視窗」resume 該聊天室 —
     // 同一顆 claude 執行檔，非 -p 無頭管線 → 少爺能直接看到處理過程（黑視窗問題的解）
-    if (run.wakeMode === 'cli') {
+    // 少爺 2026-07-14：留言可勾「開視窗」→ 本次喚醒改開可視互動 CLI（僅限已綁定且該專案沒有進行中的無頭進程——避免同 session 雙寫）
+    const _busy = claudeProcs.get(projectPath)?.status === 'running'
+    const _useCli = (run.wakeMode === 'cli' || wakeVisible === true) && run.boundSessionId && !_busy
+    if (_useCli) {
       const _exe = getClaudeExe().replace(/'/g, "''")
       const _path = projectPath.replace(/'/g, "''")
       const _prompt = prompt.replace(/'/g, "''")
-      const _ps = `Start-Process -FilePath '${_exe}' -WorkingDirectory '${_path}' -ArgumentList '--resume','${run.boundSessionId}','${_prompt}'`
+      const _modelArgs = _model ? `'--model','${String(_model).replace(/'/g, "''")}',` : ''
+      const _effortArgs = _effort ? `'--effort','${String(_effort).replace(/'/g, "''")}',` : ''
+      const _ps = `Start-Process -FilePath '${_exe}' -WorkingDirectory '${_path}' -ArgumentList ${_modelArgs}${_effortArgs}'--resume','${run.boundSessionId}','${_prompt}'`
       const p = spawn('powershell.exe', ['-NoProfile', '-Command', _ps], { detached: true, stdio: 'ignore' })
       p.unref()
       logEvent('qa.wake.cli', { id: run.id, action, sessionId: run.boundSessionId })
@@ -2858,11 +2979,18 @@ function qaWakeBoundSession(run, action, text, attachPaths = []) {
     if (existing?.status === 'running') {
       let q = claudeRunQueue.get(projectPath)
       if (!q) { q = []; claudeRunQueue.set(projectPath, q) }
-      q.push({ prompt, sessionId: run.boundSessionId })
-      logEvent('qa.wake.queued', { id: run.id, action, sessionId: run.boundSessionId })
+      // 同 session 已有排隊中的喚醒 → 併入同一則（少爺 2026-07-15 修：喚醒堆積成 N 個回合、每回合重複回答）
+      const _pending = q.find(x => x.sessionId === (run.boundSessionId ?? null))
+      if (_pending) {
+        _pending.prompt += `\n\n(追加喚醒) ${prompt}`
+        logEvent('qa.wake.coalesced', { id: run.id, action, sessionId: run.boundSessionId ?? null })
+      } else {
+        q.push({ prompt, sessionId: run.boundSessionId ?? null, model: _model, effort: _effort, onInit: _onInit })
+        logEvent('qa.wake.queued', { id: run.id, action, sessionId: run.boundSessionId ?? null })
+      }
     } else {
-      spawnClaude(projectPath, prompt, run.boundSessionId)
-      logEvent('qa.wake.spawned', { id: run.id, action, sessionId: run.boundSessionId })
+      spawnClaude(projectPath, prompt, run.boundSessionId ?? null, _model, _effort, _onInit)
+      logEvent('qa.wake.spawned', { id: run.id, action, sessionId: run.boundSessionId ?? null })
     }
   } catch (e) { logEvent('qa.wake.error', { id: run.id, action, error: String(e?.message ?? e) }) }
 }
@@ -2873,7 +3001,10 @@ app.post('/api/qa/runs/:id/control', async (request, reply) => {
   const data = readQaRuns()
   const run = data.runs.find(r => r.id === request.params.id)
   if (!run) { reply.code(404); return { ok: false, error: 'not found' } }
-  const { action, text, itemId, attachments } = request.body ?? {}
+  const { action, text, itemId, attachments, model, effort, wakeVisible } = request.body ?? {}
+  // 少爺 2026-07-14：QA 留言可指定喚醒子進程的 AI 模型＋強度（只在 comment 動作使用）
+  const _wakeModel = (typeof model === 'string' && model.trim()) ? model.trim() : null
+  const _wakeEffort = EFFORT_LEVELS.includes(effort) ? effort : null
   let _attachPaths = []   // comment 附檔存成 temp 檔的路徑，append 到喚醒 prompt 讓 Claude 讀
   if (action === 'start-now') {
     if (run.status === 'announced' || run.status === 'countdown') {
@@ -2912,7 +3043,7 @@ app.post('/api/qa/runs/:id/control', async (request, reply) => {
   writeQaRuns(data)
   logEvent('qa.run.control', { id: run.id, action })
   qaBroadcast(run)
-  qaWakeBoundSession(run, action, action === 'comment' ? String(text ?? '') : '', _attachPaths)
+  qaWakeBoundSession(run, action, action === 'comment' ? String(text ?? '') : '', _attachPaths, action === 'comment' ? _wakeModel : null, action === 'comment' ? _wakeEffort : null, wakeVisible === true)
   return { ok: true, run }
 })
 
