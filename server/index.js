@@ -111,6 +111,29 @@ try {
   }
 } catch {}
 
+// 不明 Session 名稱回填（少爺 2026-07-15：側欄不該只顯示「Session」字樣）——
+// 舊持久化資料裡命名從未解析的，開機後從 transcript 補（aiTitle→首句）；找不到紀錄的標明讓少爺好清。
+// ⚠️ 延遲執行：getSessionTopic 依賴檔案後段才宣告的 CLAUDE_DIR（TDZ），不可在模組頂層直接呼叫
+setTimeout(() => {
+  try {
+    let _changed = 0
+    for (const [_sid, _s] of [...sessions]) {
+      // 全 projects 無 transcript ＝ 幽靈進程殘留（一句對話都沒寫）→ 直接移除，不留「(無紀錄)」垃圾條目
+      if (!findJsonlPath(_sid)) {
+        if (_s.status === 'active' || _s.status === 'waiting') continue   // 剛啟動還沒寫第一句的合法 session 不誤殺
+        sessions.delete(_sid)
+        broadcast({ type: 'session_remove', sessionId: _sid })
+        _changed++
+        continue
+      }
+      if (_s.displayName && _s.displayName !== 'Session') continue
+      const _topic = getSessionTopic(_sid)
+      if (_topic) { _s.topic = _s.topic ?? _topic; _s.displayName = _topic.slice(0, 40); broadcast({ type: 'session', session: _s }); _changed++ }
+    }
+    if (_changed) schedulePersist()
+  } catch {}
+}, 3000)
+
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 
 // A. Health endpoint — dashboard 可顯示連線數 / sessions 數 / 記憶體
@@ -287,7 +310,15 @@ app.post('/hook/Stop', async (request) => {
   const reason = e.stop_reason ?? ''
   const isSleeping = reason === 'max_tokens'
   const status = isSleeping ? 'sleeping' : 'done'
+  // 幽靈進程不建檔（少爺 2026-07-15「為什麼會有(無紀錄)」根治）：未知 session 的 Stop 且全 projects 無 transcript
+  // ＝短命進程（如 resume 撞鎖即死），建了也只是「(無紀錄)」垃圾條目
+  if (!sessions.has(e.session_id) && !findJsonlPath(e.session_id)) return { ok: true }
   const s = upsertSession(e.session_id)
+  // 名稱自癒（少爺 2026-07-15）：server 重啟後第一個事件是 Stop 的 session 會掛預設名，這裡補解析
+  if (s.displayName === 'Session') {
+    const _topic = getSessionTopic(e.session_id)
+    if (_topic) { s.topic = s.topic ?? _topic; s.displayName = _topic.slice(0, 40) }
+  }
   if (isSleeping) s.sleepingAt = Date.now()
   else s.sleepingAt = null
   // Accumulate token usage
