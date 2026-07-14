@@ -115,19 +115,25 @@ try {
 // 不明 Session 名稱回填（少爺 2026-07-15：側欄不該只顯示「Session」字樣）——
 // 舊持久化資料裡命名從未解析的，開機後從 transcript 補（aiTitle→首句）；找不到紀錄的標明讓少爺好清。
 // ⚠️ 延遲執行：getSessionTopic 依賴檔案後段才宣告的 CLAUDE_DIR（TDZ），不可在模組頂層直接呼叫
-setTimeout(() => {
+// 幽靈 session 清掃（少爺 2026-07-15：開機一次不夠——子代理/短命進程運行中隨時長出來 → 週期執行）
+function sweepGhostSessions(deep = false) {
   try {
     let _changed = 0
+    const _now = Date.now()
     for (const [_sid, _s] of [...sessions]) {
-      // 全 projects 無 transcript ＝ 幽靈進程殘留（一句對話都沒寫）→ 直接移除，不留「(無紀錄)」垃圾條目
+      // 全 projects 無 transcript ＝ 幽靈進程殘留（一句對話都沒寫）→ 直接移除，不留垃圾條目
       if (!findJsonlPath(_sid)) {
-        if (_s.status === 'active' || _s.status === 'waiting') continue   // 剛啟動還沒寫第一句的合法 session 不誤殺
+        // 剛啟動還沒寫第一句的合法 session 不誤殺：active/waiting 給 15 分鐘寬限
+        const _age = _now - (_s.startedAt ?? 0)
+        if ((_s.status === 'active' || _s.status === 'waiting') && _age < 15 * 60 * 1000) continue
         sessions.delete(_sid)
         broadcast({ type: 'session_remove', sessionId: _sid })
         _changed++
         continue
       }
-      // 名稱收斂到「最初首句」（＝HISTORY 同款 aiTitle→首句；少爺 2026-07-15：名稱不可漂移成最新 prompt）
+      // 名稱收斂到「最初首句」（＝HISTORY 同款 aiTitle→首句；名稱不可漂移成最新 prompt）。
+      // deep=開機全量收斂；週期 sweep 只補 generic 名（大 transcript 全解析不便宜，不每 10 分鐘做）
+      if (!deep && _s.displayName !== 'Session') continue
       const _initial = getSessionTopic(_sid)
       if (_initial && _s.displayName !== _initial.slice(0, 40)) {
         _s.topic = _initial
@@ -138,7 +144,9 @@ setTimeout(() => {
     }
     if (_changed) schedulePersist()
   } catch {}
-}, 3000)
+}
+setTimeout(() => sweepGhostSessions(true), 3000)
+setInterval(() => sweepGhostSessions(false), 3 * 60 * 1000)
 
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 
@@ -244,6 +252,8 @@ function upsertSession(sessionId, patch = {}) {
       status: 'active',
       startedAt: Date.now(),
     })
+    // 臨時診斷（少爺 2026-07-15 不明聊天室溯源）：記錄「誰建的檔」——抓到來源後移除
+    try { logEvent('debug.session.created', { sid: sessionId, via: new Error().stack.split('\n').slice(2, 4).map(x => x.trim()).join(' <- ') }) } catch {}
   }
   const s = sessions.get(sessionId)
   Object.assign(s, patch)
@@ -282,6 +292,7 @@ app.post('/hook', async (request) => {
 // SessionStart
 app.post('/hook/SessionStart', async (request) => {
   const e = request.body
+  logEvent('debug.sessionstart', e)  // 臨時診斷（少爺 2026-07-15 子代理辨識）：抓 payload 欄位，確認後移除
   forwardToClaudia(e, 'SessionStart')
   // Ignore sessions spawned by our own subprocess — they appear in Chat, not Sessions list
   // Check both confirmed session_ids and pending spawns (by cwd) to handle race condition
@@ -348,6 +359,9 @@ app.post('/hook/SessionEnd', async (request) => {
   // TC 出身的 sid 永久標記不刪（少爺 2026-07-14）：同 sid 可能有多顆進程（喚醒＋孤兒），
   // 一顆 SessionEnd 就除名會讓另一顆還活著的事件被誤註冊成互動 session
   if (subprocessSids.has(e.session_id)) return { ok: true }
+  // 未知 session 的 SessionEnd 不建檔（少爺 2026-07-15：VS Code 重載時舊視窗齊發 SessionEnd，
+  // setStatus 憑空建出一排無名條目）——沒追蹤過的 session 結束了也沒東西好更新
+  if (!sessions.has(e.session_id)) return { ok: true }
   setStatus(e.session_id, 'done')
   emitLog(e.session_id, `[SessionEnd]`)
   return { ok: true }
@@ -396,6 +410,9 @@ app.post('/hook/PostToolUse', async (request) => {
 app.post('/hook/PermissionRequest', async (request) => {
   const e = request.body
   forwardToClaudia(e, 'PermissionRequest')
+  // TC 子進程（含 👁 cli 視窗喚醒）的權限詢問不走 TC 卡片（少爺 2026-07-15：此入口原本無過濾，
+  // cli 視窗的 PermissionRequest 把 136dd7dd 憑空註冊成無名條目）——回 ok 讓它退回自己視窗內詢問
+  if (subprocessSids.has(e.session_id)) return { ok: true }
   setStatus(e.session_id, 'waiting')
   const summary = toolSummary(e.tool_name, e.tool_input)
   emitLog(e.session_id, `[Permission] ${e.tool_name}: ${summary}`, 'permission')
@@ -1281,6 +1298,7 @@ function scanJsonlSessions() {
           const lines = fs.readFileSync(fp, 'utf-8').split('\n').filter(Boolean)
           let cwd = null, aiTitle = null, firstUser = null, lastStatus = 'done'
           let hasActivity = false
+          let lastMsgTs = 0   // 最後一句「真實對話」（user/assistant）的時間——metadata 行（last-prompt 等）不算
           for (const l of lines) {
             try {
               const o = JSON.parse(l)
@@ -1293,6 +1311,10 @@ function scanJsonlSessions() {
                 if (clean) firstUser = clean.slice(0, 60)
               }
               if (o.type === 'assistant') hasActivity = true
+              if ((o.type === 'user' || o.type === 'assistant') && o.timestamp) {
+                const _t = Date.parse(o.timestamp)
+                if (_t > lastMsgTs) lastMsgTs = _t
+              }
               // Most recent result/stop tells us status
               if (o.type === 'result') lastStatus = 'done'
             } catch {}
@@ -1300,12 +1322,16 @@ function scanJsonlSessions() {
           if (!hasActivity) continue   // skip empty/init-only files
           // TC 自己 spawn 的子進程 session 不進互動 sessions 清單（少爺 2026-07-14：掃描器漏掉這道濾網＝孤兒被誤註冊的根因）
           if (subprocessSids.has(sid)) continue
+          // 復活判定看「最後真實對話」不看檔案 mtime（少爺 2026-07-15：VS Code 重載會對所有舊 session 檔
+          // 補 last-prompt 中繼行 → mtime 全新 → 清掉的舊 session 被掃描器復活）——沒新對話的不重新註冊
+          if (!sessions.has(sid) && (!lastMsgTs || now - lastMsgTs > SCAN_WINDOW_MS)) continue
           // Determine if session looks "active" (file modified < 3 min ago and no result event at end)
           const recentlyWritten = now - st.mtimeMs < 3 * 60 * 1000
           const lastLine = lines[lines.length - 1] ?? ''
           let lastType = null
           try { lastType = JSON.parse(lastLine).type } catch {}
-          const looksActive = recentlyWritten && lastType !== 'result'
+          // active 判定也看真實對話時間（metadata 觸碰不該讓舊 session 亮綠燈）
+          const looksActive = recentlyWritten && lastType !== 'result' && (now - lastMsgTs < 3 * 60 * 1000)
           const status = looksActive ? 'active' : 'done'
           const displayName = aiTitle ?? firstUser ?? sid.slice(0, 8)
           // Upsert — only protect active→done downgrade when file is very recent
