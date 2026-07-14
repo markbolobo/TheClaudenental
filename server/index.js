@@ -79,7 +79,8 @@ function persistSessions() {
   try {
     const data = {}
     for (const [id, s] of sessions) data[id] = s
-    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data))
+    // atomic 寫入（少爺 2026-07-15）：崩潰時 writeFileSync 半寫會截斷檔案 → 下次開機全部 session 名稱/topic 遺失
+    atomicWriteJson(SESSIONS_FILE, data)
   } catch {}
 }
 
@@ -126,9 +127,14 @@ setTimeout(() => {
         _changed++
         continue
       }
-      if (_s.displayName && _s.displayName !== 'Session') continue
-      const _topic = getSessionTopic(_sid)
-      if (_topic) { _s.topic = _s.topic ?? _topic; _s.displayName = _topic.slice(0, 40); broadcast({ type: 'session', session: _s }); _changed++ }
+      // 名稱收斂到「最初首句」（＝HISTORY 同款 aiTitle→首句；少爺 2026-07-15：名稱不可漂移成最新 prompt）
+      const _initial = getSessionTopic(_sid)
+      if (_initial && _s.displayName !== _initial.slice(0, 40)) {
+        _s.topic = _initial
+        _s.displayName = _initial.slice(0, 40)
+        broadcast({ type: 'session', session: _s })
+        _changed++
+      }
     }
     if (_changed) schedulePersist()
   } catch {}
@@ -429,10 +435,12 @@ app.post('/hook/UserPromptSubmit', async (request) => {
     s.cwd = e.cwd
     if (s.displayName === 'Session') s.displayName = projectName(e.cwd)
   }
-  // First real human message becomes the display name
+  // 名稱＝對話「最初」首句，永遠與 HISTORY 同款（少爺 2026-07-15：entry 遺失重建後不可被最新 prompt 蓋名——
+  // 先從 transcript 解析最初首句/aiTitle，只有全新 session（transcript 還沒有 user 訊息）才用當前 prompt）
   if (!s.topic && clean) {
-    s.topic = clean
-    s.displayName = clean.slice(0, 40)
+    const _initial = getSessionTopic(e.session_id) ?? clean
+    s.topic = _initial
+    s.displayName = _initial.slice(0, 40)
   }
   broadcast({ type: 'session', session: s })
   emitLog(e.session_id, `[Prompt] ${preview}`, 'user')
