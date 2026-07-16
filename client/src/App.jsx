@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react'
+import { useState, useEffect, useRef, useCallback, useLayoutEffect, useMemo } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { DndContext, PointerSensor, TouchSensor, useSensor, useSensors, closestCenter } from '@dnd-kit/core'
@@ -392,9 +392,113 @@ function HistoryMessage({ message: m }) {
 }
 
 
+// ─── Outline minimap（少爺 2026-07-16：ChatGPT/Notion 式對話大綱）──────────────
+// 條目=少爺的留言。平常收合成右緣 tick 簡圖，hover/點擊展開成清單；
+// 點條目捲動聊天室到該留言；聊天室捲動位置反向同步高亮條目（Notion 進度同步）。
+
+const OUTLINE_MAX_TICKS = 48
+
+/** 從訊息列表抽大綱條目 + 追蹤捲動位置對應的 active 條目（Chat / History 共用） */
+function useChatOutline(containerRef, messages, prefix, disabled = false) {
+  const [activeId, setActiveId] = useState(null)
+  const entries = useMemo(() => {
+    if (disabled) return []
+    const _list = []
+    messages.forEach((m, idx) => {
+      if (m.role !== 'user') return
+      const _raw = (m.text ?? '').trim()
+      // 系統產物不進大綱（compact 續傳摘要 / skill 展開文 / caveat）——大綱只放少爺親手打的留言
+      if (!_raw || _raw.startsWith('Caveat:') || _raw.startsWith('Base directory for this skill') || _raw.includes('This session is being continued')) return
+      const _label = _raw.split('\n')[0].replace(/^[>›\s]+/, '').slice(0, 80)
+      if (_label) _list.push({ id: `${prefix}-${idx}`, absIdx: idx, label: _label })
+    })
+    return _list
+  }, [messages, prefix, disabled])
+  // active = 「捲動視窗上緣 30% 線」以上最後一個條目（Notion 式「目前所在區塊」）
+  const update = useCallback(() => {
+    const _el = containerRef.current
+    if (!_el || !entries.length) { setActiveId(null); return }
+    const _threshold = _el.scrollTop + _el.clientHeight * 0.3
+    let _current = entries[0].id
+    for (const e of entries) {
+      const _node = document.getElementById(e.id)
+      if (!_node) continue
+      if (_node.offsetTop <= _threshold) _current = e.id
+      else break
+    }
+    setActiveId(_current)
+  }, [entries, containerRef])
+  useEffect(() => { update() }, [update, messages])
+  return { entries, activeId, update }
+}
+
+function OutlineMinimap({ entries, activeId, onJump }) {
+  const [expanded, setExpanded] = useState(false)
+  const panelRef = useRef(null)
+
+  // 展開時讓 active 條目維持在面板可視範圍（跟著聊天室捲動走）
+  useEffect(() => {
+    if (!expanded || !activeId) return
+    panelRef.current?.querySelector(`[data-oid="${activeId}"]`)?.scrollIntoView({ block: 'nearest' })
+  }, [expanded, activeId])
+
+  if (entries.length < 2) return null
+
+  // tick 過多時等距抽樣（active 條目永遠保留，確保高亮不消失）
+  let ticks = entries
+  if (entries.length > OUTLINE_MAX_TICKS) {
+    const _step = entries.length / OUTLINE_MAX_TICKS
+    const _picked = []
+    for (let i = 0; i < OUTLINE_MAX_TICKS; i++) _picked.push(entries[Math.floor(i * _step)])
+    if (activeId && !_picked.some(e => e.id === activeId)) {
+      const _act = entries.find(e => e.id === activeId)
+      if (_act) _picked.splice(_picked.findIndex(e => e.absIdx > _act.absIdx), 0, _act)
+    }
+    ticks = _picked
+  }
+
+  return (
+    <div
+      className="absolute inset-y-0 right-1 z-20 flex items-stretch"
+      onMouseEnter={() => setExpanded(true)}
+      onMouseLeave={() => setExpanded(false)}
+    >
+      {expanded ? (
+        <div ref={panelRef}
+          className="self-center max-h-[92%] my-2 w-[240px] max-w-[70vw] overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--surface)]/95 backdrop-blur-sm shadow-xl py-1">
+          {entries.map(e => (
+            <button key={e.id} data-oid={e.id}
+              onClick={() => { onJump(e); setExpanded(false) }}
+              className={`block w-full text-left px-2.5 py-[5px] text-[10px] leading-snug truncate border-l-2 ${
+                e.id === activeId
+                  ? 'text-[var(--gold)] bg-[var(--gold)]/10 border-[var(--gold)]'
+                  : 'text-[var(--text-muted)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] border-transparent'
+              }`}>
+              {e.label}
+            </button>
+          ))}
+        </div>
+      ) : (
+        <div
+          onClick={() => setExpanded(true)}
+          className="flex w-6 cursor-pointer flex-col items-end justify-center gap-[5px] overflow-hidden py-4">
+          {ticks.map(e => (
+            <div key={e.id}
+              className={`h-[2px] rounded-full transition-all ${
+                e.id === activeId ? 'w-4 bg-[var(--gold)]' : 'w-2.5 bg-[var(--text-muted)]/40'
+              }`} />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function HistoryPanel({ onContinue }) {
   const [list, setList] = useState([])
   const [active, setActive] = useState(null)
+  // 少爺 2026-07-16：點 tag 過濾聊天室（跨室檢索——「哪幾個聊天室都在打野蠻人」）
+  const [tagFilter, setTagFilter] = useState(null)
   const [messages, setMessages] = useState([])
   const [activeCost, setActiveCost] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -402,6 +506,45 @@ function HistoryPanel({ onContinue }) {
   useEffect(() => {
     fetch('/api/history').then(r => r.json()).then(d => setList(d.sessions ?? []))
   }, [])
+
+  // 少爺 2026-07-16 Phase2：LLM tag 是背景排隊產生的 → 列表顯示期間輪詢快取端點合併
+  // （輕量端點只讀 in-memory cache，不重掃 transcript）
+  useEffect(() => {
+    if (active) return
+    const _iv = setInterval(() => {
+      fetch('/api/history/tags').then(r => r.json()).then(d => {
+        if (!d?.tags) return
+        setList(prev => prev.map(s => d.tags[s.sessionId]
+          ? { ...s, tags: d.tags[s.sessionId].tags, summary: d.tags[s.sessionId].summary, knowledge: d.tags[s.sessionId].knowledge, llm: true }
+          : s))
+      }).catch(() => {})
+    }, 15000)
+    return () => clearInterval(_iv)
+  }, [active])
+
+  // 少爺 2026-07-16：History 詳閱頁也掛大綱 minimap（條目=少爺留言）
+  const histScrollRef = useRef(null)
+  const outline = useChatOutline(histScrollRef, messages, 'histmsg')
+
+  function jumpToOutline(entry) {
+    document.getElementById(entry.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+
+  // 少爺 2026-07-16：tag/summary 校正（新增=重標必保留、移除=重標不再回來、少爺的話蓋過 LLM）
+  const [tagDraft, setTagDraft] = useState('')
+  const [editingSummary, setEditingSummary] = useState(false)
+  const [summaryDraft, setSummaryDraft] = useState('')
+
+  async function patchTags(body) {
+    if (!active) return
+    const d = await fetch(`/api/history/${active.sessionId}/tags`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    }).then(r => r.json()).catch(() => null)
+    if (!d?.ok) return
+    setActive(a => ({ ...a, tags: d.tags, summary: d.summary, knowledge: d.knowledge, llm: true }))
+    setList(prev => prev.map(s => s.sessionId === active.sessionId
+      ? { ...s, tags: d.tags, summary: d.summary, knowledge: d.knowledge, llm: true } : s))
+  }
 
   async function open(s) {
     setActive(s); setLoading(true); setActiveCost(null)
@@ -414,7 +557,7 @@ function HistoryPanel({ onContinue }) {
   if (active) return (
     <div className="flex flex-col h-full">
       <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--border)] shrink-0">
-        <button onClick={() => setActive(null)} className="text-[var(--text-muted)] hover:text-[var(--text)] text-xs">← Back</button>
+        <button onClick={() => { setActive(null); setMessages([]) }} className="text-[var(--text-muted)] hover:text-[var(--text)] text-xs">← Back</button>
         <span className="flex-1 text-xs text-[var(--text-h)] truncate">{active.title}</span>
         {activeCost != null && (
           <span className="shrink-0 text-[10px] text-[var(--gold)]/80">{fmtCost(activeCost)}</span>
@@ -428,79 +571,108 @@ function HistoryPanel({ onContinue }) {
           </button>
         )}
       </div>
-      <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2">
-        {loading && <div className="text-[var(--text-muted)] text-xs">Loading…</div>}
-        {messages.map((m, i) => (
-          <HistoryMessage key={i} message={m} />
-        ))}
+      {/* LLM 語意摘要 + 標籤校正 + 相關拼圖（Phase2：少爺可編輯——校正 LLM 認知，校正必勝重標） */}
+      <div className="px-3 py-1.5 border-b border-[var(--border)]/60 bg-[var(--surface-2)]/40 shrink-0 space-y-1">
+        {editingSummary ? (
+          <input autoFocus value={summaryDraft} onChange={e => setSummaryDraft(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') { patchTags({ summary: summaryDraft }); setEditingSummary(false) }
+              if (e.key === 'Escape') setEditingSummary(false)
+            }}
+            className="w-full bg-[var(--surface-2)] border border-[var(--gold-border)] rounded px-2 py-0.5 text-[10px] text-[var(--text-h)] focus:outline-none" />
+        ) : (
+          <div className="text-[10px] text-[var(--text)] flex items-center gap-1">
+            <span className="flex-1">📎 {active.summary || '（尚無 LLM 摘要——排隊標記中）'}</span>
+            <button onClick={() => { setSummaryDraft(active.summary ?? ''); setEditingSummary(true) }}
+              className="shrink-0 text-[var(--text-muted)] hover:text-[var(--gold)]" title="校正摘要">✏</button>
+          </div>
+        )}
+        <div className="flex flex-wrap items-center gap-1">
+          {(active.tags ?? []).map((t, i) => (
+            <span key={i} className="text-[9px] px-1.5 py-0.5 rounded-full border border-[var(--gold-border)] bg-[var(--gold-dim)] text-[var(--text)]">
+              <span className="text-[var(--gold)]/70">#</span>{t}
+              <button onClick={() => patchTags({ removeTag: t })} title="移除（LLM 重標不會再加回）"
+                className="ml-1 text-[var(--text-muted)] hover:text-[var(--red)]">✕</button>
+            </span>
+          ))}
+          <input value={tagDraft} onChange={e => setTagDraft(e.target.value)} placeholder="＋新增標籤"
+            onKeyDown={e => { if (e.key === 'Enter' && tagDraft.trim()) { patchTags({ addTag: tagDraft.trim() }); setTagDraft('') } }}
+            className="w-24 bg-transparent border border-[var(--border)] rounded-full px-2 py-0.5 text-[9px] text-[var(--text)] focus:outline-none focus:border-[var(--gold-border)]" />
+        </div>
+        {(active.knowledge ?? []).some(k => k.docs?.length) && (
+          <div className="flex flex-wrap gap-1">
+            {active.knowledge.filter(k => k.docs?.length).map((k, i) => (
+              <button key={i} title={`${k.docs.join('\n')}\n（點擊在 VSCode 開第一份拼圖）`}
+                onClick={() => openInVSCode(k.docs[0])}
+                className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--gold-border)] text-[var(--gold)]/80 hover:bg-[var(--gold-dim)] hover:text-[var(--gold)] cursor-pointer">
+                🧩 {k.term}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      {/* relative wrapper：讓大綱 minimap 疊在捲動區右緣、不隨內容捲動 */}
+      <div className="relative flex-1 min-h-0">
+        <div ref={histScrollRef} onScroll={outline.update} className="h-full overflow-y-auto px-3 py-2 space-y-2">
+          {loading && <div className="text-[var(--text-muted)] text-xs">Loading…</div>}
+          {messages.map((m, i) => (
+            m.role === 'user'
+              ? <div key={i} id={`histmsg-${i}`}><HistoryMessage message={m} /></div>
+              : <HistoryMessage key={i} message={m} />
+          ))}
+        </div>
+        <OutlineMinimap entries={outline.entries} activeId={outline.activeId} onJump={jumpToOutline} />
       </div>
     </div>
   )
+
+  const shownList = tagFilter ? list.filter(s => (s.tags ?? []).includes(tagFilter)) : list
 
   return (
     <div className="flex-1 overflow-y-auto px-2 py-2">
-      {list.length === 0 && <div className="text-[var(--text-muted)] text-xs text-center mt-8">No history</div>}
-      {list.map(s => (
-        <div key={s.sessionId} onClick={() => open(s)}
-          className="px-3 py-2 rounded hover:bg-[var(--surface-2)] cursor-pointer mb-1">
-          <div className="text-xs text-[var(--text-h)] truncate">{s.title}</div>
-          <div className="flex items-center gap-1.5 text-[10px] text-[var(--text-muted)]">
-            <span className="truncate">{s.project.replace('c--', '').replace(/-/g,'/')} · {new Date(s.mtime).toLocaleDateString()}</span>
-            {s.costUsd != null && <span className="shrink-0 text-[var(--gold)]/70">{fmtCost(s.costUsd)}</span>}
+      {/* tag 過濾列（點列表任一 tag 進入；✕ 清除） */}
+      {tagFilter && (
+        <div className="flex items-center gap-2 px-2 py-1.5 mb-1 rounded border border-[var(--gold-border)] bg-[var(--gold-dim)]">
+          <span className="text-[10px] text-[var(--gold)]">
+            <span className="opacity-70">#</span>{tagFilter}
+          </span>
+          <span className="text-[9px] text-[var(--text-muted)]">{shownList.length} 個聊天室</span>
+          <button onClick={() => setTagFilter(null)}
+            className="ml-auto text-[10px] text-[var(--text-muted)] hover:text-[var(--text)]">✕ 清除過濾</button>
+        </div>
+      )}
+      {shownList.length === 0 && (
+        <div className="text-[var(--text-muted)] text-xs text-center mt-8">
+          {tagFilter ? `沒有聊天室帶 #${tagFilter}` : 'No history'}
+        </div>
+      )}
+      {shownList.map(s => (
+        <div key={s.sessionId} onClick={() => open(s)} title={s.summary || undefined}
+          className="flex items-start gap-2 px-3 py-2 rounded hover:bg-[var(--surface-2)] cursor-pointer mb-1">
+          <div className="flex-1 min-w-0">
+            <div className="text-xs text-[var(--text-h)] truncate">{s.title}</div>
+            <div className="flex items-center gap-1.5 text-[10px] text-[var(--text-muted)]">
+              <span className="truncate">{s.project.replace('c--', '').replace(/-/g,'/')} · {new Date(s.mtime).toLocaleDateString()}</span>
+              {s.costUsd != null && <span className="shrink-0 text-[var(--gold)]/70">{fmtCost(s.costUsd)}</span>}
+            </div>
           </div>
+          {/* 少爺 2026-07-16：聊天室重點 hashtag（LLM 語意 tag=金框；點 tag 過濾同主題聊天室） */}
+          {Array.isArray(s.tags) && s.tags.length > 0 && (
+            <div className="shrink-0 max-w-[45%] flex flex-wrap gap-1 justify-end pt-0.5">
+              {s.tags.map((t, ti) => (
+                <span key={ti}
+                  onClick={e => { e.stopPropagation(); setTagFilter(t) }}
+                  title={`${s.llm ? (s.summary || 'LLM 語意標籤') : '暫用詞頻墊檔——LLM 語意標籤排隊中，標完自動變金框'}\n（點擊過濾 #${t}）`}
+                  className={`text-[9px] leading-tight px-1.5 py-0.5 rounded-full border whitespace-nowrap cursor-pointer hover:border-[var(--gold)] ${s.llm
+                    ? 'border-[var(--gold-border)] bg-[var(--gold-dim)] text-[var(--text)]'
+                    : 'border-[var(--border-2)] bg-[var(--surface-2)]/70 text-[var(--text-muted)]'}`}>
+                  <span className="text-[var(--gold)]/70">#</span>{t}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       ))}
-    </div>
-  )
-}
-
-function CheckpointsPanel({ selected }) {
-  const [checkpoints, setCheckpoints] = useState([])
-  const [msg, setMsg] = useState('')
-  const [loading, setLoading] = useState(false)
-  const cwd = selected?.cwd ?? ''
-
-  const reload = useCallback(() => {
-    if (!cwd) return
-    fetch(`/api/checkpoints?cwd=${encodeURIComponent(cwd)}`).then(r=>r.json()).then(d => setCheckpoints(d.checkpoints ?? []))
-  }, [cwd])
-
-  useEffect(() => { reload() }, [reload])
-
-  async function create() {
-    setLoading(true)
-    await fetch('/api/checkpoints', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cwd, message: msg }) })
-    setMsg(''); reload(); setLoading(false)
-  }
-
-  async function restore(hash) {
-    if (!confirm(`Restore to ${hash}?`)) return
-    await fetch('/api/checkpoints/restore', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ cwd, hash }) })
-    reload()
-  }
-
-  if (!cwd) return <div className="px-3 py-2 text-[10px] text-[var(--text-muted)]">Select a session with cwd</div>
-
-  return (
-    <div className="flex flex-col gap-2 px-2 py-2">
-      <div className="flex gap-1">
-        <input value={msg} onChange={e=>setMsg(e.target.value)} placeholder="Checkpoint message…"
-          className="flex-1 bg-[var(--surface-2)] border border-[var(--border)] rounded px-2 py-1 text-[10px] text-[var(--text-h)] focus:outline-none focus:border-[var(--gold)]" />
-        <button onClick={create} disabled={loading}
-          className="px-2 py-1 rounded bg-[var(--gold-dim)] border border-[var(--gold-border)] text-[var(--gold)] text-[10px] shrink-0">
-          Save
-        </button>
-      </div>
-      <div className="space-y-1">
-        {checkpoints.map(c => (
-          <div key={c.hash} className="flex items-center gap-2 text-[10px] hover:bg-[var(--surface-2)] px-1 py-1 rounded">
-            <span className="font-mono text-[var(--gold)] shrink-0">{c.hash}</span>
-            <span className="text-[var(--text-muted)] truncate flex-1">{c.message}</span>
-            <button onClick={() => restore(c.hash)} className="text-[var(--text-muted)] hover:text-amber-400 shrink-0">↩</button>
-          </div>
-        ))}
-        {checkpoints.length === 0 && <div className="text-[var(--text-muted)] text-[10px]">No checkpoints</div>}
-      </div>
     </div>
   )
 }
@@ -1139,6 +1311,19 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
   const scrollContainerRef = useRef(null)
   const isNearBottomRef = useRef(true)
   const [showJumpToLatest, setShowJumpToLatest] = useState(false)
+  // 少爺 2026-07-16：對話大綱 minimap（條目=少爺留言；搜尋模式下停用，避免錨點對不上 filter 結果）
+  const chatOutline = useChatOutline(scrollContainerRef, messages, 'chatmsg', !!chatSearchQuery.trim())
+
+  // 點大綱條目 → 捲到該留言；目標還在「載入更早」隱藏區時，先展開到該則再捲
+  function jumpToOutline(entry) {
+    isNearBottomRef.current = false
+    if (entry.absIdx < hiddenCount) {
+      setHiddenCount(entry.absIdx)
+      setTimeout(() => document.getElementById(entry.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60)
+      return
+    }
+    document.getElementById(entry.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
   const prevChatInitRef = useRef(null)
   // Live streaming block (rAF-batched to avoid per-token re-renders)
   const liveBlockRef = useRef(null)  // { type: 'thinking'|'text', text: string } | null
@@ -1393,6 +1578,7 @@ function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
     const nearBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) <= 80
     isNearBottomRef.current = nearBottom
     setShowJumpToLatest(!nearBottom)
+    chatOutline.update()  // 大綱高亮跟著捲動位置同步（Notion 式）
   }
 
   function jumpToLatest() {
@@ -2176,9 +2362,10 @@ ${body}`
         </div>
       )}
 
-      {/* Messages */}
+      {/* Messages（外層 relative wrapper：大綱 minimap 疊在右緣、不隨內容捲動） */}
+      <div className="relative flex-1 min-h-0">
       <div ref={scrollContainerRef} onScroll={handleChatScroll}
-           className="flex-1 overflow-y-auto px-3 py-2 space-y-2 min-h-0 relative">
+           className="h-full overflow-y-auto px-3 py-2 space-y-2 relative">
         {messages.length === 0 && (
           <div className="text-[10px] text-[var(--text-muted)] text-center mt-8">
             輸入訊息開始對話，不需要 VS Code 介面
@@ -2228,7 +2415,8 @@ ${body}`
           )
 
           return renderMessages.map((m, i) => (
-          <div key={i} className={`text-[11px] leading-relaxed ${m.historical ? 'opacity-75' : ''}`}>
+          <div key={i} id={m.role === 'user' && !q ? `chatmsg-${hiddenCount + i}` : undefined}
+            className={`text-[11px] leading-relaxed ${m.historical ? 'opacity-75' : ''}`}>
             {/* System / divider */}
             {m.role === 'system' && (
               <div className="text-[9px] text-[var(--text-muted)] text-center py-1 border-t border-[var(--border)] mt-1">{m.text}</div>
@@ -2323,6 +2511,8 @@ ${body}`
             ▼ 回到最新
           </button>
         )}
+      </div>
+      <OutlineMinimap entries={chatOutline.entries} activeId={chatOutline.activeId} onJump={jumpToOutline} />
       </div>
 
       {/* Input area */}

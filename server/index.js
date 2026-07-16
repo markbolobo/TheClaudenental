@@ -1,6 +1,7 @@
 import Fastify from 'fastify'
 import wsPlugin from '@fastify/websocket'
 import multipart from '@fastify/multipart'
+import * as OpenCC from 'opencc-js'
 import fs from 'fs'
 import path from 'path'
 import { spawnSync, spawn } from 'child_process'
@@ -630,64 +631,466 @@ function getSessionTopic(sessionId) {
   return null
 }
 
+// ── 聊天室重點 hashtag（少爺 2026-07-16）──────────────────────────────────────
+// History 總覽每列右側的簡介 tag。依據=少爺留言（user messages）、同室去重。
+// 混合法：(1) CJK n-gram＋英數 token 頻次抽主題詞——跨留言重複的詞優先浮上來
+// （如「野蠻人」「噴飛」「陣型」）；(2) 主題詞不足 3 個時用留言首行摘要補位。
+const TAG_MAX = 5
+const TAG_DIGEST_LEN = 16
+// n-gram 頭尾若是虛詞即丟棄（避免「陣型的」「要野蠻人」這類殘缺詞）
+const TAG_STOP_EDGE = '我你他它這那的了嗎呢吧啊也都很就還要能會用有沒是不在把讓被跟與和或到去做再先請幫個們著過只但因為所以如果然後'
+// 高頻但無資訊量的完整詞
+const TAG_STOPWORDS = new Set(['可以', '需要', '這個', '那個', '我們', '你們', '目前', '現在', '然後', '因為', '所以', '如果', '但是', '還是', '就是', '已經', '應該', '什麼', '怎麼', '沒有', '一下', '一個', '時候', '地方', '不要', '不是', '有沒有', '為什麼', '使用', '確認', '檢查', '繼續', '實際', '幫我', '開始', '這樣', '這些', '那些', '其他', '部分', '內容', '一樣', '專案', '知道'])
+const TAG_STOPWORDS_EN = new Set(['the', 'and', 'for', 'with', 'this', 'that', 'have', 'from', 'not', 'are', 'was', 'can', 'use', 'using', 'all', 'you', 'your', 'project', 'game', 'http', 'https', 'www', 'com', 'code', 'claude', 'run', 'say', 'reply', 'exactly', 'new', 'please', 'will', 'what', 'when', 'how', 'why', 'there', 'here', 'task', 'message', 'messages', 'system', 'user', 'instructions', 'unchanged', 'already', 'loaded', 'session'])
+// 系統注入文的識別標記（出現即整則跳過——不是少爺親手打的內容）
+const TAG_SYSTEM_MARKERS = ['<system-reminder', 'task-notification', 'tool_use_error', 'UserPromptSubmit hook', '每輪鐵律', 'This session is being continued', '[Request interrupted']
+
+// ── 拼圖詞彙表（少爺 2026-07-16「HashTag 與拼圖聯動」）──────────────────────
+// SSOT = task_kickoff_check SKILL 的「關鍵字→拼圖對映表」（表格第一欄，/ 分隔）。
+// 命中詞彙表的候選詞大幅加權且允許單次出現——tag 因此天然對齊拼圖語彙，
+// 未來可反向從 tag 對回 §A/§B 表的必讀拼圖文件。
+const TAG_LEXICON_SOURCES = [
+  'C:/Project/RomanPrototype/.agent/skills/task_kickoff_check/SKILL.md',
+]
+let tagLexiconCache = null   // { key, terms:Set(原樣), lower:Set(小寫), docsMap:Map(小寫詞→拼圖文件[]) }
+function getTagLexicon() {
+  let _key = ''
+  for (const p of TAG_LEXICON_SOURCES) { try { _key += fs.statSync(p).mtimeMs + '|' } catch { _key += 'x|' } }
+  if (tagLexiconCache && tagLexiconCache.key === _key) return tagLexiconCache
+  const _terms = new Set(), _lower = new Set(), _docsMap = new Map()
+  for (const p of TAG_LEXICON_SOURCES) {
+    try {
+      for (const line of fs.readFileSync(p, 'utf-8').split('\n')) {
+        if (!line.startsWith('|')) continue
+        const _cells = line.split('|')
+        const _firstCell = _cells[1] ?? ''
+        // 第二欄=該關鍵字群的必讀拼圖文件（.md/.canvas）→ tag 反查拼圖的橋
+        const _docs = [...(_cells[2] ?? '').matchAll(/[\w./\\-]+\.(?:md|canvas)/g)].map(m => m[0]).slice(0, 6)
+        for (const raw of _firstCell.split('/')) {
+          const _t = raw.replace(/\*\*/g, '').trim()
+          if (_t.length < 2 || _t.length > 20 || _t.startsWith('---')) continue
+          _terms.add(_t); _lower.add(_t.toLowerCase())
+          if (_docs.length && !_docsMap.has(_t.toLowerCase())) _docsMap.set(_t.toLowerCase(), _docs)
+        }
+      }
+    } catch {}
+  }
+  tagLexiconCache = { key: _key, terms: _terms, lower: _lower, docsMap: _docsMap }
+  return tagLexiconCache
+}
+
+/** LLM tag 的 knowledge 詞 → 對映拼圖文件（詞彙表 §A/§B 第二欄） */
+function resolveKnowledgeDocs(terms) {
+  const _lex = getTagLexicon()
+  return (terms ?? []).map(t => ({ term: t, docs: _lex.docsMap.get(String(t).toLowerCase()) ?? [] }))
+}
+
+/** 濾出「少爺親手打的留言」：系統注入文 / 喚醒探針 / skill 展開文全排除 */
+function filterUserTexts(userTexts) {
+  return userTexts
+    .map(t => (t ?? '').trim())
+    .filter(t => t && !t.startsWith('(') && !t.startsWith('Base directory for this skill') && !t.startsWith('Caveat:')
+      && !TAG_SYSTEM_MARKERS.some(mk => t.includes(mk)))
+}
+
+function extractSessionTags(userTexts) {
+  const _texts = filterUserTexts(userTexts)
+    .slice(0, 100)
+    .map(t => t.slice(0, 300))
+  if (!_texts.length) return []
+
+  // 候選詞頻統計：term → { count 總次數, msgs 出現於幾則留言 }
+  const _freq = new Map()
+  const _bump = (term, mi) => {
+    let _e = _freq.get(term)
+    if (!_e) { _e = { count: 0, msgs: new Set() }; _freq.set(term, _e) }
+    _e.count++; _e.msgs.add(mi)
+  }
+  _texts.forEach((t, mi) => {
+    for (const m of t.matchAll(/[A-Za-z][A-Za-z0-9_+-]*/g)) {
+      const _w = m[0]
+      if (_w.length < 3 || _w.length > 24) continue   // 整詞比對，不做中途截斷
+      if (!TAG_STOPWORDS_EN.has(_w.toLowerCase())) _bump(_w, mi)
+    }
+    for (const run of t.matchAll(/[一-鿿]{2,}/g)) {
+      const _s = run[0]
+      for (let n = 2; n <= Math.min(6, _s.length); n++)
+        for (let i = 0; i + n <= _s.length; i++) _bump(_s.slice(i, i + n), mi)
+    }
+  })
+
+  // 過濾＋計分：頻次>=2（拼圖詞彙允許單次）；分數=次數×(長度+2)＋跨留言則數加權；
+  // 命中拼圖詞彙表 ×3＋40 — 拼圖語彙優先浮上來（少爺 2026-07-16）
+  const _lex = getTagLexicon()
+  const _cands = []
+  for (const [term, e] of _freq) {
+    const _inLexicon = _lex.terms.has(term) || _lex.lower.has(term.toLowerCase())
+    if (e.count < 2 && !_inLexicon) continue
+    if (TAG_STOPWORDS.has(term)) continue
+    if (/^[一-鿿]/.test(term) && (TAG_STOP_EDGE.includes(term[0]) || TAG_STOP_EDGE.includes(term[term.length - 1]))) continue
+    let _score = e.count * (term.length + 2) + e.msgs.size * 3
+    if (_inLexicon) _score = _score * 3 + 40
+    _cands.push({ term, score: _score })
+  }
+  _cands.sort((a, b) => b.score - a.score)
+
+  // 兩個 CJK 詞共享 3 字以上滑窗即視為重疊（「目前的互動方」vs「前的互動方式」）
+  const _cjkOverlap = (a, b) => {
+    if (!/^[一-鿿]/.test(a) || !/^[一-鿿]/.test(b) || a.length < 3 || b.length < 3) return false
+    for (let i = 0; i + 3 <= a.length; i++) if (b.includes(a.slice(i, i + 3))) return true
+    return false
+  }
+  // 貪婪挑選：互為子字串（比對不分大小寫）或 CJK 滑窗重疊的候選只留分數最高者
+  const _tags = []
+  const _dup = (t, term) => {
+    const _a = t.toLowerCase(), _b = term.toLowerCase()
+    return _a.includes(_b) || _b.includes(_a) || _cjkOverlap(term, t)
+  }
+  for (const c of _cands) {
+    if (_tags.length >= TAG_MAX) break
+    if (_tags.some(t => _dup(t, c.term))) continue
+    _tags.push(c.term)
+  }
+
+  // 補位：主題詞太少時用留言首行摘要（與既有 tag 半重疊的不收，重複留言只出現一次）
+  if (_tags.length < 3) {
+    const _seen = new Set()
+    for (const t of _texts) {
+      if (_tags.length >= TAG_MAX) break
+      // 首行在第一個標點斷句（「更新話題筆記，從上次…」→「更新話題筆記」）
+      const _d = t.split('\n')[0].replace(/^[>›\s]+/, '').split(/[，。？！；、,.:;?!]/)[0].slice(0, TAG_DIGEST_LEN)
+      const _k = _d.replace(/\s+/g, '')
+      if (!_k || _seen.has(_k)) continue
+      if (_tags.some(x => _dup(x, _d))) { _seen.add(_k); continue }
+      _seen.add(_k); _tags.push(_d)
+    }
+  }
+  return _tags
+}
+
+// ── LLM 語意 tag 管線（少爺 2026-07-16 Phase 2：LLM 產 tag＋寫回 jsonl 快取）────
+// 產物不只 hashtag：tags＋summary＋knowledge（拼圖詞彙命中→對映拼圖文件）。
+// 快取寫回該 session 的 transcript jsonl（type:'ai-tags' 行，比照 ai-title 前例）——
+// 任何工具（含未來 session 的 Claude 讀 transcript）都拿得到這份語意快取＝跨工具同步。
+const TAG_LLM_MODEL = 'claude-haiku-4-5-20251001'   // 標籤任務用便宜快的模型
+// 少爺 2026-07-16：「我是使用繁體中文的，務必注意」——雙保險：prompt 強制繁體 + OpenCC 簡轉繁（台灣用語）
+// ver 不符的舊快取自動重標（v2 = 繁體強制版）
+const TAG_PIPELINE_VER = 2
+const s2tw = OpenCC.Converter({ from: 'cn', to: 'twp' })
+function twNormalizeTags(p) {
+  if (!p) return p
+  try {
+    return {
+      ...p,
+      tags: (p.tags ?? []).map(t => s2tw(String(t))),
+      summary: p.summary ? s2tw(String(p.summary)) : p.summary,
+      knowledge: (p.knowledge ?? []).map(t => s2tw(String(t))),
+    }
+  } catch { return p }
+}
+const TAG_LLM_QUIET_MS = 5 * 60 * 1000              // 聊天室安靜 5 分鐘才標（不追著活 session 重標）
+const TAG_LLM_STALE_MSGS = 3                        // 快取後新增留言 >= 此數 → 視為過期重標
+const TAGGER_CWD = path.join(os.tmpdir(), 'tc-tagger')
+const llmTagCache = new Map()   // sessionId → { tags, summary, knowledge, userCount, ts }
+const tagQueue = []
+const tagQueuedSids = new Set()
+let tagWorkerBusy = false
+
+function enqueueLlmTagging(sessionId, cleanTexts, cleanCount = null) {
+  if (tagQueuedSids.has(sessionId) || !cleanTexts.length) return
+  tagQueuedSids.add(sessionId)
+  tagQueue.push({ sessionId, cleanTexts, cleanCount: cleanCount ?? cleanTexts.length })
+  setImmediate(runTagWorker)
+}
+
+// ── 少爺 tag 校正（2026-07-16「編輯/新增/移除，校正你的 LLM 認知」）────────────
+// 校正落成兩處：(1) ai-tags 行帶 manual/pinned/banned——重標時 pinned 必留、banned 必濾，
+// LLM 永遠蓋不掉少爺的話；(2) 校正流水帳 tc_tag_corrections.jsonl——少爺新增過的詞
+// 會注入之後所有標籤 prompt 的「少爺自訂詞」段（全域學習），dream pass 時同步回拼圖詞彙表。
+const TAG_CORRECTIONS_FILE = path.join(os.homedir(), '.claude', 'tc_tag_corrections.jsonl')
+
+function logTagCorrection(sessionId, op, value) {
+  try { fs.appendFileSync(TAG_CORRECTIONS_FILE, JSON.stringify({ ts: Date.now(), sessionId, op, value }) + '\n', 'utf8') } catch {}
+}
+
+/** 少爺歷來新增過的自訂詞（跨聊天室全域，注入 prompt 詞彙表） */
+function getCustomTagTerms() {
+  try {
+    const _terms = new Set()
+    for (const l of fs.readFileSync(TAG_CORRECTIONS_FILE, 'utf8').split('\n')) {
+      try { const o = JSON.parse(l); if (o.op === 'add' && o.value) _terms.add(String(o.value)) } catch {}
+    }
+    return [..._terms].slice(-40)
+  } catch { return [] }
+}
+
+function buildTagPrompt(cleanTexts) {
+  const _custom = getCustomTagTerms()
+  const _customLine = _custom.length ? `\n少爺自訂詞（曾手動加過的標籤，符合主題時優先採用）：${_custom.join('、')}` : ''
+  const _terms = [...getTagLexicon().terms].slice(0, 260).join('、') + _customLine
+  const _msgs = cleanTexts.slice(0, 40).map((t, i) => `${i + 1}. ${t.replace(/\s+/g, ' ').slice(0, 200)}`).join('\n')
+  return `你是聊天室主題標籤器。以下是一個遊戲開發聊天室中使用者的留言（時間序）。不要使用任何工具，只輸出純 JSON、不要其他文字：
+{"tags":["3~6個主題標籤"],"summary":"這個聊天室在做什麼（繁體中文一句話，50字內）","knowledge":["tags 相關且出現在詞彙表中的詞"]}
+規則：**全部輸出一律使用繁體中文（台灣用語），嚴禁出現任何簡體字**；tags 用繁體中文或原文技術詞；優先採用詞彙表的詞；聊天室特有的具體主題（例如「野蠻人噴飛BUG」「陣型衝撞」）要保留具體性；不要放「專案」「功能」這種空泛詞。
+詞彙表：${_terms}
+留言：
+${_msgs}`
+}
+
+/** ai-tags 快取行寫回 transcript jsonl（append-only；讀取端取最後一行為準） */
+function appendAiTagsLine(sessionId, payload) {
+  const _fp = findJsonlPath(sessionId)
+  if (!_fp) return false
+  let _prefix = ''
+  try {
+    const _fd = fs.openSync(_fp, 'r')
+    const _st = fs.fstatSync(_fd)
+    if (_st.size > 0) {
+      const _b = Buffer.alloc(1)
+      fs.readSync(_fd, _b, 0, 1, _st.size - 1)
+      if (_b.toString() !== '\n') _prefix = '\n'
+    }
+    fs.closeSync(_fd)
+  } catch {}
+  try { fs.appendFileSync(_fp, _prefix + JSON.stringify({ type: 'ai-tags', ...payload }) + '\n', 'utf8'); return true } catch { return false }
+}
+
+function runTagWorker() {
+  if (tagWorkerBusy || tagQueue.length === 0) return
+  tagWorkerBusy = true
+  const job = tagQueue.shift()
+  const _cwdNorm = TAGGER_CWD.replace(/\\/g, '/').toLowerCase()
+  try { fs.mkdirSync(TAGGER_CWD, { recursive: true }) } catch {}
+  pendingSpawnCwds.add(_cwdNorm)   // tagger 子進程不進 Sessions 側欄（沿用 spawn 前例）
+  const args = ['--model', TAG_LLM_MODEL, '--output-format', 'stream-json', '--verbose',
+    '--dangerously-skip-permissions', '--max-turns', '1', '-p', buildTagPrompt(job.cleanTexts)]
+  let proc
+  try { proc = spawn(getClaudeExe(), args, { cwd: TAGGER_CWD, stdio: ['ignore', 'pipe', 'pipe'] }) }
+  catch { tagQueuedSids.delete(job.sessionId); pendingSpawnCwds.delete(_cwdNorm); tagWorkerBusy = false; return }
+  let _sid = null, _text = '', _buf = ''
+  const _timeout = setTimeout(() => { try { proc.kill() } catch {} }, 120_000)
+  proc.stdout.on('data', c => {
+    _buf += c.toString()
+    const _lines = _buf.split('\n'); _buf = _lines.pop()
+    for (const l of _lines) {
+      try {
+        const ev = JSON.parse(l)
+        if (ev.type === 'system' && ev.subtype === 'init') { _sid = ev.session_id; subprocessSids.add(_sid) }
+        if (ev.type === 'result' && typeof ev.result === 'string') _text = ev.result
+      } catch {}
+    }
+  })
+  proc.on('close', () => {
+    clearTimeout(_timeout)
+    pendingSpawnCwds.delete(_cwdNorm)
+    // tagger 自己的 transcript 不留（否則 History 會長出標籤器聊天室）
+    if (_sid) { try { const _fp = findJsonlPath(_sid); if (_fp) fs.unlinkSync(_fp) } catch {} }
+    try {
+      const _m = _text.match(/\{[\s\S]*\}/)
+      if (_m) {
+        const _p = JSON.parse(_m[0])
+        const payload = twNormalizeTags({
+          tags: (Array.isArray(_p.tags) ? _p.tags : []).map(t => String(t).slice(0, 24)).filter(Boolean).slice(0, 6),
+          summary: String(_p.summary ?? '').slice(0, 80),
+          knowledge: (Array.isArray(_p.knowledge) ? _p.knowledge : []).map(t => String(t).slice(0, 24)).slice(0, 8),
+          userCount: job.cleanCount ?? job.cleanTexts.length,
+          ver: TAG_PIPELINE_VER,
+          ts: Date.now(),
+        })
+        // 少爺校正必勝：pinned 必留、banned 必濾（LLM 重標永遠蓋不掉人工校正）
+        const _prev = llmTagCache.get(job.sessionId)
+        if (_prev?.pinned?.length || _prev?.banned?.length) {
+          const _ban = new Set(_prev.banned ?? [])
+          payload.tags = [...new Set([...(_prev.pinned ?? []), ...payload.tags.filter(t => !_ban.has(t))])].slice(0, 12)
+          payload.pinned = _prev.pinned ?? []
+          payload.banned = _prev.banned ?? []
+        }
+        if (payload.tags.length) {
+          appendAiTagsLine(job.sessionId, payload)
+          llmTagCache.set(job.sessionId, payload)
+          logEvent('tags.llm.done', { sessionId: job.sessionId, tags: payload.tags })
+        }
+      }
+    } catch {}
+    tagQueuedSids.delete(job.sessionId)
+    tagWorkerBusy = false
+    setImmediate(runTagWorker)
+  })
+}
+
+// LLM tag 快取查詢（HistoryPanel 輪詢用——不重掃 transcript，便宜）
+app.get('/api/history/tags', async () => {
+  const out = {}
+  for (const [sid, p] of llmTagCache) {
+    out[sid] = { tags: p.tags, summary: p.summary, knowledge: resolveKnowledgeDocs(p.knowledge), ts: p.ts }
+  }
+  return { tags: out, queue: tagQueue.length, busy: tagWorkerBusy }
+})
+
+// 少爺 tag 校正：新增/移除標籤、改 summary——寫回 ai-tags 行（manual）＋校正流水帳
+app.patch('/api/history/:sessionId/tags', async (request) => {
+  const { sessionId } = request.params
+  const { addTag, removeTag, summary } = request.body ?? {}
+  const _cur = llmTagCache.get(sessionId) ?? { tags: [], summary: '', knowledge: [], userCount: 0 }
+  const _pinned = new Set(_cur.pinned ?? [])
+  const _banned = new Set(_cur.banned ?? [])
+  let _tags = [...(_cur.tags ?? [])]
+  let _knowledge = [...(_cur.knowledge ?? [])]
+  if (addTag) {
+    const _t = s2tw(String(addTag).trim()).slice(0, 24)
+    if (_t) {
+      if (!_tags.includes(_t)) _tags.push(_t)
+      _pinned.add(_t); _banned.delete(_t)
+      // 加的是拼圖詞彙 → 一併進 knowledge（拼圖 chips 立即出現）
+      const _lex = getTagLexicon()
+      if ((_lex.terms.has(_t) || _lex.lower.has(_t.toLowerCase())) && !_knowledge.includes(_t)) _knowledge.push(_t)
+      logTagCorrection(sessionId, 'add', _t)
+    }
+  }
+  if (removeTag) {
+    _tags = _tags.filter(t => t !== removeTag)
+    _knowledge = _knowledge.filter(t => t !== removeTag)
+    _banned.add(removeTag); _pinned.delete(removeTag)
+    logTagCorrection(sessionId, 'remove', removeTag)
+  }
+  if (summary != null) logTagCorrection(sessionId, 'summary', String(summary).slice(0, 80))
+  const payload = twNormalizeTags({
+    tags: _tags.slice(0, 12),
+    summary: summary != null ? String(summary).slice(0, 80) : (_cur.summary ?? ''),
+    knowledge: _knowledge.slice(0, 10),
+    pinned: [..._pinned], banned: [..._banned],
+    manual: true, userCount: _cur.userCount ?? 0, ver: TAG_PIPELINE_VER, ts: Date.now(),
+  })
+  appendAiTagsLine(sessionId, payload)
+  llmTagCache.set(sessionId, payload)
+  return { ok: true, tags: payload.tags, summary: payload.summary, knowledge: resolveKnowledgeDocs(payload.knowledge) }
+})
+
+// ── History 增量索引（少爺 2026-07-16：「全掃是單次動作，之後只更新有新對話的聊天室」）──
+// 聊天室 transcript 是 append-only（只累加不改舊內容）：索引對每室記「已掃到的 byte 游標」
+// （少爺說的不顯示的時間戳記），開 History 時逐檔 statSync 比大小——沒長大＝零 IO 直接用索引；
+// 長大＝只讀新增的尾巴增量累加。全掃只發生在索引不存在的第一次；檔案變短（異常重寫）才單室重建。
+const HISTORY_INDEX_FILE = path.join(os.homedir(), '.claude', 'tc_history_index.json')
+const HIST_HEAD_KEEP = 20, HIST_TAIL_KEEP = 20   // 每室存頭尾各 20 則乾淨留言（標籤 prompt 用，控索引體積）
+let historyIndex = null
+function loadHistoryIndex() {
+  if (!historyIndex) {
+    try { historyIndex = JSON.parse(fs.readFileSync(HISTORY_INDEX_FILE, 'utf8')) } catch { historyIndex = null }
+    if (!historyIndex?.sessions) historyIndex = { sessions: {} }
+  }
+  return historyIndex
+}
+
+/** 把一行 transcript JSON 累加進索引 entry（首掃與增量共用同一套規則） */
+function foldHistoryLine(entry, obj) {
+  if (!entry.cwd && obj.cwd) entry.cwd = obj.cwd
+  if (obj.type === 'ai-title' && obj.aiTitle) entry.title = obj.aiTitle
+  if (obj.type === 'ai-tags' && Array.isArray(obj.tags)) entry.aiTags = twNormalizeTags(obj)
+  if (obj.type === 'user') {
+    const _c = obj.message?.content
+    const _text = typeof _c === 'string' ? _c : _c?.[0]?.text ?? ''
+    const _clean = _text.replace(/^(\s*<[^>]+>[\s\S]*?<\/[^>]+>\s*)+/, '').trim()
+    if (_clean) {
+      if (!entry.firstMsg) entry.firstMsg = _clean.slice(0, 60)
+      if (filterUserTexts([_clean]).length) {
+        const _t = _clean.slice(0, 300)
+        entry.cleanCount = (entry.cleanCount ?? 0) + 1
+        entry.cleanHead = entry.cleanHead ?? []
+        entry.cleanTail = entry.cleanTail ?? []
+        if (entry.cleanHead.length < HIST_HEAD_KEEP) entry.cleanHead.push(_t)
+        else { entry.cleanTail.push(_t); if (entry.cleanTail.length > HIST_TAIL_KEEP) entry.cleanTail.shift() }
+      }
+    }
+  }
+  if (obj.type === 'result' && typeof obj.total_cost_usd === 'number')
+    entry.resultUsd = (entry.resultUsd ?? 0) + obj.total_cost_usd
+  if (obj.type === 'assistant' && obj.message?.usage) {
+    const u  = obj.message.usage
+    const mn = obj.message.model ?? 'claude-sonnet-4-6'
+    const p  = PRICING[mn] ?? PRICING['claude-sonnet-4-6']
+    entry.estUsd = (entry.estUsd ?? 0) + (
+      (u.input_tokens ?? 0) * p.input +
+      (u.output_tokens ?? 0) * p.output +
+      (u.cache_read_input_tokens ?? 0) * p.cacheRead +
+      (u.cache_creation_input_tokens ?? 0) * p.cacheWrite
+    ) / 1e6
+  }
+}
+
+/** 增量掃描：從上次游標只讀新增 bytes；游標永遠停在完整行邊界（寫入中的殘行下次再收） */
+function scanHistoryFile(fullPath, stat, entry) {
+  const _start = entry.scannedSize ?? 0
+  const _len = stat.size - _start
+  if (_len <= 0) return entry
+  try {
+    const _fd = fs.openSync(fullPath, 'r')
+    const _buf = Buffer.alloc(_len)
+    fs.readSync(_fd, _buf, 0, _len, _start)
+    fs.closeSync(_fd)
+    const _nl = _buf.lastIndexOf(0x0A)
+    if (_nl === -1) return entry
+    for (const l of _buf.slice(0, _nl + 1).toString('utf8').split('\n')) {
+      if (!l.trim()) continue
+      try { foldHistoryLine(entry, JSON.parse(l)) } catch {}
+    }
+    entry.scannedSize = _start + _nl + 1
+  } catch {}
+  return entry
+}
+
 // List all past sessions across all projects
 app.get('/api/history', async () => {
   const projectsDir = path.join(CLAUDE_DIR, 'projects')
+  const idx = loadHistoryIndex()
   const result = []
+  const _seen = new Set()
+  let _dirty = false
   try {
     for (const proj of fs.readdirSync(projectsDir)) {
       const projPath = path.join(projectsDir, proj)
       if (!fs.statSync(projPath).isDirectory()) continue
+      if (proj.includes('tc-tagger')) continue   // 標籤器工作目錄不算聊天室
       for (const file of fs.readdirSync(projPath)) {
         if (!file.endsWith('.jsonl')) continue
         const sessionId = file.replace('.jsonl', '')
         const fullPath = path.join(projPath, file)
         const stat = fs.statSync(fullPath)
-        // Read ai-title, cwd, and first user message
-        let title = null, firstMsg = null, cwd = null, costUsd = null
-        try {
-          const lines = fs.readFileSync(fullPath, 'utf-8').split('\n').filter(Boolean)
-          const byModelCost = {}
-          for (const l of lines) {
-            try {
-              const obj = JSON.parse(l)
-              if (!cwd && obj.cwd) cwd = obj.cwd
-              if (obj.type === 'ai-title' && obj.aiTitle) title = obj.aiTitle
-              if (obj.type === 'result' && typeof obj.total_cost_usd === 'number') {
-                costUsd = (costUsd ?? 0) + obj.total_cost_usd
-              }
-              if (obj.type === 'assistant' && obj.message?.usage) {
-                const u  = obj.message.usage
-                const mn = obj.message.model ?? 'claude-sonnet-4-6'
-                const p  = PRICING[mn] ?? PRICING['claude-sonnet-4-6']
-                byModelCost[mn] = (byModelCost[mn] ?? 0) + (
-                  (u.input_tokens ?? 0) * p.input +
-                  (u.output_tokens ?? 0) * p.output +
-                  (u.cache_read_input_tokens ?? 0) * p.cacheRead +
-                  (u.cache_creation_input_tokens ?? 0) * p.cacheWrite
-                ) / 1e6
-              }
-            } catch {}
-          }
-          if (costUsd === null) {
-            const est = Object.values(byModelCost).reduce((s, v) => s + v, 0)
-            if (est > 0) costUsd = est
-          }
-          for (const l of lines) {
-            try {
-              const obj = JSON.parse(l)
-              if (obj.type === 'user') {
-                const c = obj.message?.content
-                const text = typeof c === 'string' ? c : c?.[0]?.text ?? ''
-                const clean = text.replace(/^(\s*<[^>]+>[\s\S]*?<\/[^>]+>\s*)+/, '').trim()
-                if (clean) { firstMsg = clean.slice(0, 60); break }
-              }
-            } catch {}
-          }
-        } catch {}
-        result.push({ sessionId, project: proj, cwd, title: title ?? firstMsg ?? sessionId.slice(0,8), mtime: stat.mtimeMs, size: stat.size, costUsd })
+        _seen.add(sessionId)
+        let entry = idx.sessions[sessionId]
+        if (entry && stat.size < (entry.scannedSize ?? 0)) entry = null   // 檔案變短＝被重寫 → 單室重建
+        if (!entry) entry = { scannedSize: 0 }
+        if (stat.size > (entry.scannedSize ?? 0)) { entry = scanHistoryFile(fullPath, stat, entry); _dirty = true }
+        entry.project = proj
+        entry.mtime = stat.mtimeMs
+        entry.size = stat.size
+        idx.sessions[sessionId] = entry
+
+        // tags 決策：新鮮 LLM 快取直接用；無/過期 → 啟發式墊檔＋排隊重標（安靜 5 分鐘才標）
+        const aiTags = entry.aiTags ?? null
+        const cleanTexts = [...(entry.cleanHead ?? []), ...(entry.cleanTail ?? [])]
+        let tags = null, summary = null, knowledge = []
+        // manual（少爺校正過）即使清空也是權威——不得回退啟發式讓被移除的 tag 復活
+        if (aiTags && (aiTags.tags?.length || aiTags.manual)) {
+          llmTagCache.set(sessionId, aiTags)
+          tags = aiTags.tags ?? []; summary = aiTags.summary ?? null; knowledge = aiTags.knowledge ?? []
+        }
+        const _quiet = Date.now() - stat.mtimeMs > TAG_LLM_QUIET_MS
+        // 過期條件：無快取 / 版本不符 / 新增留言達門檻
+        const _stale = aiTags
+          ? (aiTags.ver !== TAG_PIPELINE_VER || (entry.cleanCount ?? 0) - (aiTags.userCount ?? 0) >= TAG_LLM_STALE_MSGS)
+          : true
+        if (_quiet && _stale && cleanTexts.length) enqueueLlmTagging(sessionId, cleanTexts, entry.cleanCount ?? cleanTexts.length)
+        if (!tags) tags = extractSessionTags(cleanTexts)
+        const costUsd = entry.resultUsd ?? ((entry.estUsd ?? 0) > 0 ? entry.estUsd : null)
+        result.push({ sessionId, project: proj, cwd: entry.cwd ?? null,
+          title: entry.title ?? entry.firstMsg ?? sessionId.slice(0, 8),
+          mtime: stat.mtimeMs, size: stat.size, costUsd,
+          tags, summary, llm: !!(aiTags?.tags?.length || aiTags?.manual), knowledge: resolveKnowledgeDocs(knowledge) })
       }
     }
+    // transcript 已刪除的室從索引剔除
+    for (const sid of Object.keys(idx.sessions)) if (!_seen.has(sid)) { delete idx.sessions[sid]; _dirty = true }
+    if (_dirty) atomicWriteJson(HISTORY_INDEX_FILE, idx)
   } catch {}
   return { sessions: result.sort((a,b) => b.mtime - a.mtime).slice(0, 100) }
 })

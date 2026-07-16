@@ -1170,6 +1170,17 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
                       <span className="ml-1 text-[var(--text-muted)]">
                         {new Date(s.mtime).toLocaleDateString()}{s.cwd ? ` · ${s.cwd.split(/[\\/]/).pop()}` : ''}
                       </span>
+                      {/* 少爺 2026-07-16：聊天室重點 hashtag（挑續聊目標更好認；/api/history 已帶 tags） */}
+                      {Array.isArray(s.tags) && s.tags.length > 0 && (
+                        <span className="block mt-0.5" title={s.summary || undefined}>
+                          {s.tags.slice(0, 4).map((t, ti) => (
+                            <span key={ti}
+                              className="inline-block mr-1 text-[8px] px-1 py-[1px] rounded-full border border-[var(--gold-border)]/60 bg-[var(--gold-dim)] text-[var(--text-muted)]">
+                              #{t}
+                            </span>
+                          ))}
+                        </span>
+                      )}
                     </button>
                   ))}
                 </div>
