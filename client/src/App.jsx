@@ -121,7 +121,7 @@ function ActivityHeat() {
   )
 }
 
-function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick, autoResumeArmed, autoResumeFireAt, onToggleAutoResume, hitLimit, isChatSession, chatStage = 1, chatRunning = 0, chatLastDelta = null, chatBaseline = 0, onPermissionResponse }) {
+function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick, autoResumeArmed, autoResumeFireAt, onToggleAutoResume, hitLimit, isChatSession, chatStage = 1, chatRunning = 0, chatLastDelta = null, chatBaseline = 0, onPermissionResponse, showChatPermission = false }) {
   const base = 'flex items-center gap-2 px-3 py-2 rounded cursor-pointer transition-all'
   const selectedCls = isSelected
     ? 'bg-[var(--surface-2)] session-active-glow'
@@ -170,6 +170,7 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick,
       <div className="flex-1 min-w-0">
         {/* Row 1: session name */}
         <div className="truncate text-[var(--text-h)] text-xs leading-tight mb-0.5">
+          {session.origin === 'tc' && <span title="TC 開的聊天室（仕酒師/QA 喚醒）" className="mr-1">🍷</span>}
           {session.displayName}
         </div>
         {/* Row 2: time */}
@@ -229,8 +230,8 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick,
             </button>
           )}
         </div>
-        {/* Row 4: pending permission (non-chat sessions) */}
-        {session.pendingPermission && !isChatSession && (
+        {/* Row 4: pending permission — chat session 的權限卡桌面端由右側欄顯示；手機端無右側欄，呼叫端開 showChatPermission 在列表內補上 */}
+        {session.pendingPermission && (!isChatSession || showChatPermission) && (
           <div className="mt-1 rounded border border-amber-600/40 bg-amber-900/10 px-1.5 py-1">
             <div className="text-[8px] text-amber-400 font-semibold tracking-wide mb-0.5">⚠ 需要授權</div>
             <div className="text-[9px] text-[var(--text)] font-mono truncate mb-1">{session.pendingPermission.toolName}</div>
@@ -263,68 +264,6 @@ function nextWholeHourAfter(ms) {
   d.setMinutes(0, 1, 0)
   if (d.getTime() <= ms) d.setHours(d.getHours() + 1)
   return d.getTime()
-}
-
-function CooldownTimer({ sleepingAt }) {
-  const [remaining, setRemaining] = useState(null)
-
-  useEffect(() => {
-    if (!sleepingAt) { setRemaining(null); return }
-    function tick() {
-      const elapsed = Date.now() - sleepingAt
-      const left = Math.max(0, SESSION_LIMIT_MS - elapsed)
-      setRemaining(left)
-    }
-    tick()
-    const id = setInterval(tick, 1000)
-    return () => clearInterval(id)
-  }, [sleepingAt])
-
-  if (remaining === null) return null
-
-  const h = Math.floor(remaining / 3600000)
-  const m = Math.floor((remaining % 3600000) / 60000)
-  const s = Math.floor((remaining % 60000) / 1000)
-  const pct = Math.round(((SESSION_LIMIT_MS - remaining) / SESSION_LIMIT_MS) * 100)
-
-  if (remaining === 0) return (
-    <div className="text-[10px] text-green-400 mt-1">✓ 冷卻完成，可繼續</div>
-  )
-
-  return (
-    <div className="mt-2">
-      <div className="flex justify-between text-[9px] text-[var(--text-muted)] mb-1">
-        <span>冷卻中</span>
-        <span className="tabular-nums">{h}h {String(m).padStart(2,'0')}m {String(s).padStart(2,'0')}s</span>
-      </div>
-      <div className="w-full h-1 bg-gray-800 rounded-full overflow-hidden">
-        <div
-          className="h-full bg-gray-500 rounded-full transition-all duration-1000"
-          style={{ width: `${pct}%` }}
-        />
-      </div>
-    </div>
-  )
-}
-
-function CharacterZone({ status }) {
-  // Placeholder — Rive animation will go here
-  const mood = {
-    active:   { emoji: '⚔', label: 'On mission', color: 'text-green-400' },
-    sleeping: { emoji: '💤', label: 'Sleeping (token limit)', color: 'text-gray-500 shimmer' },
-    waiting:  { emoji: '⏳', label: 'Awaiting approval', color: 'text-amber-400 pulse-amber' },
-    error:    { emoji: '🩸', label: 'Fallen', color: 'text-red-400' },
-    done:     { emoji: '🏛', label: 'Mission complete', color: 'text-blue-400' },
-    idle:     { emoji: '🏛', label: 'Idle', color: 'text-gray-600' },
-  }[status] ?? { emoji: '🏛', label: 'Idle', color: 'text-gray-600' }
-
-  return (
-    <div className="flex flex-col items-center gap-2 py-4">
-      <div className={`text-5xl leading-none ${mood.color}`}>{mood.emoji}</div>
-      <div className={`text-[10px] uppercase tracking-widest ${mood.color}`}>{mood.label}</div>
-      <div className="text-[10px] text-[var(--text-muted)] mt-1">The Continental</div>
-    </div>
-  )
 }
 
 // ─── WebSocket hook ───────────────────────────────────────────────────────────
@@ -1219,7 +1158,7 @@ function ThinkingBlock({ text, fullMessage }) {
   )
 }
 
-function ChatPanel({ streamEvents, chatInit, logs, selectedId }) {
+function ChatPanel({ streamEvents, chatInit, selectedId }) {
   const [projectPath, setProjectPath] = useState('C:/Project/RomanPrototype')
   // 少爺 2026-07-14：Chat 可選 AI 模型＋強度（空字串=預設；記憶在 localStorage 跨開啟保留）
   const [chatModel, setChatModel] = useState(() => localStorage.getItem('tc_chat_model') ?? '')
@@ -3543,12 +3482,12 @@ const COLLABORATOR_TABS = [
 ]
 
 const MOBILE_TABS = [
-  { id: 'sessions', label: 'SESSIONS', icon: '◈' },
-  { id: 'chat',     label: 'CHAT',     icon: '◻' },
-  { id: 'todos',    label: 'TODO',     icon: '✓' },
-  { id: 'qa',       label: 'QA',       icon: '🧪' },
-  { id: 'history',  label: 'HISTORY',  icon: '◷' },
-  { id: 'more',     label: 'MORE',     icon: '⋯' },
+  { id: 'sessions',  label: 'SESSIONS',  icon: '◈' },
+  { id: 'chat',      label: 'CHAT',      icon: '◻' },
+  { id: 'sommelier', label: 'SOMMELIER', icon: '🍷' },
+  { id: 'qa',        label: 'QA',        icon: '🧪' },
+  { id: 'history',   label: 'HISTORY',   icon: '◷' },
+  { id: 'more',      label: 'MORE',      icon: '⋯' },
 ]
 
 const COLLABORATOR_MOBILE_TABS = [
@@ -3653,6 +3592,7 @@ function MobileSessionsPanel({ sessions, selectedId, setSelectedId, setActiveTab
             chatLastDelta={s.id === selectedId ? chatLastDelta : null}
             chatBaseline={s.id === selectedId ? chatBaseline : 0}
             onPermissionResponse={onPermissionResponse}
+            showChatPermission
           />
         ))}
         {sessions.length === 0 && <div className="text-[10px] text-[var(--text-muted)] text-center mt-8">No sessions yet</div>}
@@ -3661,51 +3601,30 @@ function MobileSessionsPanel({ sessions, selectedId, setSelectedId, setActiveTab
   )
 }
 
-function MobileMorePanel({ selected, send, logs, sessions }) {
-  const [sub, setSub] = useState('agent')
-  const SUB = ['agent', 'prompt', 'prefs', 'hooks']
+// 與桌面端 TABS 對齊：底部功能列沒有的分頁收進 MORE
+function MobileMorePanel({ sessions, onTriggerChat }) {
+  const [sub, setSub] = useState('todos')
+  const SUB = [
+    { id: 'todos',   label: 'TODO' },
+    { id: 'metrics', label: 'DASHBOARD' },
+    { id: 'prefs',   label: 'PREFS' },
+    { id: 'prompt',  label: 'PROMPT' },
+  ]
   return (
     <div className="flex flex-col h-full">
       <div className="flex overflow-x-auto border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
         {SUB.map(t => (
-          <button key={t} onClick={() => setSub(t)}
+          <button key={t.id} onClick={() => setSub(t.id)}
             className={`px-3 py-2 text-[9px] uppercase tracking-wider shrink-0 border-b-2 transition-colors ${
-              sub === t ? 'border-[var(--gold)] text-[var(--gold)]' : 'border-transparent text-[var(--text-muted)]'
-            }`}>{t}</button>
+              sub === t.id ? 'border-[var(--gold)] text-[var(--gold)]' : 'border-transparent text-[var(--text-muted)]'
+            }`}>{t.label}</button>
         ))}
       </div>
       <div className="flex-1 overflow-hidden min-h-0 flex flex-col">
-        {sub === 'agent' && (
-          <div className="flex flex-col h-full overflow-y-auto">
-            <CharacterZone status={selected?.status ?? 'idle'} />
-            {selected?.pendingPermission && (
-              <div className="mx-3 mb-3 border border-amber-500/50 rounded p-2 bg-amber-900/10">
-                <div className="text-[10px] text-amber-400 font-semibold uppercase tracking-wider mb-1 pulse-amber">⏳ Permission</div>
-                <div className="text-[10px] text-[var(--text)] mb-1 font-mono truncate">{selected.pendingPermission.toolName}</div>
-                <div className="text-[9px] text-[var(--text-muted)] mb-2 break-all line-clamp-2">{selected.pendingPermission.summary}</div>
-                <div className="flex gap-1">
-                  <button onClick={() => send({ type: 'permission_response', permissionId: selected.pendingPermission.permissionId, action: 'approve' })} className="flex-1 py-1 rounded bg-green-900/40 border border-green-700 text-green-300 text-[10px]">✓ Allow</button>
-                  <button onClick={() => send({ type: 'permission_response', permissionId: selected.pendingPermission.permissionId, action: 'allow_always' })} className="flex-1 py-1 rounded bg-yellow-900/40 border border-yellow-600 text-yellow-300 text-[10px]">⭐ Always</button>
-                  <button onClick={() => send({ type: 'permission_response', permissionId: selected.pendingPermission.permissionId, action: 'block' })} className="flex-1 py-1 rounded bg-red-900/40 border border-red-700 text-red-300 text-[10px]">✕ Block</button>
-                </div>
-              </div>
-            )}
-            <div className="px-3 py-2 border-t border-[var(--border)] flex-1 overflow-y-auto">
-              <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] mb-2">Checkpoints</div>
-              <CheckpointsPanel selected={selected} />
-            </div>
-          </div>
-        )}
-        {sub === 'prompt'    && <PromptStudioPanel />}
-        {sub === 'prefs'     && <PreferencesPanel />}
-        {sub === 'hooks'      && (
-          <div className="flex-1 overflow-y-auto px-3 py-1 font-mono text-[10px]">
-            {logs.length === 0 && <span className="text-[var(--text-muted)]">Waiting for events…</span>}
-            {logs.map((l, i) => (
-              <div key={i} className={`leading-5 ${l.level === 'user' ? 'text-[var(--gold)]' : l.level === 'permission' ? 'text-amber-400' : 'text-[var(--text-muted)]'}`}>{l.text ?? JSON.stringify(l)}</div>
-            ))}
-          </div>
-        )}
+        {sub === 'todos'   && <TodoBoard sessions={sessions} onTriggerChat={onTriggerChat} />}
+        {sub === 'metrics' && <MetricsDashboard />}
+        {sub === 'prefs'   && <PreferencesPanel />}
+        {sub === 'prompt'  && <PromptStudioPanel />}
       </div>
     </div>
   )
@@ -3815,7 +3734,6 @@ export default function App() {
       else localStorage.removeItem('tc_selected_session')
     } catch {}
   }, [selectedId])
-  const [logs, setLogs] = useState([])
   const [renamingId, setRenamingId] = useState(null)
   const [renameVal, setRenameVal] = useState('')
   const [activeTab, setActiveTab] = useState(() => {
@@ -4059,6 +3977,18 @@ export default function App() {
     setActiveTab('chat')
   }
 
+  // TODO 卡「去聊天室」：桌面待辦分頁與手機 MORE > TODO 共用
+  function handleTodoTriggerChat({ sessionId, prefillText }) {
+    if (sessionId === '__new__') {
+      setSelectedId(null)
+      setChatInit({ sessionId: null, projectPath: 'C:/Project/RomanPrototype', prefillText, ts: Date.now() })
+    } else {
+      setSelectedId(sessionId)
+      setChatInit({ sessionId, projectPath: 'C:/Project/RomanPrototype', prefillText, ts: Date.now() })
+    }
+    setActiveTab('chat')
+  }
+
   // Reset stage state whenever the selected session changes
   useEffect(() => {
     if (!selectedId) return
@@ -4149,13 +4079,11 @@ export default function App() {
     if (msg.type === 'state') {
       setSessions(msg.sessions)
       setSelectedId(prev => prev ?? msg.sessions[0]?.id ?? null)
-      if (msg.logs) setLogs(msg.logs)  // replace on reconnect, not append
       // Auto-watch all active sessions on reconnect
       for (const s of msg.sessions ?? []) {
         if (s.status === 'active') autoWatch(s.id)
       }
     }
-    if (msg.type === 'log') setLogs(prev => [...prev.slice(-200), msg])
     // AutoQA Monitor：轉發給 QAMonitorPanel（decoupled，不佔 App state）
     if (msg.type === 'qa_run_update') {
       try { window.dispatchEvent(new CustomEvent('tc-qa-run-update', { detail: msg.run })) } catch {}
@@ -4403,6 +4331,7 @@ export default function App() {
                     chatLastDelta={s.id === selectedId ? chatLastDelta : null}
                     chatBaseline={s.id === selectedId ? chatBaseline : 0}
                     onPermissionResponse={(permId, action) => send({ type: 'permission_response', permissionId: permId, action })}
+                    showChatPermission
                   />
                 )
             ))}
@@ -4453,21 +4382,10 @@ export default function App() {
           {/* Tab content */}
           <div className="flex-1 overflow-hidden min-h-0 flex flex-col">
             {activeTab === 'chat' && (
-              <ChatPanel streamEvents={streamEvents} chatInit={chatInit} logs={logs} selectedId={selectedId} />
+              <ChatPanel streamEvents={streamEvents} chatInit={chatInit} selectedId={selectedId} />
             )}
             {activeTab === 'todos' && (
-              <TodoBoard
-                sessions={sessions}
-                onTriggerChat={({ sessionId, prefillText }) => {
-                  if (sessionId === '__new__') {
-                    setSelectedId(null)
-                    setChatInit({ sessionId: null, projectPath: 'C:/Project/RomanPrototype', prefillText, ts: Date.now() })
-                  } else {
-                    setSelectedId(sessionId)
-                    setChatInit({ sessionId, projectPath: 'C:/Project/RomanPrototype', prefillText, ts: Date.now() })
-                  }
-                  setActiveTab('chat')
-                }} />
+              <TodoBoard sessions={sessions} onTriggerChat={handleTodoTriggerChat} />
             )}
             {activeTab === 'qa'      && <QAMonitorPanel selectedSessionId={selectedId} onGoToChat={handleContinueInChat} projects={tcProjects} activeProjectId={activeProjectId} onSelectProject={setActiveProjectId} onManageProjects={() => setShowHighTable(true)} />}
             {activeTab === 'metrics' && <MetricsDashboard />}
@@ -4486,72 +4404,10 @@ export default function App() {
               onPermissionResponse={(permId, action) => send({ type: 'permission_response', permissionId: permId, action })}
               chatStage={chatStage} chatRunning={chatRunning} chatLastDelta={chatLastDelta} chatBaseline={chatBaseline}
             />}
-            {activeTab === 'more'      && <MobileMorePanel selected={selected} send={send} logs={logs} sessions={sessions} />}
+            {activeTab === 'more'      && <MobileMorePanel sessions={sessions} onTriggerChat={handleTodoTriggerChat} />}
           </div>
 
         </main>
-
-        {/* Right: Character + Gate summary — desktop only */}
-        <aside className="hidden md:flex w-48 shrink-0 border-l border-[var(--border)] flex-col bg-[var(--surface)] overflow-hidden">
-          <div className="px-3 py-2 text-[10px] uppercase tracking-widest text-[var(--text-muted)] border-b border-[var(--border)]">
-            Agent
-          </div>
-          <CharacterZone status={selected?.status ?? 'idle'} />
-
-          {/* Permission request card */}
-          {selected?.pendingPermission && (
-            <div className="mx-2 mb-2 border border-amber-500/50 rounded p-2 bg-amber-900/10">
-              <div className="text-[10px] text-amber-400 font-semibold uppercase tracking-wider mb-1 pulse-amber">
-                ⏳ Permission Request
-              </div>
-              <div className="text-[10px] text-[var(--text)] mb-1 font-mono truncate">
-                {selected.pendingPermission.toolName}
-              </div>
-              <div className="text-[9px] text-[var(--text-muted)] mb-2 break-all line-clamp-2">
-                {selected.pendingPermission.summary}
-              </div>
-              <div className="flex gap-1">
-                <button
-                  onClick={() => send({ type: 'permission_response', permissionId: selected.pendingPermission.permissionId, action: 'approve' })}
-                  className="flex-1 py-1 rounded bg-green-900/40 border border-green-700 text-green-300 hover:bg-green-800/60 text-[10px]"
-                >
-                  ✓ Allow
-                </button>
-                <button
-                  onClick={() => send({ type: 'permission_response', permissionId: selected.pendingPermission.permissionId, action: 'allow_always' })}
-                  className="flex-1 py-1 rounded bg-yellow-900/40 border border-yellow-600 text-yellow-300 hover:bg-yellow-800/60 text-[10px]"
-                >
-                  ⭐ Always
-                </button>
-                <button
-                  onClick={() => send({ type: 'permission_response', permissionId: selected.pendingPermission.permissionId, action: 'block' })}
-                  className="flex-1 py-1 rounded bg-red-900/40 border border-red-700 text-red-300 hover:bg-red-800/60 text-[10px]"
-                >
-                  ✕ Block
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* Sleeping notification */}
-          {selected?.status === 'sleeping' && (
-            <div className="mx-2 mb-2 border border-gray-600 rounded p-2 bg-gray-900/20">
-              <div className="flex items-center justify-between">
-                <div className="text-[10px] text-gray-400 shimmer">💤 Token 用量已達上限</div>
-                {autoResumeMap[selected.id]?.enabled && (
-                  <div className="text-[9px] text-amber-400 pulse-amber shrink-0 ml-2">⏰ 整點自動繼續</div>
-                )}
-              </div>
-              <CooldownTimer sleepingAt={selected.sleepingAt ?? null} />
-            </div>
-          )}
-
-          {/* Checkpoints */}
-          <div className="px-3 py-2 border-t border-[var(--border)] flex-1 overflow-y-auto">
-            <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] mb-2">Checkpoints</div>
-            <CheckpointsPanel selected={selected} />
-          </div>
-        </aside>
 
       </div>
 

@@ -108,14 +108,17 @@ function persistSubprocessSids() {
 try {
   for (const _sid of JSON.parse(fs.readFileSync(SUBPROC_SIDS_FILE, 'utf-8'))) {
     subprocessSids.add(_sid)
-    // 開機回濾：先前被誤註冊進 sessions 的 TC 子進程 session 一併清掉
-    if (sessions.has(_sid)) sessions.delete(_sid)
+    // 開機回濾：先前被「誤註冊」的 TC 子進程條目清掉；spawn 生命週期正式建的（origin:'tc'）保留
+    if (sessions.has(_sid) && sessions.get(_sid)?.origin !== 'tc') sessions.delete(_sid)
   }
 } catch {}
 
 // 不明 Session 名稱回填（少爺 2026-07-15：側欄不該只顯示「Session」字樣）——
 // 舊持久化資料裡命名從未解析的，開機後從 transcript 補（aiTitle→首句）；找不到紀錄的標明讓少爺好清。
 // ⚠️ 延遲執行：getSessionTopic 依賴檔案後段才宣告的 CLAUDE_DIR（TDZ），不可在模組頂層直接呼叫
+// 側欄退場門檻：超過此時間沒有真實活動的非活躍聊天室離開側欄（掃描器復活門檻同值，避免振盪）
+const SESSION_RETIRE_MS = 20 * 60 * 1000
+
 // 幽靈 session 清掃（少爺 2026-07-15：開機一次不夠——子代理/短命進程運行中隨時長出來 → 週期執行）
 function sweepGhostSessions(deep = false) {
   try {
@@ -132,6 +135,15 @@ function sweepGhostSessions(deep = false) {
         _changed++
         continue
       }
+      // 側欄自動退場（少爺 2026-07-15「用完的聊天室不該一直掛著」）：非 active/waiting/sleeping
+      // 且超過 20 分鐘沒有任何 hook 活動 → 離開側欄（History 永遠查得到；回來用會自動重新出現）
+      if (!['active', 'waiting', 'sleeping'].includes(_s.status)
+          && _now - (_s.lastSeenAt ?? _s.startedAt ?? 0) > SESSION_RETIRE_MS) {
+        sessions.delete(_sid)
+        broadcast({ type: 'session_remove', sessionId: _sid })
+        _changed++
+        continue
+      }
       // 名稱收斂到「最初首句」（＝HISTORY 同款 aiTitle→首句；名稱不可漂移成最新 prompt）。
       // deep=開機全量收斂；週期 sweep 只補 generic 名（大 transcript 全解析不便宜，不每 10 分鐘做）
       if (!deep && _s.displayName !== 'Session') continue
@@ -140,6 +152,33 @@ function sweepGhostSessions(deep = false) {
         _s.topic = _initial
         _s.displayName = _initial.slice(0, 40)
         broadcast({ type: 'session', session: _s })
+        _changed++
+      }
+    }
+    // TC 出身聊天室回填（deep）：spawn 生命週期建檔機制上線前就存在的、或 cli 視窗喚醒（不經 claudeProcs）的，
+    // 只要最近有真實對話就補進側欄（origin:'tc'、最初首句名）——少爺 2026-07-15「TC 出身一樣要顯示」
+    if (deep) {
+      for (const _sid of subprocessSids) {
+        if (sessions.has(_sid)) continue
+        const _fp = findJsonlPath(_sid)
+        if (!_fp) continue
+        let _lastTs = 0
+        try {
+          const _lines = fs.readFileSync(_fp, 'utf-8').split('\n').filter(Boolean)
+          for (let i = _lines.length - 1; i >= 0 && i >= _lines.length - 80; i--) {
+            try {
+              const _o = JSON.parse(_lines[i])
+              if ((_o.type === 'user' || _o.type === 'assistant') && _o.timestamp) { _lastTs = Date.parse(_o.timestamp); break }
+            } catch {}
+          }
+        } catch {}
+        if (!_lastTs || _now - _lastTs > SESSION_RETIRE_MS) continue
+        const _topic = getSessionTopic(_sid) ?? _sid.slice(0, 8)
+        upsertSession(_sid, {
+          origin: 'tc', status: _now - _lastTs < 3 * 60 * 1000 ? 'active' : 'done',
+          topic: _topic, displayName: _topic.slice(0, 40), lastSeenAt: _lastTs,
+        }, false)
+        broadcast({ type: 'session', session: sessions.get(_sid) })
         _changed++
       }
     }
@@ -244,7 +283,7 @@ function schedulePersist() {
   _persistTimer = setTimeout(() => { _persistTimer = null; persistSessions() }, 2000)
 }
 
-function upsertSession(sessionId, patch = {}) {
+function upsertSession(sessionId, patch = {}, touch = true) {
   if (!sessions.has(sessionId)) {
     sessions.set(sessionId, {
       id: sessionId,
@@ -258,6 +297,8 @@ function upsertSession(sessionId, patch = {}) {
   }
   const s = sessions.get(sessionId)
   Object.assign(s, patch)
+  // 活動時間只由「真實 hook 活動」刷新（側欄自動退場用）；掃描器輪詢 upsert 傳 touch=false 不算活動
+  if (touch) s.lastSeenAt = Date.now()
   sessions.set(sessionId, s)
   schedulePersist()
   return s
@@ -298,7 +339,8 @@ app.post('/hook/SessionStart', async (request) => {
   // Ignore sessions spawned by our own subprocess — they appear in Chat, not Sessions list
   // Check both confirmed session_ids and pending spawns (by cwd) to handle race condition
   const cwdNorm = (e.cwd ?? '').replace(/\\/g, '/').toLowerCase()
-  if (subprocessSids.has(e.session_id) || pendingSpawnCwds.has(cwdNorm)) return { ok: true }
+  // TC 出身 sid：hook 只可更新既有條目、不可建檔（少爺 2026-07-15 拍板進側欄後的防污染守則）
+  if ((subprocessSids.has(e.session_id) && !sessions.has(e.session_id)) || pendingSpawnCwds.has(cwdNorm)) return { ok: true }
   const name = getSessionTopic(e.session_id) ?? projectName(e.cwd)
   // Remove old done/inactive sessions from the same project to keep the list clean
   for (const [id, old] of sessions) {
@@ -324,7 +366,7 @@ app.post('/hook/SessionStart', async (request) => {
 app.post('/hook/Stop', async (request) => {
   const e = request.body
   forwardToClaudia(e, 'Stop')
-  if (subprocessSids.has(e.session_id)) return { ok: true }
+  if (subprocessSids.has(e.session_id) && !sessions.has(e.session_id)) return { ok: true }
   const reason = e.stop_reason ?? ''
   const isSleeping = reason === 'max_tokens'
   const status = isSleeping ? 'sleeping' : 'done'
@@ -358,8 +400,8 @@ app.post('/hook/SessionEnd', async (request) => {
   const e = request.body
   forwardToClaudia(e, 'SessionEnd')
   // TC 出身的 sid 永久標記不刪（少爺 2026-07-14）：同 sid 可能有多顆進程（喚醒＋孤兒），
-  // 一顆 SessionEnd 就除名會讓另一顆還活著的事件被誤註冊成互動 session
-  if (subprocessSids.has(e.session_id)) return { ok: true }
+  // 一顆 SessionEnd 就除名會讓另一顆還活著的事件被誤註冊成互動 session；有正式條目者放行更新
+  if (subprocessSids.has(e.session_id) && !sessions.has(e.session_id)) return { ok: true }
   // 未知 session 的 SessionEnd 不建檔（少爺 2026-07-15：VS Code 重載時舊視窗齊發 SessionEnd，
   // setStatus 憑空建出一排無名條目）——沒追蹤過的 session 結束了也沒東西好更新
   if (!sessions.has(e.session_id)) return { ok: true }
@@ -372,7 +414,7 @@ app.post('/hook/SessionEnd', async (request) => {
 app.post('/hook/PreToolUse', async (request) => {
   const e = request.body
   forwardToClaudia(e, 'PreToolUse')
-  if (subprocessSids.has(e.session_id)) return { ok: true }
+  if (subprocessSids.has(e.session_id) && !sessions.has(e.session_id)) return { ok: true }
   const s = upsertSession(e.session_id)
   // Fill in displayName from cwd if still generic
   if (e.cwd && (!s.cwd || s.displayName === 'Session')) {
@@ -438,10 +480,38 @@ app.post('/hook/PermissionRequest', async (request) => {
 })
 
 // UserPromptSubmit
+// 同步 hook（少爺 2026-07-15「不要中斷心流」）：少爺在互動介面對「TC 出身＋綁 spawn 模式 QA run」的
+// 聊天室打字時，注入一次性指令讓該分頁自己掛 Monitor＋轉 monitor 模式——VS Code 原地聯動全自動化。
+// 這個端點只做注入判斷（session 註冊仍走既有非同步 /hook/UserPromptSubmit，不重複處理）
+app.post('/hook/UserPromptSubmitSync', async (request, reply) => {
+  const e = request.body ?? {}
+  const _sid = e.session_id
+  if (!_sid || !subprocessSids.has(_sid)) return ''
+  const _prompt = String(e.prompt ?? '')
+  if (_prompt.startsWith('(TC')) return ''   // TC 自己的喚醒/通知 prompt 不注入
+  // TC 自家無頭進程正在跑這個 session ＝ 這句不是少爺在互動介面打的
+  for (const [, _p] of claudeProcs) if (_p.sessionId === _sid && _p.status === 'running') return ''
+  const _run = readQaRuns().runs.find(r =>
+    r.boundSessionId === _sid && r.wakeMode === 'spawn' && !r.archivedAt && !['closed', 'aborted'].includes(r.status))
+  if (!_run) return ''
+  logEvent('qa.monitor.autoconvert.injected', { sid: _sid, runId: _run.id })
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'UserPromptSubmit',
+      additionalContext:
+        `(TC 自動聯動設定) 本聊天室已被少爺在互動介面開啟，且綁定 QA run「${_run.topic}」(${_run.id})目前為 spawn 喚醒模式。` +
+        `請在處理少爺訊息前先完成兩步（一次性設定，轉成 monitor 後不再出現）：` +
+        `(1) 用 Monitor 工具執行 command='python -u C:/Project/MasterBrain/.agent/scripts/Watch-QAComments.py --session ${_sid}'、persistent=true；` +
+        `(2) PATCH http://127.0.0.1:3001/api/qa/runs/${_run.id} body {"wakeMode":"monitor"}。` +
+        `完成後照常處理少爺的訊息，並簡短告知已完成聯動設定。`,
+    },
+  }
+})
+
 app.post('/hook/UserPromptSubmit', async (request) => {
   const e = request.body
   forwardToClaudia(e, 'UserPromptSubmit')
-  if (subprocessSids.has(e.session_id)) return { ok: true }
+  if (subprocessSids.has(e.session_id) && !sessions.has(e.session_id)) return { ok: true }
   const raw = e.prompt ?? ''
   // Strip leading XML system tags (e.g. <task-notification>, <system-reminder>)
   const clean = raw.replace(/^(\s*<[^>]+>[\s\S]*?<\/[^>]+>\s*)+/, '').trim()
@@ -788,18 +858,28 @@ function twNormalizeTags(p) {
     }
   } catch { return p }
 }
-const TAG_LLM_QUIET_MS = 5 * 60 * 1000              // 聊天室安靜 5 分鐘才標（不追著活 session 重標）
-const TAG_LLM_STALE_MSGS = 3                        // 快取後新增留言 >= 此數 → 視為過期重標
+// 少爺 2026-07-16 定案：標籤器改「每晚 23:30 定時批次增量」——不再追活 session、不在開 History 即時觸發。
+// 只處理「有新對話」的室（cleanCount > 上次標記時 userCount）、增量室只看新留言、併批 spawn 攤提系統開銷。
 const TAGGER_CWD = path.join(os.tmpdir(), 'tc-tagger')
+const TAG_NIGHTLY_HOUR = 23, TAG_NIGHTLY_MIN = 30   // 每天定時時刻（與話題筆記同為晚上）
+const TAG_BATCH_SIZE = 5                            // 每批 spawn 處理的室數（攤提 ~15-20k 系統 prompt 開銷）
+const TAG_NIGHTLY_STATE_FILE = path.join(os.homedir(), '.claude', 'tc_tag_nightly.json')
 const llmTagCache = new Map()   // sessionId → { tags, summary, knowledge, userCount, ts }
-const tagQueue = []
+const tagQueue = []             // array of batch：{ items: [{ sessionId, mode, prevTags, prevSummary, texts, cleanCount }] }
 const tagQueuedSids = new Set()
 let tagWorkerBusy = false
 
+/** 單室排隊（手動即時重標用）——包成單室 batch 走同一條 worker */
 function enqueueLlmTagging(sessionId, cleanTexts, cleanCount = null) {
-  if (tagQueuedSids.has(sessionId) || !cleanTexts.length) return
-  tagQueuedSids.add(sessionId)
-  tagQueue.push({ sessionId, cleanTexts, cleanCount: cleanCount ?? cleanTexts.length })
+  enqueueTagBatch([{ sessionId, mode: 'full', texts: cleanTexts, cleanCount: cleanCount ?? (cleanTexts?.length ?? 0) }])
+}
+
+/** 批次排隊：過濾掉已在排隊中的室，其餘併成一個 batch job */
+function enqueueTagBatch(items) {
+  const _fresh = (items ?? []).filter(it => it.sessionId && !tagQueuedSids.has(it.sessionId) && it.texts?.length)
+  if (!_fresh.length) return
+  for (const it of _fresh) tagQueuedSids.add(it.sessionId)
+  tagQueue.push({ items: _fresh })
   setImmediate(runTagWorker)
 }
 
@@ -824,17 +904,69 @@ function getCustomTagTerms() {
   } catch { return [] }
 }
 
-function buildTagPrompt(cleanTexts) {
+/** 批次標籤 prompt：一次帶多室；增量室（mode='incremental'）附既有標籤、只列新留言 */
+function buildBatchTagPrompt(items) {
   const _custom = getCustomTagTerms()
   const _customLine = _custom.length ? `\n少爺自訂詞（曾手動加過的標籤，符合主題時優先採用）：${_custom.join('、')}` : ''
   const _terms = [...getTagLexicon().terms].slice(0, 260).join('、') + _customLine
-  const _msgs = cleanTexts.slice(0, 40).map((t, i) => `${i + 1}. ${t.replace(/\s+/g, ' ').slice(0, 200)}`).join('\n')
-  return `你是聊天室主題標籤器。以下是一個遊戲開發聊天室中使用者的留言（時間序）。不要使用任何工具，只輸出純 JSON、不要其他文字：
-{"tags":["3~6個主題標籤"],"summary":"這個聊天室在做什麼（繁體中文一句話，50字內）","knowledge":["tags 相關且出現在詞彙表中的詞"]}
+  const _blocks = items.map((it, i) => {
+    const _prev = (it.mode === 'incremental' && it.prevTags?.length)
+      ? `既有標籤：${it.prevTags.join('、')}｜既有摘要：${it.prevSummary ?? ''}\n（下方只列本室的「新增留言」。請輸出「更新後的完整標籤集」：保留既有標籤中仍能代表本室的、再加上新留言帶出的新主題，合計取最具代表性的 3~6 個〔別丟掉既有的重要主題〕；summary 也更新成涵蓋新舊主題的一句話。）`
+      : ''
+    const _msgs = (it.texts ?? []).slice(0, 40).map((t, j) => `${j + 1}. ${t.replace(/\s+/g, ' ').slice(0, 200)}`).join('\n')
+    return `── 聊天室 ${i + 1} ──\n${_prev}\n留言：\n${_msgs}`
+  }).join('\n\n')
+  return `你是聊天室主題標籤器。下面有 ${items.length} 個遊戲開發聊天室，各附使用者留言（時間序）。為「每一室」產生標籤。不要使用任何工具，只輸出純 JSON 陣列（第 i 個元素對應「聊天室 i」、順序絕不可變、室數必須與下方一致）、不要其他文字：
+[{"tags":["3~6個主題標籤"],"summary":"這室在做什麼（繁體中文一句話，50字內）","knowledge":["tags 相關且出現在詞彙表中的詞"]}, ...]
 規則：**全部輸出一律使用繁體中文（台灣用語），嚴禁出現任何簡體字**；tags 用繁體中文或原文技術詞；優先採用詞彙表的詞；聊天室特有的具體主題（例如「野蠻人噴飛BUG」「陣型衝撞」）要保留具體性；不要放「專案」「功能」這種空泛詞。
 詞彙表：${_terms}
-留言：
-${_msgs}`
+
+${_blocks}`
+}
+
+/** 從 LLM 回應抽出批次結果陣列（缺項回 null；單室可退回單物件） */
+function parseTagBatchResult(text, n) {
+  try {
+    const _m = text.match(/\[[\s\S]*\]/)
+    if (_m) {
+      const _arr = JSON.parse(_m[0])
+      if (Array.isArray(_arr)) return _arr
+    }
+    if (n === 1) {
+      const _o = text.match(/\{[\s\S]*\}/)
+      if (_o) return [JSON.parse(_o[0])]
+    }
+  } catch {}
+  return []
+}
+
+/** 單室標籤結果寫回：增量融合舊 tag（保底）+ 套 pinned/banned 校正 + ai-tags 行 + in-memory 快取 */
+function writeTagResult(sessionId, raw, cleanCount, prevTagsForMerge = null) {
+  if (!raw) return
+  let _tags = (Array.isArray(raw.tags) ? raw.tags : []).map(t => String(t).slice(0, 24)).filter(Boolean).slice(0, 6)
+  // 增量融合保底：LLM 應已在 prompt 指示下保留舊主題，這裡再兜底一次防它只回新 tag（上限放寬到 8）
+  if (prevTagsForMerge?.length) _tags = [...new Set([..._tags, ...prevTagsForMerge.map(t => String(t).slice(0, 24))])].slice(0, 8)
+  const payload = twNormalizeTags({
+    tags: _tags,
+    summary: String(raw.summary ?? '').slice(0, 80),
+    knowledge: (Array.isArray(raw.knowledge) ? raw.knowledge : []).map(t => String(t).slice(0, 24)).slice(0, 8),
+    userCount: cleanCount ?? 0,
+    ver: TAG_PIPELINE_VER,
+    ts: Date.now(),
+  })
+  // 少爺校正必勝：pinned 必留、banned 必濾（LLM 重標永遠蓋不掉人工校正）
+  const _prev = llmTagCache.get(sessionId)
+  if (_prev?.pinned?.length || _prev?.banned?.length) {
+    const _ban = new Set(_prev.banned ?? [])
+    payload.tags = [...new Set([...(_prev.pinned ?? []), ...payload.tags.filter(t => !_ban.has(t))])].slice(0, 12)
+    payload.pinned = _prev.pinned ?? []
+    payload.banned = _prev.banned ?? []
+  }
+  if (payload.tags.length) {
+    appendAiTagsLine(sessionId, payload)
+    llmTagCache.set(sessionId, payload)
+    logEvent('tags.llm.done', { sessionId, tags: payload.tags })
+  }
 }
 
 /** ai-tags 快取行寫回 transcript jsonl（append-only；讀取端取最後一行為準） */
@@ -859,16 +991,21 @@ function runTagWorker() {
   if (tagWorkerBusy || tagQueue.length === 0) return
   tagWorkerBusy = true
   const job = tagQueue.shift()
+  const _release = () => {
+    for (const it of job.items) tagQueuedSids.delete(it.sessionId)
+    tagWorkerBusy = false
+    setImmediate(runTagWorker)
+  }
   const _cwdNorm = TAGGER_CWD.replace(/\\/g, '/').toLowerCase()
   try { fs.mkdirSync(TAGGER_CWD, { recursive: true }) } catch {}
   pendingSpawnCwds.add(_cwdNorm)   // tagger 子進程不進 Sessions 側欄（沿用 spawn 前例）
   const args = ['--model', TAG_LLM_MODEL, '--output-format', 'stream-json', '--verbose',
-    '--dangerously-skip-permissions', '--max-turns', '1', '-p', buildTagPrompt(job.cleanTexts)]
+    '--dangerously-skip-permissions', '--max-turns', '1', '-p', buildBatchTagPrompt(job.items)]
   let proc
   try { proc = spawn(getClaudeExe(), args, { cwd: TAGGER_CWD, stdio: ['ignore', 'pipe', 'pipe'] }) }
-  catch { tagQueuedSids.delete(job.sessionId); pendingSpawnCwds.delete(_cwdNorm); tagWorkerBusy = false; return }
+  catch { pendingSpawnCwds.delete(_cwdNorm); _release(); return }
   let _sid = null, _text = '', _buf = ''
-  const _timeout = setTimeout(() => { try { proc.kill() } catch {} }, 120_000)
+  const _timeout = setTimeout(() => { try { proc.kill() } catch {} }, 180_000)   // 批次放寬到 180s
   proc.stdout.on('data', c => {
     _buf += c.toString()
     const _lines = _buf.split('\n'); _buf = _lines.pop()
@@ -886,35 +1023,12 @@ function runTagWorker() {
     // tagger 自己的 transcript 不留（否則 History 會長出標籤器聊天室）
     if (_sid) { try { const _fp = findJsonlPath(_sid); if (_fp) fs.unlinkSync(_fp) } catch {} }
     try {
-      const _m = _text.match(/\{[\s\S]*\}/)
-      if (_m) {
-        const _p = JSON.parse(_m[0])
-        const payload = twNormalizeTags({
-          tags: (Array.isArray(_p.tags) ? _p.tags : []).map(t => String(t).slice(0, 24)).filter(Boolean).slice(0, 6),
-          summary: String(_p.summary ?? '').slice(0, 80),
-          knowledge: (Array.isArray(_p.knowledge) ? _p.knowledge : []).map(t => String(t).slice(0, 24)).slice(0, 8),
-          userCount: job.cleanCount ?? job.cleanTexts.length,
-          ver: TAG_PIPELINE_VER,
-          ts: Date.now(),
-        })
-        // 少爺校正必勝：pinned 必留、banned 必濾（LLM 重標永遠蓋不掉人工校正）
-        const _prev = llmTagCache.get(job.sessionId)
-        if (_prev?.pinned?.length || _prev?.banned?.length) {
-          const _ban = new Set(_prev.banned ?? [])
-          payload.tags = [...new Set([...(_prev.pinned ?? []), ...payload.tags.filter(t => !_ban.has(t))])].slice(0, 12)
-          payload.pinned = _prev.pinned ?? []
-          payload.banned = _prev.banned ?? []
-        }
-        if (payload.tags.length) {
-          appendAiTagsLine(job.sessionId, payload)
-          llmTagCache.set(job.sessionId, payload)
-          logEvent('tags.llm.done', { sessionId: job.sessionId, tags: payload.tags })
-        }
-      }
+      const _arr = parseTagBatchResult(_text, job.items.length)
+      // 順序對應：第 i 個結果 → job.items[i]（不依賴 LLM 正確回傳 sid，最 robust）
+      // 增量室傳 prevTags 做融合保底（舊主題不丟失）
+      job.items.forEach((it, i) => writeTagResult(it.sessionId, _arr[i], it.cleanCount, it.mode === 'incremental' ? it.prevTags : null))
     } catch {}
-    tagQueuedSids.delete(job.sessionId)
-    tagWorkerBusy = false
-    setImmediate(runTagWorker)
+    _release()
   })
 }
 
@@ -1038,11 +1152,10 @@ function scanHistoryFile(fullPath, stat, entry) {
   return entry
 }
 
-// List all past sessions across all projects
-app.get('/api/history', async () => {
+/** 增量掃描全部 transcript、更新索引並寫回；回傳更新後的 idx。route 與 nightly 標籤共用。 */
+function refreshHistoryIndex() {
   const projectsDir = path.join(CLAUDE_DIR, 'projects')
   const idx = loadHistoryIndex()
-  const result = []
   const _seen = new Set()
   let _dirty = false
   try {
@@ -1064,35 +1177,97 @@ app.get('/api/history', async () => {
         entry.mtime = stat.mtimeMs
         entry.size = stat.size
         idx.sessions[sessionId] = entry
-
-        // tags 決策：新鮮 LLM 快取直接用；無/過期 → 啟發式墊檔＋排隊重標（安靜 5 分鐘才標）
-        const aiTags = entry.aiTags ?? null
-        const cleanTexts = [...(entry.cleanHead ?? []), ...(entry.cleanTail ?? [])]
-        let tags = null, summary = null, knowledge = []
-        // manual（少爺校正過）即使清空也是權威——不得回退啟發式讓被移除的 tag 復活
-        if (aiTags && (aiTags.tags?.length || aiTags.manual)) {
-          llmTagCache.set(sessionId, aiTags)
-          tags = aiTags.tags ?? []; summary = aiTags.summary ?? null; knowledge = aiTags.knowledge ?? []
-        }
-        const _quiet = Date.now() - stat.mtimeMs > TAG_LLM_QUIET_MS
-        // 過期條件：無快取 / 版本不符 / 新增留言達門檻
-        const _stale = aiTags
-          ? (aiTags.ver !== TAG_PIPELINE_VER || (entry.cleanCount ?? 0) - (aiTags.userCount ?? 0) >= TAG_LLM_STALE_MSGS)
-          : true
-        if (_quiet && _stale && cleanTexts.length) enqueueLlmTagging(sessionId, cleanTexts, entry.cleanCount ?? cleanTexts.length)
-        if (!tags) tags = extractSessionTags(cleanTexts)
-        const costUsd = entry.resultUsd ?? ((entry.estUsd ?? 0) > 0 ? entry.estUsd : null)
-        result.push({ sessionId, project: proj, cwd: entry.cwd ?? null,
-          title: entry.title ?? entry.firstMsg ?? sessionId.slice(0, 8),
-          mtime: stat.mtimeMs, size: stat.size, costUsd,
-          tags, summary, llm: !!(aiTags?.tags?.length || aiTags?.manual), knowledge: resolveKnowledgeDocs(knowledge) })
+        // in-memory tag 快取同步（jsonl 已有 ai-tags 就載入）——校正權威也走這條回填
+        if (entry.aiTags && (entry.aiTags.tags?.length || entry.aiTags.manual)) llmTagCache.set(sessionId, entry.aiTags)
       }
     }
-    // transcript 已刪除的室從索引剔除
     for (const sid of Object.keys(idx.sessions)) if (!_seen.has(sid)) { delete idx.sessions[sid]; _dirty = true }
     if (_dirty) atomicWriteJson(HISTORY_INDEX_FILE, idx)
   } catch {}
+  return idx
+}
+
+// List all past sessions across all projects（純顯示——不再即時觸發 LLM 標籤，改由每晚 23:30 定時批次）
+app.get('/api/history', async () => {
+  const idx = refreshHistoryIndex()
+  const result = []
+  for (const [sessionId, entry] of Object.entries(idx.sessions)) {
+    const aiTags = entry.aiTags ?? null
+    const cleanTexts = [...(entry.cleanHead ?? []), ...(entry.cleanTail ?? [])]
+    let tags = null, summary = null, knowledge = []
+    // manual（少爺校正過）即使清空也是權威；有 LLM tag 用 LLM；都沒有才詞頻墊檔
+    if (aiTags && (aiTags.tags?.length || aiTags.manual)) {
+      tags = aiTags.tags ?? []; summary = aiTags.summary ?? null; knowledge = aiTags.knowledge ?? []
+    }
+    if (!tags) tags = extractSessionTags(cleanTexts)
+    const costUsd = entry.resultUsd ?? ((entry.estUsd ?? 0) > 0 ? entry.estUsd : null)
+    result.push({ sessionId, project: entry.project, cwd: entry.cwd ?? null,
+      title: entry.title ?? entry.firstMsg ?? sessionId.slice(0, 8),
+      mtime: entry.mtime, size: entry.size, costUsd,
+      tags, summary, llm: !!(aiTags?.tags?.length || aiTags?.manual), knowledge: resolveKnowledgeDocs(knowledge) })
+  }
   return { sessions: result.sort((a,b) => b.mtime - a.mtime).slice(0, 100) }
+})
+
+// ── 每晚 23:30 定時批次標籤（少爺 2026-07-16）───────────────────────────────────
+// 只處理「有新對話」的室（cleanCount > 上次 userCount）；增量室只餵新留言；併批 spawn。
+function runNightlyTagging(reason = 'scheduled') {
+  const idx = refreshHistoryIndex()
+  const _cands = []
+  for (const [sessionId, entry] of Object.entries(idx.sessions)) {
+    const cleanCount = entry.cleanCount ?? 0
+    if (!cleanCount) continue
+    const aiTags = entry.aiTags ?? null
+    const _sample = [...(entry.cleanHead ?? []), ...(entry.cleanTail ?? [])]
+    if (!aiTags || aiTags.ver !== TAG_PIPELINE_VER) {
+      // 從沒標過 / 版本過舊 → 首標（讀樣本）
+      _cands.push({ sessionId, mode: 'full', texts: _sample, cleanCount })
+    } else if (cleanCount > (aiTags.userCount ?? 0)) {
+      // 有新對話 → 增量（只看上次之後的新留言）
+      const _newCount = cleanCount - (aiTags.userCount ?? 0)
+      const _newTexts = (entry.cleanTail ?? []).slice(-Math.min(_newCount, 20))
+      if (_newTexts.length) _cands.push({ sessionId, mode: 'incremental', prevTags: aiTags.tags, prevSummary: aiTags.summary, texts: _newTexts, cleanCount })
+    }
+    // 沒新對話 → 跳過（零成本）
+  }
+  for (let i = 0; i < _cands.length; i += TAG_BATCH_SIZE) enqueueTagBatch(_cands.slice(i, i + TAG_BATCH_SIZE))
+  logEvent('tags.nightly.run', { reason, candidates: _cands.length, batches: Math.ceil(_cands.length / TAG_BATCH_SIZE) })
+  try { atomicWriteJson(TAG_NIGHTLY_STATE_FILE, { lastRun: Date.now(), reason, candidates: _cands.length }) } catch {}
+  return _cands.length
+}
+
+function scheduleNextNightly() {
+  const _now = new Date()
+  const _next = new Date(_now)
+  _next.setHours(TAG_NIGHTLY_HOUR, TAG_NIGHTLY_MIN, 0, 0)
+  if (_next <= _now) _next.setDate(_next.getDate() + 1)
+  const _delay = _next.getTime() - _now.getTime()
+  logEvent('tags.nightly.scheduled', { at: _next.toISOString(), inMinutes: Math.round(_delay / 60000) })
+  setTimeout(() => {
+    try { runNightlyTagging('scheduled') } catch (e) { console.error('[nightly tag]', e) }
+    scheduleNextNightly()
+  }, _delay)
+}
+
+// tagger 子進程 transcript 保險清掃（單次清在 worker close 做；這裡清歷史殘留——如 server 曾在
+// tagger 跑到一半重啟、close handler 沒觸發）。開機時＋每晚跑完各清一次。
+function cleanTaggerTranscripts() {
+  try {
+    const _projectsDir = path.join(CLAUDE_DIR, 'projects')
+    for (const proj of fs.readdirSync(_projectsDir)) {
+      if (!proj.includes('tc-tagger')) continue
+      const _dir = path.join(_projectsDir, proj)
+      for (const f of fs.readdirSync(_dir)) try { fs.unlinkSync(path.join(_dir, f)) } catch {}
+    }
+  } catch {}
+}
+cleanTaggerTranscripts()
+scheduleNextNightly()
+
+// 手動觸發夜間標籤（測試／少爺想立即跑一輪）
+app.post('/api/history/tags/run-nightly', async () => {
+  const _n = runNightlyTagging('manual')
+  return { ok: true, candidates: _n, queue: tagQueue.length }
 })
 
 // Get messages from a specific session JSONL
@@ -1463,6 +1638,19 @@ function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort
           pendingSpawnCwds.delete(normalCwd)
           // 新聊天室的 model/effort 選擇在拿到 session id 後記成偏好，續聊/QA 喚醒沿用
           setSessionPrefs(event.session_id, entry.model ?? null, entry.effort ?? null)
+          // TC 出身聊天室進 Sessions 側欄（少爺 2026-07-15 拍板）：建檔由 spawn 生命週期做（hook 對
+          // subprocess 只可更新不可建）——名稱照「最初首句」規則，origin:'tc' 給前端掛 🍷 出身標記
+          {
+            const _cur = sessions.get(event.session_id)
+            const _raw = _cur?.topic ?? getSessionTopic(event.session_id) ?? prompt
+            // 喚醒/測試前綴「(TC ...)」不進名稱（最初首句規則的 TC 變體）
+            const _topic = (_raw.replace(/^\((TC|probe)[^)]*\)\s*/, '').trim() || _raw).slice(0, 60)
+            upsertSession(event.session_id, {
+              origin: 'tc', status: 'active', cwd: projectPath,
+              topic: _topic, displayName: _topic.slice(0, 40),
+            })
+            broadcast({ type: 'session', session: sessions.get(event.session_id) })
+          }
           // 呼叫端要拿新 session id 做後續綁定時用（少爺 2026-07-14：QA 未綁定 run 自動開新聊天室並綁回）
           if (onInit) try { onInit(event.session_id) } catch {}
         }
@@ -1471,6 +1659,9 @@ function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort
         broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath), sessionId: entry.sessionId ?? null, event })
       } catch {}
     }
+    // TC 聊天室的側欄活動時間隨輸出刷新（in-memory；持久化靠既有 schedulePersist 節奏）
+    const _sess = entry.sessionId ? sessions.get(entry.sessionId) : null
+    if (_sess) _sess.lastSeenAt = Date.now()
   })
 
   proc.stderr.on('data', chunk => {
@@ -1481,6 +1672,8 @@ function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort
   proc.on('close', code => {
     entry.status = 'done'
     broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath), event: { type: 'done', exitCode: code } })
+    // 側欄的 TC 聊天室轉 done（閒置 20 分鐘後自動退場）
+    if (entry.sessionId && sessions.has(entry.sessionId)) setStatus(entry.sessionId, 'done')
     setTimeout(() => { if (claudeProcs.get(projectPath) === entry) claudeProcs.delete(projectPath) }, 10_000)
     // 處理 queue 下一個（如果有）— 維持「直接送 + 不中斷」UX
     processQueueIfIdle(projectPath)
@@ -1723,11 +1916,13 @@ function scanJsonlSessions() {
             } catch {}
           }
           if (!hasActivity) continue   // skip empty/init-only files
-          // TC 自己 spawn 的子進程 session 不進互動 sessions 清單（少爺 2026-07-14：掃描器漏掉這道濾網＝孤兒被誤註冊的根因）
-          if (subprocessSids.has(sid)) continue
+          // TC 出身 sid：掃描器只可更新既有條目、不可建檔（2026-07-15 對齊 hook 同款政策——
+          // 全跳過會讓 tc 條目狀態凍結、孤兒守護者工作時 session_live 不掛監看、TC Chat 看不到直播）
+          if (subprocessSids.has(sid) && !sessions.has(sid)) continue
           // 復活判定看「最後真實對話」不看檔案 mtime（少爺 2026-07-15：VS Code 重載會對所有舊 session 檔
-          // 補 last-prompt 中繼行 → mtime 全新 → 清掉的舊 session 被掃描器復活）——沒新對話的不重新註冊
-          if (!sessions.has(sid) && (!lastMsgTs || now - lastMsgTs > SCAN_WINDOW_MS)) continue
+          // 補 last-prompt 中繼行 → mtime 全新 → 清掉的舊 session 被掃描器復活）——沒新對話的不重新註冊。
+          // 門檻與自動退場（20 分鐘）一致，避免「掃描器加回、退場再移除」振盪
+          if (!sessions.has(sid) && (!lastMsgTs || now - lastMsgTs > SESSION_RETIRE_MS)) continue
           // Determine if session looks "active" (file modified < 3 min ago and no result event at end)
           const recentlyWritten = now - st.mtimeMs < 3 * 60 * 1000
           const lastLine = lines[lines.length - 1] ?? ''
@@ -1742,7 +1937,7 @@ function scanJsonlSessions() {
           // recentlyWritten = < 3 min; if older, allow downgrade.
           const cur = sessions.get(sid)
           if (cur && cur.status === 'active' && status === 'done' && recentlyWritten) continue
-          const s = upsertSession(sid, { displayName, cwd: cwd ?? cur?.cwd, status, startedAt: st.birthtimeMs ?? st.mtimeMs })
+          const s = upsertSession(sid, { displayName, cwd: cwd ?? cur?.cwd, status, startedAt: st.birthtimeMs ?? st.mtimeMs, ...(lastMsgTs ? { lastSeenAt: Math.max(cur?.lastSeenAt ?? 0, lastMsgTs) } : {}) }, false)
           broadcast({ type: 'session', session: s })
           schedulePersist()
           // Auto-watch newly-discovered active sessions
@@ -3346,6 +3541,7 @@ app.patch('/api/qa/runs/:id', async (request, reply) => {
       status: 'pending', evidenceRefs: [], resultNote: '',
     })
   }
+  if (Array.isArray(body.criteria)) run.criteria = body.criteria // A 區塊 criteria 整批重設(補字串→物件用；PATCH 入口，2026-07-15)
   if (Array.isArray(body.addCriteria)) for (const c of body.addCriteria) run.criteria.push(c)
   // 少爺 2026-07-14 環境戳記標準欄位：announce 舊路徑建的 run 可事後 PATCH 補填
   for (const _k of ['env', 'commit', 'branch', 'map', 'buildConfig'])
@@ -3395,11 +3591,55 @@ app.post('/api/qa/runs/:id/events', async (request, reply) => {
 
 // M-6b：少爺控制動作 → server 主動喚醒綁定的聊天室（wakeMode='spawn' 時）
 // 走既有 /api/claude/run 機器：busy → 排隊；idle → spawnClaude resume 該 session
+// 提早「處理中」訊號（少爺 2026-07-15：留言後 QA 分頁掛「等待接手」直到 Claude 第一次 PATCH，
+// 空窗約 4 分鐘常被誤判沒做動）——喚醒後輪詢 transcript，一開始寫入就把 ack 翻成 working
+function armAckEarlyFlip(runId, watchFp, baselineMtime) {
+  const _timer = setInterval(() => {
+    try {
+      const _mt = (() => { try { return watchFp ? fs.statSync(watchFp).mtimeMs : 0 } catch { return 0 } })()
+      if (_mt <= baselineMtime) return
+      clearInterval(_timer)
+      const _d = readQaRuns()
+      const _r = _d.runs.find(x => x.id === runId)
+      if (_r?.claudeAck?.state === 'pending') {
+        _r.claudeAck.state = 'working'
+        _r.claudeAck.workingAt = Date.now()
+        writeQaRuns(_d)
+        qaBroadcast(_r)
+      }
+    } catch {}
+  }, 8 * 1000)
+  setTimeout(() => clearInterval(_timer), 160 * 1000)
+}
+
 const QA_WAKE_ACTIONS = { 'start-now': '按了「▶ 立即開跑」→ 請進入階段二（埋 LOG + 雙編譯 + 重啟 Editor）', pause: '要求暫停', resume: '要求繼續', abort: '要求中止', comment: '留言', close: '按了「✔ 結案」→ 階段五（清 QAC LOG + 雙編譯 + 重啟 Editor；無頭啟動 Editor 用 Start-Process detached）＋維護侍酒師閉環：把本 run 需求「實作驗證後的收斂」沉澱回四種血肉（C++ code / 架構 canvas / 拼圖 memory；藍圖 md 暫跳過），Editor 開著時跑 extract_asset_graph.py 更新藍圖資產層，最後 POST /api/sommelier/refresh/roman 重萃取讓侍酒師吃到最新拼圖' }
 function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, effort = null, wakeVisible = false) {
   try {
-    // monitor 模式＝該 session 自掛監看，不可 spawn（雙寫 transcript）；其餘一律喚醒
-    if (run.wakeMode === 'monitor') return
+    // monitor 模式＝該 session 自掛監看，不可 spawn（雙寫 transcript）；其餘一律喚醒。
+    // 看門狗（少爺 2026-07-15「確保機制能運作」）：分頁被關掉＝監看已死——150 秒內 transcript 沒有
+    // 新寫入就退回無頭喚醒＋run 轉回 spawn 模式（喚醒永不聾；監看腳本輪詢 15s + 反應時間，150s 足夠）
+    if (run.wakeMode === 'monitor') {
+      const _mFp = findJsonlPath(run.boundSessionId)
+      const _mBefore = (() => { try { return _mFp ? fs.statSync(_mFp).mtimeMs : 0 } catch { return 0 } })()
+      armAckEarlyFlip(run.id, _mFp, _mBefore)
+      const _mPrompt = `(TC QA 聯動通知) 少爺在 QA Monitor 對 run「${run.topic}」(${run.id}) ${QA_WAKE_ACTIONS[action] ?? action}${text ? `：「${text}」` : ''}。原 monitor 監看已無回應（分頁可能已關閉），本喚醒為無頭補送，run 已轉回 spawn 模式。請照 Mode C 流程繼續（QA/README.md §Mode C），先 GET /api/qa/runs/${run.id}?ackComments=1 讀留言。`
+      setTimeout(() => {
+        try {
+          const _mAfter = (() => { try { return _mFp ? fs.statSync(_mFp).mtimeMs : 0 } catch { return 0 } })()
+          if (_mAfter > _mBefore) return   // 監看有反應（分頁活著）
+          const _d = readQaRuns()
+          const _r = _d.runs.find(x => x.id === run.id)
+          if (_r) { _r.wakeMode = 'spawn'; _r.updatedAt = Date.now(); writeQaRuns(_d); qaBroadcast(_r) }
+          logEvent('qa.wake.monitor_fallback', { id: run.id, action, sessionId: run.boundSessionId })
+          const _pp = (run.boundProjectPath ?? 'C:/Project/RomanPrototype').replace(/\//g, path.sep)
+          if (!isSafeCwd(_pp)) return
+          const _sp = getSessionPrefs(run.boundSessionId)
+          if (claudeProcs.get(_pp)?.status === 'running') return
+          spawnClaude(_pp, _mPrompt, run.boundSessionId, _sp?.model ?? null, _sp?.effort ?? null)
+        } catch {}
+      }, 150 * 1000)
+      return
+    }
     // 少爺 2026-07-14「QA 送出＝仕酒師同做法」：未綁定聊天室（或 wakeMode none）不再沉默——
     // 像「開新聊天室」spawn 新 session 接手，並在 init 拿到 session id 後自動綁回 run（自癒「沒綁定＝按鈕聾的」）
     const _unbound = !run.boundSessionId
@@ -3441,7 +3681,29 @@ function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, e
       const p = spawn('powershell.exe', ['-NoProfile', '-Command', _ps], { detached: true, stdio: 'ignore' })
       p.unref()
       logEvent('qa.wake.cli', { id: run.id, action, sessionId: run.boundSessionId })
+      // cli 視窗看門狗（少爺 2026-07-15「確保機制能運作」）：pm2 服務脈絡下 Start-Process 可能無聲失敗
+      // （03:39 實錄：無進程、無寫入）——90 秒內 transcript 沒有新寫入就自動退回無頭喚醒，保底送達
+      {
+        const _watchFp = findJsonlPath(run.boundSessionId)
+        const _before = (() => { try { return _watchFp ? fs.statSync(_watchFp).mtimeMs : 0 } catch { return 0 } })()
+        armAckEarlyFlip(run.id, _watchFp, _before)
+        setTimeout(() => {
+          try {
+            const _after = (() => { try { return _watchFp ? fs.statSync(_watchFp).mtimeMs : 0 } catch { return 0 } })()
+            if (_after > _before) return   // 視窗有在跑
+            const _existing = claudeProcs.get(projectPath)
+            if (_existing?.status === 'running') return   // 已有其他進程接手
+            logEvent('qa.wake.cli_fallback', { id: run.id, action, sessionId: run.boundSessionId })
+            spawnClaude(projectPath, prompt, run.boundSessionId, _model, _effort, _onInit)
+          } catch {}
+        }, 90 * 1000)
+      }
       return
+    }
+    // 提早「處理中」訊號（spawn/queue 皆適用；未綁定新開的 run 等 Claude 首次 PATCH 才翻）
+    if (run.boundSessionId) {
+      const _aFp = findJsonlPath(run.boundSessionId)
+      armAckEarlyFlip(run.id, _aFp, (() => { try { return _aFp ? fs.statSync(_aFp).mtimeMs : 0 } catch { return 0 } })())
     }
     const existing = claudeProcs.get(projectPath)
     if (existing?.status === 'running') {
