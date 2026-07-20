@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { MODEL_OPTIONS, EFFORT_OPTIONS } from './modelOptions.js'
 import { confirmIfLiveInteractive, fetchLiveInteractiveIds } from './liveSessionGuard.js'
+import { WorkflowLauncher } from './WorkflowLauncher.jsx'
 
 // ─── Sommelier 侍酒師 — 專案名詞圖鑑(P0:C++ 骨架層 + P1:選件購物車)─────────
 // 室內設計圖式層級瀏覽:模組 → 種類 → 類別 → (pragma region 分節的)成員。
@@ -529,6 +530,10 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
     setNotice(msg)
     setTimeout(() => setNotice(''), ms)
   }, [])
+
+  // ── 心腹啟動器（少爺 2026-07-20：CHAT 輸入區塊的「心腹」進駐結帳區，與附加檔案同排）──
+  // ⚡ 啟動＝把心腹模板加進「需求描述」，隨既有 結帳複製 / 送入聊天室 / 開新聊天室 出口一併帶出。
+  const [wfOpen, setWfOpen] = useState(false)
 
   useEffect(() => {
     // App 已傳入共享專案清單 → 不重複抓；清單空時顯示設定提示
@@ -1076,6 +1081,10 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
                   <button onClick={() => attachInputRef.current?.click()}
                     className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] hover:border-[var(--gold)]/60">⬆ 附加檔案</button>
                   <input ref={attachInputRef} type="file" multiple accept="image/*,.pdf,.txt,.md,.json,.csv" className="hidden" onChange={handleAttachFiles} />
+                  {/* ⚡ 心腹（少爺 2026-07-20，仿 CHAT composer）：⚡ 啟動＝模板加進描述，隨結帳一併帶出 */}
+                  <button onClick={() => setWfOpen(v => !v)}
+                    title="心腹 — 選 workflow 模板加進需求描述"
+                    className={`text-[9px] px-1.5 py-0.5 rounded border ${wfOpen ? 'bg-[var(--gold)]/20 border-[var(--gold)] text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)]'} hover:text-[var(--gold)] hover:border-[var(--gold)]/60`}>⚡ 心腹</button>
                   {attachments.map((a, i) => (
                     <span key={i} className="text-[9px] px-1.5 py-0.5 rounded bg-[var(--surface)] border border-[var(--border)] text-[var(--text)] flex items-center gap-1">
                       📎 {a.name}
@@ -1083,6 +1092,15 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
                     </span>
                   ))}
                 </div>
+                {wfOpen && (
+                  <WorkflowLauncher className="mt-1 border border-[var(--border)] rounded bg-[var(--surface-2)] p-2"
+                    launchLabel="⚡ 加入描述"
+                    onLaunch={prompt => {
+                      setWfOpen(false)
+                      setDraft(d => d.trim() ? `${d}\n\n${prompt}` : prompt)
+                      flash('⚡ 心腹模板已加入需求描述——結帳 / 送入聊天室時一併帶出', 5000)
+                    }} />
+                )}
               </div>
 
               {/* 選件列表 */}

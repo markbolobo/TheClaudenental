@@ -5,6 +5,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { MODEL_OPTIONS, EFFORT_OPTIONS } from './modelOptions.js'
 import { confirmIfLiveInteractive } from './liveSessionGuard.js'
+import { WorkflowLauncher } from './WorkflowLauncher.jsx'
 
 const STATUS_META = {
   announced: { label: '待放行', cls: 'text-yellow-400 border-yellow-500/50' },
@@ -111,6 +112,10 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
 
   const run = runs.find(r => r.id === selectedRunId) ?? null
 
+  // ── 心腹啟動器（少爺 2026-07-20）：CHAT 輸入區塊的「心腹」進駐留言列（與 📎 同排）──
+  // ⚡ 啟動＝組好的心腹模板直接走既有留言路徑送出（喚醒 bound session，模型/強度/附檔全沿用）
+  const [qaWfOpen, setQaWfOpen] = useState(false)
+
   // 倒數 tick（250ms 精度）
   useEffect(() => {
     if (run?.status !== 'countdown') return
@@ -126,6 +131,15 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
     }).then(r => r.json()).catch(() => null)
   }
 
+  // 少爺 2026-07-17：▶ 開跑 / ✔ 結案 也無縫切到 Chat 看 Claude 處理（沿用 sendComment 2026-07-08「送出＝手動階段完成→切 Chat」同一設計）。
+  // server 對每個 control action 都會 qaWakeBoundSession 喚醒 Claude；monitor 模式下 TC 不 spawn、Chat 靠 session_live（jsonl 監看）直播，兩者並存不衝突。
+  async function controlAndGoToChat(action, extra = {}) {
+    const _res = await control(action, extra)
+    const _run = _res?.run ?? run
+    onGoToChat?.({ sessionId: _run?.boundSessionId ?? null, projectPath: _run?.boundProjectPath ?? 'C:/Project/RomanPrototype' })
+    return _res
+  }
+
   function handleQaAttach(e) {
     const files = Array.from(e.target.files ?? [])
     for (const file of files) {
@@ -136,8 +150,9 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
     e.target.value = ''
   }
 
-  async function sendComment() {
-    const text = commentText.trim()
+  async function sendComment(overrideText) {
+    // onClick={sendComment} 會把 event 當第一參數傳入 → 只認字串 override（心腹 ⚡ 啟動用）
+    const text = (typeof overrideText === 'string' ? overrideText : commentText).trim()
     if (!text && qaAttach.length === 0) return
     // 少爺 2026-07-14「警示＋照送」：spawn 模式卻綁著 VS Code 活 session（錯配——活 session 應走 monitor）→ 確認後才喚醒
     if (run?.wakeMode === 'spawn' && run?.boundSessionId)
@@ -270,6 +285,12 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
                   🔵 Claude 處理中（最後動作 {fmtTime(run.claudeAck.workingAt)}）
                 </div>
               )}
+              {/* 喚醒石沉（headless 重試仍零回應）：需要少爺人工推一下活分頁（2026-07-17 結案沒反應根治） */}
+              {run.claudeAck?.state === 'undelivered' && (
+                <div className="text-center py-2 text-[12px] text-red-400 border border-red-400/40 rounded bg-red-400/5 my-1">
+                  ⚠️ 喚醒未送達（{run.claudeAck.action}）——聊天室可能被開啟中的分頁佔用，請在該 VS Code 聊天室輸入「請繼續」接手
+                </div>
+              )}
               {/* 最新動態 ticker：Claude 的 mark 事件即進度資訊 */}
               {run.events?.length > 0 && (
                 <div className="text-[10px] text-[var(--text-muted)] truncate mt-1">
@@ -287,7 +308,7 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
               <div className="flex gap-2 mt-2">
                 {['announced', 'countdown'].includes(run.status) && (
                   <>
-                    <button onClick={() => control('start-now')}
+                    <button onClick={() => controlAndGoToChat('start-now')}
                       className="text-[11px] px-3 py-1 rounded border border-green-500/50 text-green-400 hover:bg-green-500/10">▶ 立即開跑</button>
                     {run.status === 'countdown' && (
                       <button onClick={() => control('pause')}
@@ -309,7 +330,7 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
                 )}
                 {['finished', 'aborted'].includes(run.status) && (
                   <button title="結案＝通知 Claude 進入第五階段（移除驗證用 LOG + 雙編譯）"
-                    onClick={() => { if (confirm('結案這輪 QA？Claude 會收到通知並移除為驗證埋的 LOG（第五階段）')) control('close') }}
+                    onClick={() => { if (confirm('結案這輪 QA？Claude 會收到通知並移除為驗證埋的 LOG（第五階段）')) controlAndGoToChat('close') }}
                     className="text-[11px] px-3 py-1 rounded border border-[var(--gold)]/50 text-[var(--gold)] hover:bg-[var(--gold)]/10">✔ 結案</button>
                 )}
                 <div className="flex-1" />
@@ -473,7 +494,16 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
                   ))}
                 </div>
               )}
+              {/* ⚡ 心腹（少爺 2026-07-20，仿 CHAT composer）：⚡ 啟動＝模板直接當留言送出（喚醒沿用下方模型/強度/附檔） */}
+              {qaWfOpen && (
+                <WorkflowLauncher className="mt-1 mb-1 border border-[var(--border)] rounded bg-black/20 p-2"
+                  launchLabel="⚡ 啟動（送出留言）"
+                  onLaunch={prompt => { setQaWfOpen(false); sendComment(prompt) }} />
+              )}
               <div className="flex gap-2 mt-1">
+                <button onClick={() => setQaWfOpen(v => !v)}
+                  title="心腹 — 選 workflow 模板直接當留言送出"
+                  className={`shrink-0 text-[11px] px-2 py-1 rounded border ${qaWfOpen ? 'bg-[var(--gold)]/20 border-[var(--gold)] text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)]'} hover:text-[var(--gold)] hover:border-[var(--gold)]/50`}>⚡</button>
                 <select value={qaModel} onChange={e => setQaModel(e.target.value)} title="留言喚醒 Claude 時使用的 AI 模型"
                   className="shrink-0 bg-black/30 border border-[var(--border)] rounded px-1 py-1 text-[10px] text-[var(--text-muted)] focus:outline-none focus:border-[var(--gold)]/50">
                   {MODEL_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}

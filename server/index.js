@@ -49,6 +49,26 @@ const logHistory         = []          // all log entries, capped at 500
 const claudeProcs        = new Map()   // projectPath → { proc, sessionId, status }
 const subprocessSids     = new Set()   // session_ids spawned by us (filtered from sessions list)
 const pendingSpawnCwds   = new Set()   // project paths currently spawning (pre-registers before init event)
+const monitorHeartbeats  = new Map()   // sessionId → last Watch-QAComments heartbeat ms（監看存活的 VERIFIED 證據）
+
+// 監看存活 = 最後心跳在 MONITOR_ALIVE_MS 內（Watch-QAComments 輪詢 5s，20s 容 3 拍遺失不誤判死）
+const MONITOR_ALIVE_MS = 20 * 1000
+function isMonitorAlive(sessionId) {
+  return sessionId ? (Date.now() - (monitorHeartbeats.get(sessionId) ?? 0) < MONITOR_ALIVE_MS) : false
+}
+
+// 解析真 python.exe 絕對路徑（少爺 2026-07-17：Monitor 非互動 shell 下裸 `python`＝WindowsApps store shim → exit 127；
+// 注入指令與監看掛載都需絕對路徑）。boot 解析一次快取；py launcher 問不到才退回裸 python。
+let _pythonExe = null
+function getPythonExe() {
+  if (_pythonExe) return _pythonExe
+  try {
+    const _r = spawnSync('py', ['-c', 'import sys;print(sys.executable)'], { encoding: 'utf-8' })
+    const _p = String(_r.stdout ?? '').trim()
+    _pythonExe = (_p && fs.existsSync(_p)) ? _p : 'python'
+  } catch { _pythonExe = 'python' }
+  return _pythonExe
+}
 
 function broadcast(msg) {
   const data = JSON.stringify(msg)
@@ -491,21 +511,38 @@ app.post('/hook/UserPromptSubmitSync', async (request, reply) => {
   if (_prompt.startsWith('(TC')) return ''   // TC 自己的喚醒/通知 prompt 不注入
   // TC 自家無頭進程正在跑這個 session ＝ 這句不是少爺在互動介面打的
   for (const [, _p] of claudeProcs) if (_p.sessionId === _sid && _p.status === 'running') return ''
+  // 監看心跳還在＝已原地聯動、不重掛（避免每句注入）；心跳斷才注入（涵蓋兩種：spawn run 首掛 + monitor 死掉重掛）
+  if (isMonitorAlive(_sid)) return ''
   const _run = readQaRuns().runs.find(r =>
-    r.boundSessionId === _sid && r.wakeMode === 'spawn' && !r.archivedAt && !['closed', 'aborted'].includes(r.status))
+    r.boundSessionId === _sid && !r.archivedAt && !['closed', 'aborted'].includes(r.status))
   if (!_run) return ''
-  logEvent('qa.monitor.autoconvert.injected', { sid: _sid, runId: _run.id })
+  logEvent('qa.monitor.autoconvert.injected', { sid: _sid, runId: _run.id, wakeMode: _run.wakeMode })
   return {
     hookSpecificOutput: {
       hookEventName: 'UserPromptSubmit',
       additionalContext:
         `(TC 自動聯動設定) 本聊天室已被少爺在互動介面開啟，且綁定 QA run「${_run.topic}」(${_run.id})目前為 spawn 喚醒模式。` +
         `請在處理少爺訊息前先完成兩步（一次性設定，轉成 monitor 後不再出現）：` +
-        `(1) 用 Monitor 工具執行 command='python -u C:/Project/MasterBrain/.agent/scripts/Watch-QAComments.py --session ${_sid}'、persistent=true；` +
+        `(1) 用 Monitor 工具執行 command='"${getPythonExe()}" -u C:/Project/MasterBrain/.agent/scripts/Watch-QAComments.py --session ${_sid}'、persistent=true；` +
         `(2) PATCH http://127.0.0.1:3001/api/qa/runs/${_run.id} body {"wakeMode":"monitor"}。` +
         `完成後照常處理少爺的訊息，並簡短告知已完成聯動設定。`,
     },
   }
+})
+
+// Watch-QAComments 監看心跳（少爺 2026-07-17：monitor 是否活著改成 VERIFIED 事實而非猜測）——
+// 每輪 POST 一次；UserPromptSubmitSync 靠這判斷要不要重掛、qaWake 靠這決定監看死了就秒退無頭
+app.post('/hook/monitor-heartbeat', async (request) => {
+  const _sid = request.body?.session
+  if (_sid) monitorHeartbeats.set(_sid, Date.now())
+  return { ok: true }
+})
+
+// 監看存活狀態（少爺 2026-07-17：讓「原地聯動有沒有掛上」變成可觀察）——驗證用 + QA 面板顯示
+app.get('/api/qa/monitor-status', async (request) => {
+  const _sid = request.query?.session
+  const _beat = _sid ? (monitorHeartbeats.get(_sid) ?? null) : null
+  return { session: _sid ?? null, alive: isMonitorAlive(_sid), lastBeatMs: _beat, ageMs: _beat ? (Date.now() - _beat) : null }
 })
 
 app.post('/hook/UserPromptSubmit', async (request) => {
@@ -1449,6 +1486,30 @@ app.post('/api/session/watch', async (request) => {
   for (const [id, w] of watchedSessions) {
     if (id !== sessionId) { try { w.watcher.close() } catch {}; watchedSessions.delete(id) }
   }
+  // ── Continue in Chat 側欄聯動（少爺 2026-07-20）──────────────────────────────
+  // 側欄自動退場（SESSION_RETIRE_MS, 8b92c09）後歷史聊天室不在 sessions 清單，而 App 的
+  // handleContinueInChat 只做 setSelectedId「選側欄既有列」→ 選不到＝聯動看似消失。
+  // 看聊天室（watch）就補回側欄一列（最初首句名、status done）；之後 20 分鐘沒真實活動
+  // 仍照既有退場規則離開，不破壞退場機制本意。
+  if (!sessions.has(sessionId)) {
+    const _fp = findJsonlPath(sessionId)
+    if (_fp) {
+      let _cwd = null
+      try {
+        const _lines = fs.readFileSync(_fp, 'utf-8').split('\n').filter(Boolean)
+        for (const _l of _lines.slice(0, 20)) {
+          try { const _o = JSON.parse(_l); if (_o.cwd) { _cwd = _o.cwd; break } } catch {}
+        }
+      } catch {}
+      const _topic = getSessionTopic(sessionId)
+      const _s = upsertSession(sessionId, {
+        status: 'done',
+        ...(_cwd ? { cwd: _cwd } : {}),
+        ...(_topic ? { topic: _topic, displayName: _topic.slice(0, 40) } : {}),
+      })
+      broadcast({ type: 'session', session: _s })
+    }
+  }
   if (watchedSessions.has(sessionId)) return { ok: true }
   const filePath = findJsonlPath(sessionId)
   if (!filePath) return { ok: false, error: 'not found' }
@@ -1592,7 +1653,7 @@ function getSessionPrefs(sessionId) {
 // 少爺 2026-07-14：仕酒師/Chat 勾選「啟用 QA 流程」→ 需求 prompt 尾端附掛 Mode C 指令（流程 SSOT 在 skill 與 QA/README，不在此重抄）
 const QA_FLOW_DIRECTIVE = '\n\n(TC QA 流程) 少爺勾選了「啟用 QA 流程」——本需求必須走 Mode C 協作驗證收尾：照 theclaudenental_operator skill 的「QA Run 操作 SOP（Mode C）」與專案 QA/README.md §Mode C，從 Step 0 開 QA Run（POST /api/qa/runs，必綁 boundSessionId=本 session id、wakeMode:"spawn"、boundProjectPath、project），列 QAPC 計畫（操作步驟＋預期 LOG 劇本＋LOG 埋點計畫）供少爺在 QA 分頁審查；少爺按 ▶ 之前零編譯零埋 LOG。'
 
-function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort = null, onInit = null) {
+function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort = null, onInit = null, retryCount = 0) {
   // ⚠️ 不再 kill existing（會中斷使用者進行中的 thinking）
   // 呼叫端必須先檢查 claudeProcs.get(projectPath)?.status，running 時 push 到 queue 而非呼叫 spawnClaude
 
@@ -1611,7 +1672,10 @@ function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort
   if (sessionId) args.unshift('--resume', sessionId)
 
   const proc = spawn(getClaudeExe(), args, { cwd: projectPath, stdio: ['ignore', 'pipe', 'pipe'] })
-  const entry = { proc, sessionId, projectPath, status: 'running', model, effort }
+  // sawAssistant = 送達證明（唯一可信定義：出現 assistant 回應）。resume 撞上同 session 交接縫隙時，
+  // CLI 會把 prompt enqueue 進 transcript 後無人消費地退出（2026-07-17 close 喚醒石沉實錄）——
+  // 那種進程 exit 0 但零 assistant 產出，靠這旗標識別。
+  const entry = { proc, sessionId, projectPath, status: 'running', model, effort, sawAssistant: false }
   claudeProcs.set(projectPath, entry)
 
   // 少爺 2026-07-14：spawn 參數可觀察化——落 log + 推 Chat 面板顯示（effort 在 init/transcript 皆無痕跡，這裡是唯一觀察點）
@@ -1656,6 +1720,7 @@ function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort
         }
         // Skip hook noise
         if (event.type === 'system' && (event.subtype === 'hook_started' || event.subtype === 'hook_response')) continue
+        if (event.type === 'assistant') entry.sawAssistant = true
         broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath), sessionId: entry.sessionId ?? null, event })
       } catch {}
     }
@@ -1675,6 +1740,19 @@ function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort
     // 側欄的 TC 聊天室轉 done（閒置 20 分鐘後自動退場）
     if (entry.sessionId && sessions.has(entry.sessionId)) setStatus(entry.sessionId, 'done')
     setTimeout(() => { if (claudeProcs.get(projectPath) === entry) claudeProcs.delete(projectPath) }, 10_000)
+    // 喚醒石沉偵測（少爺 2026-07-17「按結案沒反應」根治）：resume 進程零 assistant 產出＝prompt 被
+    // enqueue 進 transcript 但無人消費（同 session 交接縫隙競態）→ 隔 8 秒重試一次（競態窗已過，
+    // 重試幾乎必達）；重試仍石沉 → 綁定 run 標 undelivered 上牆，請少爺在聊天室說「請繼續」。
+    if (sessionId && !entry.sawAssistant) {
+      logEvent('claude.headless.swallowed', { projectPath: normalizePath(projectPath), sessionId, exitCode: code, retryCount })
+      if (retryCount < 1) {
+        setTimeout(() => {
+          if (claudeProcs.get(projectPath)?.status === 'running') { markWakeUndelivered(sessionId); return }
+          spawnClaude(projectPath, prompt, sessionId, model, effort, onInit, retryCount + 1)
+        }, 8000)
+      } else { markWakeUndelivered(sessionId); processQueueIfIdle(projectPath) }
+      return   // 首次石沉不觸發 queue 消化（重試在途，避免 queue 下一則撞同一縫隙）
+    }
     // 處理 queue 下一個（如果有）— 維持「直接送 + 不中斷」UX
     processQueueIfIdle(projectPath)
   })
@@ -3504,7 +3582,7 @@ app.get('/api/qa/runs/:id', async (request, reply) => {
     let dirty = false
     for (const c of run.comments) if (!c.seenByClaude) { c.seenByClaude = true; dirty = true }
     // Claude 接手訊號（少爺 2026-07-06：送出 feedback/結案要看到「正在由 Claude 處理」）
-    if (run.claudeAck && run.claudeAck.state === 'pending') { run.claudeAck.state = 'working'; dirty = true }
+    if (run.claudeAck && ['pending', 'undelivered'].includes(run.claudeAck.state)) { run.claudeAck.state = 'working'; dirty = true }
     if (run.claudeAck) { run.claudeAck.workingAt = Date.now(); dirty = true }
     if (dirty) { writeQaRuns(data); qaBroadcast(run) }
   }
@@ -3565,7 +3643,7 @@ app.patch('/api/qa/runs/:id', async (request, reply) => {
   if (body.archived === true) run.archivedAt = Date.now()
   if (body.archived === false) run.archivedAt = null
   // Claude 的任何 PATCH＝正在處理（少爺可視的接手/活動訊號）
-  if (run.claudeAck) { if (run.claudeAck.state === 'pending') run.claudeAck.state = 'working'; run.claudeAck.workingAt = Date.now() }
+  if (run.claudeAck) { if (['pending', 'undelivered'].includes(run.claudeAck.state)) run.claudeAck.state = 'working'; run.claudeAck.workingAt = Date.now() }
   // 少爺引導語（2026-07-07：接手後換成告訴少爺當下該做什麼，如「請 PIE 後將 Feedback 填入留言」；空字串=清除）
   if (typeof body.guidance === 'string') run.guidance = body.guidance ? { text: body.guidance, t: Date.now() } : null
   run.updatedAt = Date.now()
@@ -3592,16 +3670,40 @@ app.post('/api/qa/runs/:id/events', async (request, reply) => {
 // M-6b：少爺控制動作 → server 主動喚醒綁定的聊天室（wakeMode='spawn' 時）
 // 走既有 /api/claude/run 機器：busy → 排隊；idle → spawnClaude resume 該 session
 // 提早「處理中」訊號（少爺 2026-07-15：留言後 QA 分頁掛「等待接手」直到 Claude 第一次 PATCH，
-// 空窗約 4 分鐘常被誤判沒做動）——喚醒後輪詢 transcript，一開始寫入就把 ack 翻成 working
+// transcript「真回應」時間戳：最後一行 type:"assistant" 的 timestamp（epoch ms）。
+// ⚠️ 不可用檔案 mtime 當活性訊號——CLI 的 queue-operation/enqueue user turn 也會動 mtime，
+// 造成「喚醒已沉沒但面板顯示處理中」假活（2026-07-17 close 喚醒石沉實錄）。讀尾 256KB 就夠。
+function lastAssistantActivityMs(watchFp) {
+  try {
+    if (!watchFp) return 0
+    const _size = fs.statSync(watchFp).size
+    const _fd = fs.openSync(watchFp, 'r')
+    const _len = Math.min(_size, 256 * 1024)
+    const _buf = Buffer.alloc(_len)
+    fs.readSync(_fd, _buf, 0, _len, _size - _len)
+    fs.closeSync(_fd)
+    const _lines = _buf.toString('utf8').split('\n')
+    for (let _i = _lines.length - 1; _i >= 0; _i--) {
+      if (!_lines[_i].includes('"type":"assistant"')) continue
+      try {
+        const _e = JSON.parse(_lines[_i])
+        if (_e.type === 'assistant' && _e.timestamp) return new Date(_e.timestamp).getTime()
+      } catch {}
+    }
+    return 0
+  } catch { return 0 }
+}
+
+// 空窗約 4 分鐘常被誤判沒做動）——喚醒後輪詢 transcript，一出現 assistant 回應就把 ack 翻成 working
 function armAckEarlyFlip(runId, watchFp, baselineMtime) {
   const _timer = setInterval(() => {
     try {
-      const _mt = (() => { try { return watchFp ? fs.statSync(watchFp).mtimeMs : 0 } catch { return 0 } })()
+      const _mt = lastAssistantActivityMs(watchFp)
       if (_mt <= baselineMtime) return
       clearInterval(_timer)
       const _d = readQaRuns()
       const _r = _d.runs.find(x => x.id === runId)
-      if (_r?.claudeAck?.state === 'pending') {
+      if (_r?.claudeAck && ['pending', 'undelivered'].includes(_r.claudeAck.state)) {
         _r.claudeAck.state = 'working'
         _r.claudeAck.workingAt = Date.now()
         writeQaRuns(_d)
@@ -3612,30 +3714,63 @@ function armAckEarlyFlip(runId, watchFp, baselineMtime) {
   setTimeout(() => clearInterval(_timer), 160 * 1000)
 }
 
+// 喚醒石沉（headless resume 零 assistant 產出、重試仍失敗）→ 綁定該 session 的活 run 標 undelivered，
+// QA 面板顯示紅字指引（請少爺在 VS Code 聊天室說「請繼續」）。狀態在 Claude 下次真的觸碰 API 時翻 working。
+function markWakeUndelivered(sessionId) {
+  try {
+    const _d = readQaRuns()
+    let _dirty = false
+    for (const _r of _d.runs) {
+      if (_r.boundSessionId !== sessionId || _r.archivedAt) continue
+      if (!_r.claudeAck || !['pending', 'working'].includes(_r.claudeAck.state)) continue
+      _r.claudeAck.state = 'undelivered'
+      _r.claudeAck.undeliveredAt = Date.now()
+      _r.updatedAt = Date.now()
+      _dirty = true
+      logEvent('qa.wake.undelivered', { id: _r.id, sessionId })
+      qaBroadcast(_r)
+    }
+    if (_dirty) writeQaRuns(_d)
+  } catch (e) { logEvent('qa.wake.undelivered.error', { sessionId, error: String(e?.message ?? e) }) }
+}
+
 const QA_WAKE_ACTIONS = { 'start-now': '按了「▶ 立即開跑」→ 請進入階段二（埋 LOG + 雙編譯 + 重啟 Editor）', pause: '要求暫停', resume: '要求繼續', abort: '要求中止', comment: '留言', close: '按了「✔ 結案」→ 階段五（清 QAC LOG + 雙編譯 + 重啟 Editor；無頭啟動 Editor 用 Start-Process detached）＋維護侍酒師閉環：把本 run 需求「實作驗證後的收斂」沉澱回四種血肉（C++ code / 架構 canvas / 拼圖 memory；藍圖 md 暫跳過），Editor 開著時跑 extract_asset_graph.py 更新藍圖資產層，最後 POST /api/sommelier/refresh/roman 重萃取讓侍酒師吃到最新拼圖' }
 function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, effort = null, wakeVisible = false) {
   try {
     // monitor 模式＝該 session 自掛監看，不可 spawn（雙寫 transcript）；其餘一律喚醒。
-    // 看門狗（少爺 2026-07-15「確保機制能運作」）：分頁被關掉＝監看已死——150 秒內 transcript 沒有
-    // 新寫入就退回無頭喚醒＋run 轉回 spawn 模式（喚醒永不聾；監看腳本輪詢 15s + 反應時間，150s 足夠）
-    if (run.wakeMode === 'monitor') {
+    // ⭐ 心跳活著也走本分支（少爺 2026-07-17）：run 還掛 spawn 但監看確實在跑時，喚醒本就靠監看輪詢 run 資料原地聯動，
+    //    再 spawn 無頭＝雙重觸發。以 VERIFIED 心跳為準，活著一律交給原地聯動、不 spawn。
+    // 看門狗（少爺 2026-07-15「確保機制能運作」）：分頁被關掉＝監看已死——心跳斷即刻無頭補送；心跳在但 transcript
+    //    150 秒沒新回應（監看活著但卡住）才退回無頭喚醒＋run 轉回 spawn 模式（喚醒永不聾）。
+    if (run.wakeMode === 'monitor' || isMonitorAlive(run.boundSessionId)) {
       const _mFp = findJsonlPath(run.boundSessionId)
-      const _mBefore = (() => { try { return _mFp ? fs.statSync(_mFp).mtimeMs : 0 } catch { return 0 } })()
-      armAckEarlyFlip(run.id, _mFp, _mBefore)
+      const _mBefore = lastAssistantActivityMs(_mFp)
       const _mPrompt = `(TC QA 聯動通知) 少爺在 QA Monitor 對 run「${run.topic}」(${run.id}) ${QA_WAKE_ACTIONS[action] ?? action}${text ? `：「${text}」` : ''}。原 monitor 監看已無回應（分頁可能已關閉），本喚醒為無頭補送，run 已轉回 spawn 模式。請照 Mode C 流程繼續（QA/README.md §Mode C），先 GET /api/qa/runs/${run.id}?ackComments=1 讀留言。`
+      // 無頭補送（監看確定不在／卡住時保底）：run 轉回 spawn、避免同進程雙寫
+      const _doHeadlessFallback = (reason) => {
+        const _d = readQaRuns()
+        const _r = _d.runs.find(x => x.id === run.id)
+        if (_r) { _r.wakeMode = 'spawn'; _r.updatedAt = Date.now(); writeQaRuns(_d); qaBroadcast(_r) }
+        logEvent('qa.wake.monitor_fallback', { id: run.id, action, sessionId: run.boundSessionId, reason })
+        const _pp = (run.boundProjectPath ?? 'C:/Project/RomanPrototype').replace(/\//g, path.sep)
+        if (!isSafeCwd(_pp)) return
+        const _sp = getSessionPrefs(run.boundSessionId)
+        if (claudeProcs.get(_pp)?.status === 'running') return
+        spawnClaude(_pp, _mPrompt, run.boundSessionId, _sp?.model ?? null, _sp?.effort ?? null)
+      }
+      // 心跳已斷＝分頁確定沒掛監看：不等 150s，立即無頭補送（喚醒不聾、不拖延）。
+      // 心跳沒斷的話，喚醒本就靠監看輪詢 run 資料原地聯動（不 spawn）——只留 transcript 活性看門狗防「監看活著但卡住」
+      if (!isMonitorAlive(run.boundSessionId))
+      {
+        _doHeadlessFallback('heartbeat-dead')
+        return
+      }
+      armAckEarlyFlip(run.id, _mFp, _mBefore)
       setTimeout(() => {
         try {
-          const _mAfter = (() => { try { return _mFp ? fs.statSync(_mFp).mtimeMs : 0 } catch { return 0 } })()
-          if (_mAfter > _mBefore) return   // 監看有反應（分頁活著）
-          const _d = readQaRuns()
-          const _r = _d.runs.find(x => x.id === run.id)
-          if (_r) { _r.wakeMode = 'spawn'; _r.updatedAt = Date.now(); writeQaRuns(_d); qaBroadcast(_r) }
-          logEvent('qa.wake.monitor_fallback', { id: run.id, action, sessionId: run.boundSessionId })
-          const _pp = (run.boundProjectPath ?? 'C:/Project/RomanPrototype').replace(/\//g, path.sep)
-          if (!isSafeCwd(_pp)) return
-          const _sp = getSessionPrefs(run.boundSessionId)
-          if (claudeProcs.get(_pp)?.status === 'running') return
-          spawnClaude(_pp, _mPrompt, run.boundSessionId, _sp?.model ?? null, _sp?.effort ?? null)
+          const _mAfter = lastAssistantActivityMs(_mFp)
+          if (_mAfter > _mBefore) return   // 監看有反應（分頁活著、有真回應）
+          _doHeadlessFallback('stalled-150s')
         } catch {}
       }, 150 * 1000)
       return
@@ -3670,7 +3805,10 @@ function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, e
     // 同一顆 claude 執行檔，非 -p 無頭管線 → 少爺能直接看到處理過程（黑視窗問題的解）
     // 少爺 2026-07-14：留言可勾「開視窗」→ 本次喚醒改開可視互動 CLI（僅限已綁定且該專案沒有進行中的無頭進程——避免同 session 雙寫）
     const _busy = claudeProcs.get(projectPath)?.status === 'running'
-    const _useCli = (run.wakeMode === 'cli' || wakeVisible === true) && run.boundSessionId && !_busy
+    // 做法A（2026-07-17 少爺選）：CLI 可視視窗路徑在 pm2 服務脈絡下 Start-Process 會「無聲失敗」（無進程/無寫入）
+    //   → 卡 90 秒 watchdog 才 cli_fallback 補送，體感「VS Code 沒跟著、拖很久」。而 spawn-resume 本就會回到
+    //   已開的 VS Code 分頁即時聯動 → QA 喚醒一律走 spawn-resume、停用 CLI 視窗轉向（原條件以 false && 保留備查、可逆）
+    const _useCli = false && (run.wakeMode === 'cli' || wakeVisible === true) && run.boundSessionId && !_busy
     if (_useCli) {
       const _exe = getClaudeExe().replace(/'/g, "''")
       const _path = projectPath.replace(/'/g, "''")
@@ -3685,12 +3823,12 @@ function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, e
       // （03:39 實錄：無進程、無寫入）——90 秒內 transcript 沒有新寫入就自動退回無頭喚醒，保底送達
       {
         const _watchFp = findJsonlPath(run.boundSessionId)
-        const _before = (() => { try { return _watchFp ? fs.statSync(_watchFp).mtimeMs : 0 } catch { return 0 } })()
+        const _before = lastAssistantActivityMs(_watchFp)
         armAckEarlyFlip(run.id, _watchFp, _before)
         setTimeout(() => {
           try {
-            const _after = (() => { try { return _watchFp ? fs.statSync(_watchFp).mtimeMs : 0 } catch { return 0 } })()
-            if (_after > _before) return   // 視窗有在跑
+            const _after = lastAssistantActivityMs(_watchFp)
+            if (_after > _before) return   // 視窗有在跑（有真回應）
             const _existing = claudeProcs.get(projectPath)
             if (_existing?.status === 'running') return   // 已有其他進程接手
             logEvent('qa.wake.cli_fallback', { id: run.id, action, sessionId: run.boundSessionId })
@@ -3703,7 +3841,7 @@ function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, e
     // 提早「處理中」訊號（spawn/queue 皆適用；未綁定新開的 run 等 Claude 首次 PATCH 才翻）
     if (run.boundSessionId) {
       const _aFp = findJsonlPath(run.boundSessionId)
-      armAckEarlyFlip(run.id, _aFp, (() => { try { return _aFp ? fs.statSync(_aFp).mtimeMs : 0 } catch { return 0 } })())
+      armAckEarlyFlip(run.id, _aFp, lastAssistantActivityMs(_aFp))
     }
     const existing = claudeProcs.get(projectPath)
     if (existing?.status === 'running') {
