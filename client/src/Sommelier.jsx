@@ -18,6 +18,14 @@ const KIND_META = {
 }
 const MEMBER_ICON = { function: 'ƒ', property: '·', delegate: '⚡', enumValue: '№' }
 const MEMBER_LABEL = { function: '函式', property: '變數', delegate: '委派', enumValue: '枚舉值' }
+
+// 搜尋 token 化（少爺 2026-08-05）：空格拆詞，每個 token 都要命中（AND），但順序不拘、不用相鄰／連續，
+// 且各 token 可落在不同欄位。例「hud flow」＝同時含 hud 與 flow 的項（hud 在標題、flow 在內文也算），
+// 比原本要求連續子字串「hud flow」更廣、又不像純 OR 那樣把只含其一的都收進來。
+// 空查詢回空陣列，tokensMatchAll 對空陣列一律 true（無搜尋＝全顯示，沿用原 !ql 語意）。
+const searchTokens = (query) => (query ?? '').trim().toLowerCase().split(/\s+/).filter(Boolean)
+const tokensMatchAll = (tokens, ...fields) =>
+  tokens.length === 0 || tokens.every(t => fields.some(f => (f ?? '').toLowerCase().includes(t)))
 const CART_STORE_KEY = 'tc_sommelier_cart_v1'
 
 function daysAgo(iso) {
@@ -129,16 +137,17 @@ function ArchView({ arch, projectId, query, onJumpToSymbol, cartKeys, onToggleNo
   const [nodeId, setNodeId] = useState(null)
 
   // 常駐搜尋（query 由父層傳入）：canvas 命中(標題/檔名/含命中節點)、node 命中(標題/內文/引用符號)
-  const ql = (query ?? '').trim().toLowerCase()
-  const nodeMatch = (n) => !ql || (n.title ?? '').toLowerCase().includes(ql) || (n.text ?? '').toLowerCase().includes(ql) || (n.symbolRefs ?? []).some(r => r.name.toLowerCase().includes(ql))
-  const filteredCanvases = ql ? canvases.filter(c => c.title.toLowerCase().includes(ql) || c.file.toLowerCase().includes(ql) || c.nodes.some(nodeMatch)) : canvases
+  const _tokens = searchTokens(query)
+  const _active = _tokens.length > 0
+  const nodeMatch = (n) => tokensMatchAll(_tokens, n.title, n.text, ...(n.symbolRefs ?? []).map(r => r.name))
+  const filteredCanvases = _active ? canvases.filter(c => tokensMatchAll(_tokens, c.title, c.file) || c.nodes.some(nodeMatch)) : canvases
   // query 有值且當前 canvas 未命中 → 自動跳到第一個命中的 canvas（搜「玩家能力」直達 PlayerAbilities）
   useEffect(() => {
-    if (ql && filteredCanvases.length && !filteredCanvases.some(c => c.file === canvasFile)) {
+    if (_active && filteredCanvases.length && !filteredCanvases.some(c => c.file === canvasFile)) {
       setCanvasFile(filteredCanvases[0].file); setNodeId(null)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ql])
+  }, [query])
 
   const canvas = canvases.find(c => c.file === canvasFile)
   const node = canvas?.nodes.find(n => n.id === nodeId)
@@ -160,7 +169,7 @@ function ArchView({ arch, projectId, query, onJumpToSymbol, cartKeys, onToggleNo
     <div className="flex-1 flex min-h-0">
       {/* 左：canvas 清單 */}
       <div className="w-56 shrink-0 border-r border-[var(--border)] overflow-y-auto p-2">
-        <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70 px-1 mb-1">架構 Canvas（{filteredCanvases.length}{ql ? `/${canvases.length}` : ''}）</div>
+        <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70 px-1 mb-1">架構 Canvas（{filteredCanvases.length}{_active ? `/${canvases.length}` : ''}）</div>
         {filteredCanvases.map(c => (
           <button key={c.file} onClick={() => { setCanvasFile(c.file); setNodeId(null) }}
             className={`w-full text-left px-2 py-1 rounded text-[11px] flex items-center gap-1.5 mb-0.5 ${canvasFile === c.file ? 'bg-[var(--gold)]/10 text-[var(--gold)]' : 'text-[var(--text)] hover:bg-[var(--surface)]'}`}>
@@ -269,10 +278,9 @@ function MemoryView({ memory, projectId, query, onJumpToSymbol, onJumpToCanvas, 
   const byName = useMemo(() => new Map(notes.map(n => [n.name, n])), [notes])
   const grouped = useMemo(() => {
     const g = new Map()
-    const ql = (query ?? '').trim().toLowerCase()
+    const _tokens = searchTokens(query)
     for (const n of notes) {
-      if (ql && !n.name.toLowerCase().includes(ql) && !n.title.toLowerCase().includes(ql)
-        && !(n.description ?? '').toLowerCase().includes(ql) && !n.text.toLowerCase().includes(ql)) continue
+      if (!tokensMatchAll(_tokens, n.name, n.title, n.description, n.text)) continue
       if (!g.has(n.type)) g.set(n.type, [])
       g.get(n.type).push(n)
     }
@@ -381,9 +389,9 @@ function AssetView({ assetGraph, projectId, query, onJumpToSymbol, cartKeys, onT
 
   const grouped = useMemo(() => {
     const g = new Map()
-    const ql = (query ?? '').trim().toLowerCase()
+    const _tokens = searchTokens(query)
     for (const b of bps) {
-      if (ql && !b.name.toLowerCase().includes(ql) && !(b.parentName ?? '').toLowerCase().includes(ql)) continue
+      if (!tokensMatchAll(_tokens, b.name, b.parentName)) continue
       const key = b.parentKind === 'cpp' ? `C++ ◆ ${b.parentName}` : b.parentKind === 'bp' ? `BP ◇ ${b.parentName}` : '（無父類）'
       if (!g.has(key)) g.set(key, [])
       g.get(key).push(b)
@@ -623,20 +631,25 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
 
   // 搜尋:名稱 > 成員名 > 註解(中文註解也吃得到)
   const hits = useMemo(() => {
-    const q = query.trim().toLowerCase()
-    if (!q) return null
+    const _tokens = searchTokens(query)
+    if (!_tokens.length) return null
     const out = []
     for (const s of symbols) {
-      const nameHit = s.name.toLowerCase().includes(q)
-      const commentHit = (s.comment ?? '').toLowerCase().includes(q)
-      const memberHits = (s.members ?? []).filter(m =>
-        m.name.toLowerCase().includes(q) || (m.comment ?? '').toLowerCase().includes(q))
-      if (nameHit || commentHit || memberHits.length) {
-        out.push({
-          sym: s, memberHits,
-          score: (s.name.toLowerCase().startsWith(q) ? 0 : nameHit ? 1 : memberHits.some(m => m.name.toLowerCase().includes(q)) ? 2 : 3),
-        })
-      }
+      const _name = s.name.toLowerCase()
+      const _comment = (s.comment ?? '').toLowerCase()
+      const _members = s.members ?? []
+      // AND：每個 token 都要命中一次（可落在 name／comment／任一 member 的名或註解，跨欄位算）
+      const _tokenHit = (t) => _name.includes(t) || _comment.includes(t)
+        || _members.some(m => m.name.toLowerCase().includes(t) || (m.comment ?? '').toLowerCase().includes(t))
+      if (!_tokens.every(_tokenHit)) continue
+      // 命中列高亮：含任一 token 的 member 都標，方便看到相關列
+      const memberHits = _members.filter(m =>
+        _tokens.some(t => m.name.toLowerCase().includes(t) || (m.comment ?? '').toLowerCase().includes(t)))
+      const _nameAll = _tokens.every(t => _name.includes(t))
+      out.push({
+        sym: s, memberHits,
+        score: (_tokens.some(t => _name.startsWith(t)) ? 0 : _nameAll ? 1 : _tokens.some(t => _name.includes(t)) ? 2 : 3),
+      })
     }
     out.sort((a, b) => a.score - b.score || a.sym.name.localeCompare(b.sym.name))
     return out.slice(0, 120)
@@ -852,10 +865,11 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
         <div className="flex-1" />
         {/* 常駐搜尋欄（四視圖共用；placeholder 隨視圖變）*/}
         <input ref={searchRef} value={query} onChange={e => setQuery(e.target.value)}
-          placeholder={mode === 'skeleton' ? '搜尋名詞 / 成員 / 註解(中文可)… 快捷鍵 /'
-            : mode === 'arch' ? '搜尋架構 canvas / 節點 / 引用符號…'
-            : mode === 'memory' ? '搜尋拼圖（名稱 / 摘要 / 內文）…'
-            : '搜尋藍圖 / 父類…'}
+          title="空格分詞：每個詞都要出現（順序不拘、可落在不同欄位）。例「hud flow」＝同時含 hud 與 flow 的項"
+          placeholder={mode === 'skeleton' ? '搜尋名詞 / 成員 / 註解(中文可) · 空格＝且 · 快捷鍵 /'
+            : mode === 'arch' ? '搜尋架構 canvas / 節點 / 引用符號 · 空格＝且'
+            : mode === 'memory' ? '搜尋拼圖（名稱 / 摘要 / 內文）· 空格＝且'
+            : '搜尋藍圖 / 父類 · 空格＝且'}
           className="w-64 max-w-full bg-transparent border border-[var(--border)] focus:border-[var(--gold)]/60 rounded px-2 py-1 text-[11px] text-[var(--text)] outline-none" />
         <button onClick={() => setCartOpen(o => !o)}
           className={`text-[11px] px-2 py-1 rounded border ${cart.length ? 'border-[var(--gold)]/60 text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)]'} hover:border-[var(--gold)]`}
