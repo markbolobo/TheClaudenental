@@ -3721,7 +3721,8 @@ const CELLAR_TOOLS = [
   },
   {
     id: 'anim-toolkit', name: 'UE 動畫工具包', kind: 'execute',
-    desc: '啟動 UE 內動畫工具包 GUI（EditorUtilityWidget，開發中）',
+    desc: '啟動動畫工具包服務面板（選資產＋勾服務執行；需 UE Editor 開啟）',
+    exec: ['cmd.exe', ['/c', 'C:\\Project\\UE_AnimToolkit\\AnimToolkit.bat']],
   },
 ]
 app.get('/api/tools', async () => ({ ok: true, tools: CELLAR_TOOLS.map(t => ({ id: t.id, name: t.name, kind: t.kind, desc: t.desc })) }))
