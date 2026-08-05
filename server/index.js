@@ -3652,6 +3652,89 @@ app.post('/api/package/open', async (request) => {
   }
 })
 
+// ─── 開啟專案（少爺 2026-08-06）：一鍵開 uproject／workspace／根目錄 Explorer ──────
+// 隨 activeProjectId 切路徑（前端傳 projectId）；projectRoot 讀 sommelier.json（每專案補）。
+// uproject／workspace 掃根目錄找副檔名——檔名未必＝資料夾名（RomanPrototype/romanprototype.uproject）。
+app.post('/api/project/open', async (request) => {
+  const { projectId, target } = request.body ?? {}
+  const _cfg = readSommelierConfig()
+  const _proj = (_cfg.projects ?? []).find(p => p.id === projectId)
+  const _root = _proj?.projectRoot || _proj?.projectPath
+  if (!_root) return { ok: false, error: `專案「${projectId}」未設 projectRoot（請在 sommelier.json 補）` }
+  if (!fs.existsSync(_root)) return { ok: false, error: `專案根目錄不存在：${_root}` }
+  try {
+    if (target === 'explorer') {
+      spawn('explorer.exe', [path.normalize(_root)], { detached: true, stdio: 'ignore', shell: false }).unref()
+      return { ok: true, opened: _root }
+    }
+    if (target === 'uproject' || target === 'workspace') {
+      const _ext = target === 'uproject' ? '.uproject' : '.code-workspace'
+      const _file = fs.readdirSync(_root).find(f => f.toLowerCase().endsWith(_ext))
+      if (!_file) return { ok: false, error: `根目錄找不到 *${_ext}：${_root}` }
+      const _full = path.join(_root, _file)
+      // .code-workspace 沒有檔案關聯 → cmd start 開不起來，必用 VS Code CLI；.uproject 有 UE 關聯 → start 開
+      if (target === 'workspace') spawn('code', [_full], { detached: true, stdio: 'ignore', shell: true }).unref()
+      else spawn('cmd', ['/c', 'start', '', _full], { detached: true, stdio: 'ignore' }).unref()
+      return { ok: true, opened: _full }
+    }
+    return { ok: false, error: `未知 target：${target}` }
+  } catch (e) {
+    return { ok: false, error: e.message }
+  }
+})
+
+// ─── 專案路徑健康檢查（少爺 2026-08-06）：高桌會切專案時驗 projectRoot／打包腳本／uproject／
+// workspace 是否存在（失聯偵測）→ 前端據此禁用失效按鈕、避免對不存在的路徑動作而系統出錯。
+app.get('/api/project/health/:projectId', async (request) => {
+  const _cfg = readSommelierConfig()
+  const _proj = (_cfg.projects ?? []).find(p => p.id === request.params.projectId)
+  if (!_proj) return { ok: false, error: `未知專案：${request.params.projectId}` }
+  const _root = _proj.projectRoot || _proj.projectPath || null
+  const _rootExists = !!_root && fs.existsSync(_root)
+  let _uproject = null, _workspace = null
+  if (_rootExists) {
+    try {
+      const _files = fs.readdirSync(_root)
+      _uproject = _files.find(f => f.toLowerCase().endsWith('.uproject')) ?? null
+      _workspace = _files.find(f => f.toLowerCase().endsWith('.code-workspace')) ?? null
+    } catch { /* 讀不到目錄＝視同失聯 */ }
+  }
+  return {
+    ok: true,
+    health: {
+      projectRoot: { path: _root, exists: _rootExists },
+      packageScript: { path: _proj.packageScript ?? null, exists: !!_proj.packageScript && fs.existsSync(_proj.packageScript) },
+      uproject: { name: _uproject, exists: !!_uproject },
+      workspace: { name: _workspace, exists: !!_workspace },
+    },
+  }
+})
+
+// ─── 酒窖（Cellar）工具箱（少爺 2026-08-06）：可擴充工具——execute 點擊即跑／form 開填表介面 ──
+// 未來加工具：CELLAR_TOOLS push 一筆即現身（execute 需 exec 指令；form 由前端做專屬 UI）。
+const CELLAR_TOOLS = [
+  {
+    id: 'cooldown-timer', name: 'Claude 冷卻鬧鐘', kind: 'execute',
+    desc: '到冷卻時間自動點擊繼續（AutoClicker）',
+    exec: ['wscript.exe', ['C:\\Project\\MasterBrain\\AI_Utils\\ClaudeCooldownTimer\\啟動鬧鐘點擊器.vbs']],
+  },
+  {
+    id: 'anim-toolkit', name: 'UE 動畫工具包', kind: 'form',
+    desc: '填表送出的動畫工具（表單內容規劃中、待討論）',
+  },
+]
+app.get('/api/tools', async () => ({ ok: true, tools: CELLAR_TOOLS.map(t => ({ id: t.id, name: t.name, kind: t.kind, desc: t.desc })) }))
+app.post('/api/tools/run/:id', async (request) => {
+  const _t = CELLAR_TOOLS.find(t => t.id === request.params.id)
+  if (!_t) return { ok: false, error: '未知工具' }
+  if (_t.kind !== 'execute' || !_t.exec) return { ok: false, error: '此工具非執行型（execute）' }
+  try {
+    // 不加 windowsHide：執行型工具可能自帶 UI（AutoClicker 介面）要顯示給少爺
+    spawn(_t.exec[0], _t.exec[1], { detached: true, stdio: 'ignore' }).unref()
+    return { ok: true, ran: _t.name }
+  } catch (e) { return { ok: false, error: e.message } }
+})
+
 // ─── Open in VSCode (markdown link handler) ──────────────────────────────────
 // 對應 docs/customization/project_roots_schema.md
 // 對應 memory/feedback_filepath_markdown_format.md

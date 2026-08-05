@@ -78,6 +78,11 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
   useEffect(() => { try { localStorage.setItem('tc_pkg_suffix', pkgSuffix) } catch {} }, [pkgSuffix])
   const [pkgJob, setPkgJob] = useState(null)
   const [pkgHint, setPkgHint] = useState('')
+  // 折疊（少爺 2026-08-06）：打包／開啟專案區塊可點標題折疊，記憶 localStorage
+  const [pkgCollapsed, setPkgCollapsed] = useState(() => localStorage.getItem('tc_pkg_collapsed') === '1')
+  useEffect(() => { try { localStorage.setItem('tc_pkg_collapsed', pkgCollapsed ? '1' : '0') } catch {} }, [pkgCollapsed])
+  const [openProjCollapsed, setOpenProjCollapsed] = useState(() => localStorage.getItem('tc_openproj_collapsed') === '1')
+  useEffect(() => { try { localStorage.setItem('tc_openproj_collapsed', openProjCollapsed ? '1' : '0') } catch {} }, [openProjCollapsed])
 
   useEffect(() => {
     fetch('/api/package/status').then(r => r.json()).then(d => setPkgJob(d.job ?? null)).catch(() => {})
@@ -116,6 +121,17 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
     if (!_res.ok) setPkgHint(`⚠️ ${_res.error ?? '開啟失敗'}`)
     else setPkgHint(`📂 ${_res.path}`)
   }, [pkgSuffix])
+
+  // 開啟專案（少爺 2026-08-06）：隨 activeProjectId 開 uproject／workspace／根目錄 explorer
+  const openProject = useCallback(async (target) => {
+    setPkgHint('')
+    const _res = await fetch('/api/project/open', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectId: activeProjectId ?? 'roman', target }),
+    }).then(r => r.json()).catch(e => ({ ok: false, error: e.message }))
+    if (!_res.ok) setPkgHint(`⚠️ ${_res.error ?? '開啟失敗'}`)
+    else setPkgHint(`📂 已開啟：${_res.opened}`)
+  }, [activeProjectId])
 
   const cancelPackage = useCallback(async () => {
     if (!confirm('中止進行中的打包？')) return
@@ -327,10 +343,35 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
 
       {/* 主面板 */}
       <div className="flex-1 min-w-0 overflow-y-auto">
-        {/* ── 打包控制列（少爺 2026-08-04）：不依賴選中 run，永遠可用 ── */}
+        {/* ── 開啟專案（少爺 2026-08-06）：隨 activeProjectId 切路徑、可折疊 ── */}
+        <div className="border-b border-[var(--border)] bg-[var(--surface)] px-3 py-2">
+          <button onClick={() => setOpenProjCollapsed(v => !v)} title="折疊／展開開啟專案"
+            className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] hover:text-[var(--gold)]">
+            {openProjCollapsed ? '▸' : '▾'} 開啟專案
+          </button>
+          {!openProjCollapsed && (
+            <div className="flex items-center gap-2 flex-wrap mt-1.5">
+              <div className="flex rounded overflow-hidden border border-[var(--border)]">
+                {[['uproject', '🎮 UE 專案'], ['workspace', '📘 VS Code'], ['explorer', '📁 資料夾']].map(([_t, _label], _i) => (
+                  <button key={_t} onClick={() => openProject(_t)} title={`開啟目前專案的 ${_label}`}
+                    className={`text-[11px] px-2.5 py-1 text-[var(--text)] hover:bg-[var(--gold)]/15 hover:text-[var(--gold)] ${_i > 0 ? 'border-l border-[var(--border)]' : ''}`}>
+                    {_label}
+                  </button>
+                ))}
+              </div>
+              <span className="text-[9px] text-[var(--text-muted)]">目前：{activeProjectId ?? 'roman'}</span>
+            </div>
+          )}
+        </div>
+
+        {/* ── 打包控制列（少爺 2026-08-04）：不依賴選中 run，永遠可用；標題折疊（少爺 2026-08-06）── */}
         <div className="sticky top-0 z-10 border-b border-[var(--border)] bg-[var(--surface)] px-3 py-2">
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-[10px] uppercase tracking-widest text-[var(--text-muted)]">打包</span>
+          <button onClick={() => setPkgCollapsed(v => !v)} title="折疊／展開打包"
+            className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] hover:text-[var(--gold)]">
+            {pkgCollapsed ? '▸' : '▾'} 打包{pkgJob?.status === 'running' ? ' · 打包中' : ''}
+          </button>
+          {!pkgCollapsed && (<>
+          <div className="flex items-center gap-2 flex-wrap mt-1.5">
 
             {/* 後綴輸入框：進資料夾名，只允許英數/底線/連字號 */}
             <input value={pkgSuffix} onChange={e => setPkgSuffix(e.target.value)}
@@ -437,6 +478,7 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
           )}
 
           {pkgHint && <div className="text-[10px] mt-1 text-[var(--text-muted)] font-mono truncate">{pkgHint}</div>}
+          </>)}
         </div>
 
         {!run && (
