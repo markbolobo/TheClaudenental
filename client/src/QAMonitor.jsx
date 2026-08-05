@@ -58,6 +58,20 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
   const selectedRunIdRef = useRef(null)
   useEffect(() => { selectedRunIdRef.current = selectedRunId }, [selectedRunId])
 
+  // 少爺 2026-08-05：QA run 狀態 filter（複選 OR）——空集合＝全顯示；有選＝只顯示選中狀態的聯集。記憶在 localStorage。
+  const [statusFilter, setStatusFilter] = useState(() => {
+    try { return new Set(JSON.parse(localStorage.getItem('tc_qa_status_filter') || '[]')) } catch { return new Set() }
+  })
+  useEffect(() => { try { localStorage.setItem('tc_qa_status_filter', JSON.stringify([...statusFilter])) } catch {} }, [statusFilter])
+  const toggleStatusFilter = useCallback((s) => setStatusFilter(prev => {
+    const next = new Set(prev)
+    if (next.has(s)) next.delete(s); else next.add(s)
+    return next
+  }), [])
+  // 少爺 2026-08-05：篩選區塊預設收合，點「篩選」按鈕才展開（chips 佔空間）；open 狀態記憶在 localStorage
+  const [filterOpen, setFilterOpen] = useState(() => localStorage.getItem('tc_qa_filter_open') === '1')
+  useEffect(() => { try { localStorage.setItem('tc_qa_filter_open', filterOpen ? '1' : '0') } catch {} }, [filterOpen])
+
   // ─── 打包控制（少爺 2026-08-04）：後綴輸入框 ×1 ＋ 打包鈕 ×3 ＋ 開資料夾鈕 ×2 ───
   // 命名 SSOT 與 Invoke-RomanPackage.ps1 一致：Windows_<Dev|Shipping>_<yyyyMMdd><suffix>
   const [pkgSuffix, setPkgSuffix] = useState(() => localStorage.getItem('tc_pkg_suffix') ?? '_WithExtraWorks')
@@ -225,6 +239,13 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
   const countdownLeft = run?.status === 'countdown' && run.countdownEndsAt
     ? Math.max(0, Math.ceil((run.countdownEndsAt - now) / 1000)) : null
 
+  // 少爺 2026-08-05：狀態 filter 後的可見清單（複選 OR）＋各狀態計數（chip 上顯示、不受 filter 影響）
+  const _statusPass = (r) => statusFilter.size === 0 || statusFilter.has(r.status)
+  const _projectRuns = runs.filter(r => !r.archivedAt && runMatchesProject(r))
+  const _visibleRuns = _projectRuns.filter(_statusPass)
+  const _statusCounts = {}
+  for (const _r of _projectRuns) _statusCounts[_r.status] = (_statusCounts[_r.status] ?? 0) + 1
+
   return (
     <div className="flex h-full min-h-0">
       {/* C 歷史區（左欄） */}
@@ -244,12 +265,41 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
                 className="shrink-0 text-[10px] px-1 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] hover:border-[var(--gold)]/50 normal-case">🏛</button>
             )}
           </div>
-          QA Runs（永久保留）
+          <div className="flex items-center justify-between gap-1">
+            <span>QA Runs（永久保留）</span>
+            <button onClick={() => setFilterOpen(v => !v)} title="展開／收合狀態篩選"
+              className={`shrink-0 text-[9px] px-1.5 py-0.5 rounded border tracking-normal normal-case ${
+                statusFilter.size > 0 ? 'text-[var(--gold)] border-[var(--gold)]/50' : 'text-[var(--text-muted)] border-[var(--border)] hover:text-[var(--text)]'}`}>
+              {filterOpen ? '▾' : '▸'} 篩選{statusFilter.size > 0 ? ` (${statusFilter.size})` : ''}
+            </button>
+          </div>
+          {/* 少爺 2026-08-05：狀態 filter chips（複選 OR，任一滿足即顯示；數字＝該狀態筆數）；點「篩選」按鈕展開／收合 */}
+          {filterOpen && (
+          <div className="flex flex-wrap gap-1 mt-1.5">
+            {Object.entries(STATUS_META).map(([_s, _m]) => {
+              const _on = statusFilter.has(_s)
+              const _cnt = _statusCounts[_s] ?? 0
+              return (
+                <button key={_s} onClick={() => toggleStatusFilter(_s)} title={`${_on ? '取消篩選' : '篩選'}：${_m.label}（${_cnt} 筆）`}
+                  className={`text-[9px] px-1.5 py-0.5 rounded border tracking-normal normal-case ${
+                    _on ? `${_m.cls} bg-white/10` : 'text-[var(--text-muted)] border-[var(--border)] hover:text-[var(--text)]'}`}>
+                  {_m.label}{_cnt > 0 && <span className="ml-0.5 opacity-60">{_cnt}</span>}
+                </button>
+              )
+            })}
+            {statusFilter.size > 0 && (
+              <button onClick={() => setStatusFilter(new Set())} title="清除篩選"
+                className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] tracking-normal normal-case">✕ 清除</button>
+            )}
+          </div>
+          )}
         </div>
-        {runs.filter(r => !r.archivedAt && runMatchesProject(r)).length === 0 && (
-          <div className="px-3 py-4 text-[10px] text-[var(--text-muted)] text-center">尚無 QA run</div>
+        {_visibleRuns.length === 0 && (
+          <div className="px-3 py-4 text-[10px] text-[var(--text-muted)] text-center">
+            {_projectRuns.length === 0 ? '尚無 QA run' : '無符合篩選的 run'}
+          </div>
         )}
-        {runs.filter(r => !r.archivedAt && runMatchesProject(r)).map(r => (
+        {_visibleRuns.map(r => (
           <div key={r.id} onClick={() => setSelectedRunId(r.id)}
             className={`relative w-full text-left px-3 py-2 border-b border-[var(--border)]/50 hover:bg-white/5 cursor-pointer group ${
               r.id === selectedRunId ? 'bg-white/10' : ''}`}>
