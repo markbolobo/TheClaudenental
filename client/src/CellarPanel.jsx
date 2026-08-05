@@ -2,11 +2,11 @@ import { useState, useEffect } from 'react'
 
 // ─── Cellar（酒窖）工具箱彈跳視窗（少爺 2026-08-06）──────────────────────────────
 // 延續 TheClaudenental／侍酒師的酒主題：酒窖＝開發工具的私藏。
-// execute＝點擊即執行（POST /api/tools/run/:id）；form＝開專屬填表介面（各工具另做）。
+// 酒窖＝純 launcher：一律 execute 點擊即執行（POST /api/tools/run/:id）；
+// 工具介面歸工具自己（如 UE_AnimToolkit 的 UE 內 GUI），酒窖不做各工具的表單。
 
 const KIND_META = {
   execute: { icon: '▶', label: '點擊執行', cls: 'text-green-400 border-green-500/40' },
-  form:    { icon: '📋', label: '填表',     cls: 'text-blue-400 border-blue-500/40' },
 }
 
 export default function CellarPanel({ onClose }) {
@@ -22,7 +22,6 @@ export default function CellarPanel({ onClose }) {
   }, [])
 
   const runTool = async (t) => {
-    if (t.kind === 'form') { setHint(`「${t.name}」的填表介面規劃中——表單內容待討論`); return }
     setHint(`執行「${t.name}」…`)
     const _res = await fetch(`/api/tools/run/${t.id}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
@@ -39,7 +38,7 @@ export default function CellarPanel({ onClose }) {
         <div className="px-4 py-3 border-b border-[var(--border)] flex items-start justify-between">
           <div>
             <div className="text-[var(--gold)] text-sm tracking-widest uppercase">🍷 Cellar · 酒窖</div>
-            <div className="text-[9px] text-[var(--text-muted)] mt-0.5">開發工具的私藏——點擊執行，或開專屬填表介面</div>
+            <div className="text-[9px] text-[var(--text-muted)] mt-0.5">開發工具的私藏——點擊啟動，工具介面歸工具自己</div>
           </div>
           <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--gold)] text-lg leading-none shrink-0">✕</button>
         </div>

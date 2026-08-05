@@ -3710,8 +3710,9 @@ app.get('/api/project/health/:projectId', async (request) => {
   }
 })
 
-// ─── 酒窖（Cellar）工具箱（少爺 2026-08-06）：可擴充工具——execute 點擊即跑／form 開填表介面 ──
-// 未來加工具：CELLAR_TOOLS push 一筆即現身（execute 需 exec 指令；form 由前端做專屬 UI）。
+// ─── 酒窖（Cellar）工具箱（少爺 2026-08-06）：純 launcher——一律 execute 點擊即跑 ──
+// 工具介面歸工具自己（如 UE_AnimToolkit 的 UE 內 GUI），酒窖只負責啟動。
+// 未來加工具：CELLAR_TOOLS push 一筆即現身（exec 未接上前點擊回「開發中」提示）。
 const CELLAR_TOOLS = [
   {
     id: 'cooldown-timer', name: 'Claude 冷卻鬧鐘', kind: 'execute',
@@ -3719,15 +3720,16 @@ const CELLAR_TOOLS = [
     exec: ['wscript.exe', ['C:\\Project\\MasterBrain\\AI_Utils\\ClaudeCooldownTimer\\啟動鬧鐘點擊器.vbs']],
   },
   {
-    id: 'anim-toolkit', name: 'UE 動畫工具包', kind: 'form',
-    desc: '填表送出的動畫工具（表單內容規劃中、待討論）',
+    id: 'anim-toolkit', name: 'UE 動畫工具包', kind: 'execute',
+    desc: '啟動 UE 內動畫工具包 GUI（EditorUtilityWidget，開發中）',
   },
 ]
 app.get('/api/tools', async () => ({ ok: true, tools: CELLAR_TOOLS.map(t => ({ id: t.id, name: t.name, kind: t.kind, desc: t.desc })) }))
 app.post('/api/tools/run/:id', async (request) => {
   const _t = CELLAR_TOOLS.find(t => t.id === request.params.id)
   if (!_t) return { ok: false, error: '未知工具' }
-  if (_t.kind !== 'execute' || !_t.exec) return { ok: false, error: '此工具非執行型（execute）' }
+  if (_t.kind !== 'execute') return { ok: false, error: '此工具非執行型（execute）' }
+  if (!_t.exec) return { ok: false, error: `「${_t.name}」尚未接上啟動指令（UE 內 GUI 開發中）` }
   try {
     // 不加 windowsHide：執行型工具可能自帶 UI（AutoClicker 介面）要顯示給少爺
     spawn(_t.exec[0], _t.exec[1], { detached: true, stdio: 'ignore' }).unref()
