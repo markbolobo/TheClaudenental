@@ -5,6 +5,7 @@ import { MetricsDashboard } from './MetricsDashboard.jsx'
 import { SommelierPanel } from './Sommelier.jsx'
 import { QAMonitorPanel } from './QAMonitor.jsx'
 import BountySettings from './BountySettings.jsx'
+import MarkerPanel from './MarkerPanel.jsx'
 import { ChatPanel } from './ChatPanel.jsx'
 import { PresentButton } from './PresentationView.jsx'
 import { MODEL_OPTIONS } from './modelOptions.js'
@@ -1756,6 +1757,7 @@ export default function App() {
   const [animQueue, setAnimQueue]               = useState([])
   const [currentAnim, setCurrentAnim]           = useState(null)
   const [showBountySettings, setShowBountySettings] = useState(false)
+  const [showMarkers, setShowMarkers] = useState(false)
   const [contractModal, setContractModal]       = useState(null)
   const [historyCosts, setHistoryCosts]         = useState({})   // { [sessionId]: costUsd }
   const [chatBaseline, setChatBaseline]         = useState(0)    // historyCosts snapshot when chatInit last fired
@@ -2141,6 +2143,7 @@ export default function App() {
       {showHighTable && (
         <HighTableModal onClose={() => setShowHighTable(false)} onChanged={reloadTcProjects} />
       )}
+      {showMarkers && <MarkerPanel onClose={() => setShowMarkers(false)} />}
       {showBountySettings && (
         <BountySettings
           onClose={() => setShowBountySettings(false)}
@@ -2169,6 +2172,12 @@ export default function App() {
         <span className="text-[10px] text-[var(--text-muted)]">
           {sessions.filter(s => s.status === 'active').length} active · {sessions.length} sessions
         </span>
+        <button
+          onClick={() => setShowMarkers(true)}
+          title="Marker — 你委託 Claude 定期履行的任務（誓約）"
+          className="text-[9px] text-[var(--text-muted)] hover:text-[var(--gold)] border border-[var(--border)] hover:border-[var(--gold-border)] rounded-sm px-1.5 py-0.5 transition-colors tracking-wide uppercase">
+          ⧗ Marker
+        </button>
         <button
           onClick={() => setShowBountySettings(true)}
           title="Bounty Announcement Settings"

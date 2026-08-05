@@ -1314,6 +1314,84 @@ app.post('/api/history/tags/run-nightly', async () => {
   return { ok: true, candidates: _n, queue: tagQueue.length }
 })
 
+// ─── Marker（誓約）：定期會執行的委託任務清單（少爺 2026-08-06）───────────────────
+// 兩源合流：(1) TC server 內建定時＝下方 registry（只登記「語義上是委託任務」的；心跳／幽靈
+//   清掃／持久化那些基礎設施 setInterval 不列）(2) Windows 排程＝Get-ScheduledTask 過濾少爺／
+//   Claude 相關（名稱 match pattern）。未來自動涵蓋：新內建定時 registerMarker 一筆即現身；
+//   新 Windows 排程名 match pattern 即入列（pattern 可經 tc_user_config/markers.json 擴充）。
+const MARKER_REGISTRY = []
+function registerMarker(_m) { MARKER_REGISTRY.push(_m) }
+
+// 內建定時：夜間語意標籤（與話題筆記同 23:30，但話題筆記是 Windows 排程、走另一源）
+registerMarker({
+  id: 'nightly-tagging',
+  name: '夜間語意標籤',
+  desc: 'LLM 增量標 History／侍酒師的 tags＋summary',
+  source: 'TC 內建',
+  schedule: `每晚 ${String(TAG_NIGHTLY_HOUR).padStart(2, '0')}:${String(TAG_NIGHTLY_MIN).padStart(2, '0')}`,
+  getLast: () => { try { return JSON.parse(fs.readFileSync(TAG_NIGHTLY_STATE_FILE, 'utf8')).lastRun ?? null } catch { return null } },
+  getNext: () => {
+    const _n = new Date(); _n.setHours(TAG_NIGHTLY_HOUR, TAG_NIGHTLY_MIN, 0, 0)
+    if (_n <= new Date()) _n.setDate(_n.getDate() + 1)
+    return _n.getTime()
+  },
+})
+
+// Windows 排程識別 pattern（markers.json 可覆蓋）。預設只用精準關鍵字 Claude／Roman——
+// 現有兩個排程 ClaudeLaunchUEEditor＋RomanPrototype_話題筆記 各自命中，且不會像 'UE'／'TC'
+// 兩字母 substring 那樣誤撞系統排程（continUE／queUE／PaTChDb）。USER_CONFIG_DIR 用時求值避 TDZ。
+function readMarkerPatterns() {
+  try {
+    const _c = JSON.parse(fs.readFileSync(path.join(USER_CONFIG_DIR, 'markers.json'), 'utf8'))
+    if (Array.isArray(_c.windowsPatterns) && _c.windowsPatterns.length) return _c.windowsPatterns
+  } catch {}
+  return ['Claude', 'Roman']
+}
+
+// 撈少爺／Claude 相關的 Windows 排程（名稱 like 任一 pattern）→ 統一 marker 格式
+function listWindowsMarkers() {
+  return new Promise((resolve) => {
+    const _pats = readMarkerPatterns().map(p => '"' + String(p).replace(/"/g, '') + '"').join(',')
+    const _script = '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $pats=@(' + _pats +
+      '); Get-ScheduledTask | Where-Object { $t=$_.TaskName; ($pats | Where-Object { $t -like "*$_*" }).Count -gt 0 } | ' +
+      'ForEach-Object { $i=$_ | Get-ScheduledTaskInfo; [PSCustomObject]@{ name=$_.TaskName; state="$($_.State)"; ' +
+      'trigger=($_.Triggers | Select-Object -First 1).StartBoundary; ' +
+      'lastRun=$(if($i.LastRunTime){$i.LastRunTime.ToString("o")}else{$null}); ' +
+      'lastResult=$i.LastTaskResult; ' +
+      'nextRun=$(if($i.NextRunTime){$i.NextRunTime.ToString("o")}else{$null}) } } | ConvertTo-Json -Depth 3 -Compress'
+    let _out = ''
+    try {
+      // windowsHide 必加：否則 pm2 背景 node spawn console 程式會閃 powershell 視窗（少爺 2026-08-06 回報「按 Marker 跳視窗」根因）
+      const _ps = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', _script], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+      _ps.stdout.on('data', d => { _out += d.toString('utf-8') })
+      _ps.on('close', () => {
+        try {
+          const _j = JSON.parse(_out.trim() || 'null')
+          const _arr = Array.isArray(_j) ? _j : _j ? [_j] : []
+          resolve(_arr.map(w => ({
+            name: w.name, source: 'Windows 排程', state: w.state ?? '—',
+            schedule: w.trigger ? `每次 ${new Date(w.trigger).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' })}` : '—',
+            lastRun: w.lastRun ? Date.parse(w.lastRun) : null,
+            lastResult: w.lastResult ?? null,
+            nextRun: w.nextRun ? Date.parse(w.nextRun) : null,
+          })))
+        } catch { resolve([]) }
+      })
+      _ps.on('error', () => resolve([]))
+    } catch { resolve([]) }
+  })
+}
+
+// 誓約清單：TC 內建 registry ＋ Windows 排程合流（少爺 2026-08-06 Marker 系統）
+app.get('/api/markers', async () => {
+  const _win = await listWindowsMarkers()
+  const _tc = MARKER_REGISTRY.map(_m => ({
+    name: _m.name, desc: _m.desc ?? '', source: _m.source, schedule: _m.schedule, state: 'Ready',
+    lastRun: _m.getLast?.() ?? null, lastResult: 0, nextRun: _m.getNext?.() ?? null,
+  }))
+  return { ok: true, markers: [..._tc, ..._win] }
+})
+
 // Get messages from a specific session JSONL
 app.get('/api/history/:sessionId', async (request) => {
   const { sessionId } = request.params
