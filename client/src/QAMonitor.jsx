@@ -58,6 +58,59 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
   const selectedRunIdRef = useRef(null)
   useEffect(() => { selectedRunIdRef.current = selectedRunId }, [selectedRunId])
 
+  // ─── 打包控制（少爺 2026-08-04）：後綴輸入框 ×1 ＋ 打包鈕 ×3 ＋ 開資料夾鈕 ×2 ───
+  // 命名 SSOT 與 Invoke-RomanPackage.ps1 一致：Windows_<Dev|Shipping>_<yyyyMMdd><suffix>
+  const [pkgSuffix, setPkgSuffix] = useState(() => localStorage.getItem('tc_pkg_suffix') ?? '_WithExtraWorks')
+  useEffect(() => { try { localStorage.setItem('tc_pkg_suffix', pkgSuffix) } catch {} }, [pkgSuffix])
+  const [pkgJob, setPkgJob] = useState(null)
+  const [pkgHint, setPkgHint] = useState('')
+
+  useEffect(() => {
+    fetch('/api/package/status').then(r => r.json()).then(d => setPkgJob(d.job ?? null)).catch(() => {})
+    const onPkg = (e) => setPkgJob(e.detail ?? null)
+    window.addEventListener('tc-package-update', onPkg)
+    return () => window.removeEventListener('tc-package-update', onPkg)
+  }, [])
+
+  const pkgRunning = pkgJob?.status === 'running'
+
+  const startPackage = useCallback(async (config, overwrite = false) => {
+    setPkgHint('')
+    const _res = await fetch('/api/package/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config, suffix: pkgSuffix, overwrite }),
+    }).then(r => r.json()).catch(e => ({ ok: false, error: e.message }))
+
+    // 同日重打：既有產物動輒 2GB+，覆寫前一定要你點頭
+    if (_res.needsConfirm) {
+      if (confirm(`以下產物已存在，繼續會「刪除後重打」：\n\n${_res.existing.join('\n')}\n\n確定覆寫？`)) {
+        return startPackage(config, true)
+      }
+      setPkgHint('已取消（未覆寫既有產物）')
+      return
+    }
+    if (!_res.ok) setPkgHint(`⚠️ ${_res.error ?? '啟動失敗'}`)
+    else setPkgJob(_res.job ?? null)
+  }, [pkgSuffix])
+
+  const openPackageFolder = useCallback(async (target) => {
+    setPkgHint('')
+    const _res = await fetch('/api/package/open', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target, suffix: pkgSuffix }),
+    }).then(r => r.json()).catch(e => ({ ok: false, error: e.message }))
+    if (!_res.ok) setPkgHint(`⚠️ ${_res.error ?? '開啟失敗'}`)
+    else setPkgHint(`📂 ${_res.path}`)
+  }, [pkgSuffix])
+
+  const cancelPackage = useCallback(async () => {
+    if (!confirm('中止進行中的打包？')) return
+    // ⚠️ 一定要帶 Content-Type + body：Fastify 對無 content-type 的 POST 回 415（2026-08-05 實測）
+    await fetch('/api/package/cancel', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    }).catch(() => {})
+  }, [])
+
   const reload = useCallback(() => {
     fetch('/api/qa/runs?limit=100').then(r => r.json()).then(d => {
       const list = d.runs ?? []
@@ -224,6 +277,118 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
 
       {/* 主面板 */}
       <div className="flex-1 min-w-0 overflow-y-auto">
+        {/* ── 打包控制列（少爺 2026-08-04）：不依賴選中 run，永遠可用 ── */}
+        <div className="sticky top-0 z-10 border-b border-[var(--border)] bg-[var(--surface)] px-3 py-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-[10px] uppercase tracking-widest text-[var(--text-muted)]">打包</span>
+
+            {/* 後綴輸入框：進資料夾名，只允許英數/底線/連字號 */}
+            <input value={pkgSuffix} onChange={e => setPkgSuffix(e.target.value)}
+              placeholder="_WithExtraWorks" title="資料夾名後綴：Windows_<Dev|Shipping>_<yyyyMMdd><後綴>"
+              className="w-40 bg-black/30 border border-[var(--border)] rounded px-2 py-1 text-[11px] font-mono text-[var(--text)]" />
+
+            {/* 三個一組：打包 */}
+            <div className="flex rounded overflow-hidden border border-[var(--border)]">
+              {[['Dev', 'Dev'], ['Shipping', 'Shipping'], ['Both', 'Dev+Shipping']].map(([_cfg, _label], _i) => (
+                <button key={_cfg} onClick={() => startPackage(_cfg)} disabled={pkgRunning}
+                  title={pkgRunning ? '打包進行中' : `打包 ${_label}`}
+                  className={`text-[11px] px-2.5 py-1 ${_i > 0 ? 'border-l border-[var(--border)]' : ''} ${
+                    pkgRunning ? 'text-[var(--text-muted)] opacity-40 cursor-not-allowed'
+                      : 'text-[var(--text)] hover:bg-[var(--gold)]/15 hover:text-[var(--gold)]'}`}>
+                  {_label}
+                </button>
+              ))}
+            </div>
+
+            {/* 兩個一組：開啟產物資料夾（挑該組態最新一份） */}
+            <div className="flex rounded overflow-hidden border border-[var(--border)]">
+              {['Dev', 'Shipping'].map((_t, _i) => (
+                <button key={_t} onClick={() => openPackageFolder(_t)}
+                  title={`用檔案總管開啟最新的 ${_t} 打包資料夾`}
+                  className={`text-[11px] px-2.5 py-1 text-[var(--text)] hover:bg-white/10 ${
+                    _i > 0 ? 'border-l border-[var(--border)]' : ''}`}>
+                  📂 {_t}
+                </button>
+              ))}
+            </div>
+
+            {pkgRunning && (
+              <button onClick={cancelPackage}
+                className="text-[11px] px-2 py-1 rounded border border-red-500/40 text-red-400 hover:bg-red-500/10">中止</button>
+            )}
+
+            <div className="flex-1" />
+
+            {/* 狀態徽章 */}
+            {pkgJob && (
+              <span className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                pkgJob.status === 'running' ? 'border-blue-500/40 text-blue-400'
+                  : pkgJob.status === 'done' ? 'border-green-500/40 text-green-400'
+                  : pkgJob.status === 'cancelled' ? 'border-[var(--border)] text-[var(--text-muted)]'
+                  : pkgJob.status === 'interrupted' ? 'border-amber-500/40 text-amber-400'
+                  : 'border-red-500/40 text-red-400'}`}>
+                {pkgJob.status === 'running' ? '打包中' : pkgJob.status === 'done' ? '✅ 成功'
+                  : pkgJob.status === 'cancelled' ? '已中止'
+                  : pkgJob.status === 'interrupted' ? '⚠️ 中斷（未跑完）' : '❌ 失敗'}
+              </span>
+            )}
+          </div>
+
+          {/* 進度：階段 + cook 百分比 + 最新一行輸出 */}
+          {pkgJob && (
+            <div className="mt-1.5">
+              <div className="flex items-center gap-2 text-[10px] text-[var(--text-muted)]">
+                <span className="font-mono">{pkgJob.config}{pkgJob.suffix}</span>
+                {pkgJob.currentTarget && <span className="text-[var(--gold)]">▶ {pkgJob.currentTarget}</span>}
+                {pkgJob.phase && pkgJob.phase !== 'idle' && (
+                  <span>{{ starting: '準備中', cooking: 'Cook / Build 中', archiving: '壓縮中' }[pkgJob.phase] ?? pkgJob.phase}</span>
+                )}
+                {pkgJob.cook?.percent !== null && pkgJob.cook?.percent !== undefined && (
+                  <span className="font-mono">cook {pkgJob.cook.percent}%（剩 {pkgJob.cook.remain}）</span>
+                )}
+                <span>· {fmtTime(pkgJob.startedAt)} → {fmtTime(pkgJob.finishedAt)}</span>
+              </div>
+
+              {pkgJob.cook?.percent !== null && pkgJob.cook?.percent !== undefined && (
+                <div className="h-1 bg-black/40 rounded mt-1 overflow-hidden">
+                  <div className="h-full bg-blue-400 transition-all" style={{ width: `${pkgJob.cook.percent}%` }} />
+                </div>
+              )}
+
+              {/* 各組態結果 */}
+              {pkgJob.results?.length > 0 && (
+                <div className="flex items-center gap-2 mt-1 flex-wrap">
+                  {pkgJob.results.map((_r, _i) => (
+                    <span key={_i} className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                      _r.status === 'ok' ? 'border-green-500/40 text-green-400' : 'border-red-500/40 text-red-400'}`}>
+                      {_r.status === 'ok' ? `✅ ${_r.target} · ${_r.minutes} 分` : `❌ ${_r.target} · ${_r.reason}`}
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {/* 失敗後的自動分析狀態 */}
+              {pkgJob.status === 'failed' && pkgJob.analysis && (
+                <div className="text-[10px] mt-1 text-amber-400">
+                  {pkgJob.analysis.state === 'spawned'
+                    ? '🔍 已喚醒 Claude 分析根因並建立修復 QA Run…'
+                    : `分析未啟動：${pkgJob.analysis.reason ?? pkgJob.analysis.state}`}
+                  {pkgJob.logPath && <span className="text-[var(--text-muted)] font-mono ml-2">log: {pkgJob.logPath}</span>}
+                </div>
+              )}
+
+              {/* 最新輸出一行（看得到「還活著」） */}
+              {pkgJob.tail?.length > 0 && pkgJob.status === 'running' && (
+                <div className="text-[9px] text-[var(--text-muted)] font-mono truncate mt-1">
+                  {pkgJob.tail[pkgJob.tail.length - 1]}
+                </div>
+              )}
+            </div>
+          )}
+
+          {pkgHint && <div className="text-[10px] mt-1 text-[var(--text-muted)] font-mono truncate">{pkgHint}</div>}
+        </div>
+
         {!run && (
           <div className="text-[var(--text-muted)] text-xs text-center mt-12">
             等待 Claude 宣告 QA 計畫…（autoqa 會在跑 QA 前把「目的+方法」推上這裡）
