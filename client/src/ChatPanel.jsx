@@ -10,6 +10,7 @@ import {
   PREF_TEXT_KEY, loadRatingsCache, writeRatingsCache, loadRatingById, saveRating, flushPendingSync, extractFeatures, RATING_TAGS,
 } from './chatSupport.jsx'
 import { WorkflowLauncher } from './WorkflowLauncher.jsx'
+import { PresentButton, usePresentation } from './PresentationView.jsx'
 
 // Phase 7: 把訊息變成 TODO 卡（插單機制）
 function PinToTodoButton({ text, sessionId }) {
@@ -271,6 +272,12 @@ function ChatPanel({ streamEvents, chatInit, selectedId }) {
   const attachMenuRef = useRef(null)
   const [sessionId, setSessionId] = useState(null)
   const [messages, setMessages] = useState([])
+  // 互動式簡報（少爺 2026-07-21）：設定 mode=present 時新回覆完成自動演出；config 於 mount 讀一次
+  //（分頁切換會 remount → 到規矩改完設定切回來即生效）
+  const presentCfgRef = useRef(null)
+  useEffect(() => { fetch('/api/present/config').then(r => r.json()).then(d => { presentCfgRef.current = d.config }).catch(() => {}) }, [])
+  const lastAssistantTextRef = useRef(null)
+  const { present: presentAuto, overlay: presentOverlay } = usePresentation(sessionId)
   // ⚠️ State 永遠完整保留（對應 memory/project_tc_design_alignment_audit.md 鐵律）
   // 不對歷史 messages 動 slice / cap
 
@@ -541,6 +548,9 @@ function ChatPanel({ streamEvents, chatInit, selectedId }) {
           else if (b.type === 'tool_use')
             newMsgs.push({ role: 'tool_use', toolName: b.name, input: b.input, toolId: b.id, ts: Date.now() })
         }
+        // 自動演出用：記住本輪最後一則 assistant 文字
+        const _lastA = [...newMsgs].reverse().find(x => x.role === 'assistant')
+        if (_lastA) lastAssistantTextRef.current = _lastA.text
         // 登記指紋：session_live 之後對同內容的重播（監看 tail）會被濾掉（少爺 2026-07-15）
         for (const m of newMsgs) markFp(m)
         if (newMsgs.length) setMessages(m => [...m, ...newMsgs])
@@ -566,6 +576,8 @@ function ChatPanel({ streamEvents, chatInit, selectedId }) {
         setRunning(false)
         const cost = event.total_cost_usd ? ` · $${event.total_cost_usd.toFixed(4)}` : ''
         setMessages(m => [...m, { role: 'result', text: `完成${cost}`, ts: Date.now() }])
+        // 自動演出（少爺 2026-07-21：設定 mode=present）：run 完成後演出最後一則 assistant 回覆
+        if (presentCfgRef.current?.mode === 'present' && lastAssistantTextRef.current) presentAuto(lastAssistantTextRef.current)
         // Hold runningRef for 700ms to absorb any trailing session_live fires
         // (file watcher or Stop hook may broadcast already-shown messages from claude_stream)
         setTimeout(() => { runningRef.current = false }, 700)
@@ -741,6 +753,7 @@ function ChatPanel({ streamEvents, chatInit, selectedId }) {
 
   return (
     <div className="flex flex-col h-full">
+      {presentOverlay}
 
       {/* Project path bar */}
       <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--border)] shrink-0">
@@ -871,6 +884,8 @@ function ChatPanel({ streamEvents, chatInit, selectedId }) {
                   <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>{m.text || ''}</ReactMarkdown>
                 </div>
                 <div className="flex justify-end items-center gap-1 mt-0.5">
+                  {/* 🎬 演出（少爺 2026-07-21）：這則回覆單獨套用互動簡報回放 */}
+                  <PresentButton sessionId={sessionId} text={m.text || ''} />
                   {/* Phase 7: 📌 插單建卡按鈕 */}
                   <PinToTodoButton text={m.text || ''} sessionId={sessionId} />
                   <MessageRating id={sessionId && m.ts ? `${sessionId}_${m.ts}` : null} text={m.text || ''}

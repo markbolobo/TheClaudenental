@@ -6,6 +6,8 @@ import { SommelierPanel } from './Sommelier.jsx'
 import { QAMonitorPanel } from './QAMonitor.jsx'
 import BountySettings from './BountySettings.jsx'
 import { ChatPanel } from './ChatPanel.jsx'
+import { PresentButton } from './PresentationView.jsx'
+import { MODEL_OPTIONS } from './modelOptions.js'
 import { useChatOutline, OutlineMinimap, openInVSCode, normPath, RATING_KEY, PREF_TEXT_KEY, loadRatingsCache, loadRatings } from './chatSupport.jsx'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -305,13 +307,17 @@ function useWebSocket(url, onMessage) {
 
 const HISTORY_PREVIEW_LEN = 300
 
-function HistoryMessage({ message: m }) {
+function HistoryMessage({ message: m, sessionId = null }) {
   const [expanded, setExpanded] = useState(false)
   const isLong = m.text.length > HISTORY_PREVIEW_LEN
   const displayed = expanded || !isLong ? m.text : m.text.slice(0, HISTORY_PREVIEW_LEN) + '…'
   return (
     <div className={`text-[11px] rounded px-2 py-1 ${m.role === 'user' ? 'bg-[var(--surface-2)] text-[var(--gold)]' : 'text-[var(--text-muted)]'}`}>
-      <div className="font-semibold text-[9px] uppercase mb-0.5 opacity-60">{m.role}</div>
+      <div className="font-semibold text-[9px] uppercase mb-0.5 opacity-60 flex items-center gap-2">
+        <span className="flex-1">{m.role}</span>
+        {/* 🎬 演出（少爺 2026-07-21）：HISTORY 內每則 assistant 回覆可單獨套用互動簡報回放 */}
+        {m.role === 'assistant' && sessionId && <PresentButton sessionId={sessionId} text={m.text} />}
+      </div>
       <div className="whitespace-pre-wrap break-words">{displayed}</div>
       {isLong && (
         <button
@@ -450,8 +456,8 @@ function HistoryPanel({ onContinue }) {
           {loading && <div className="text-[var(--text-muted)] text-xs">Loading…</div>}
           {messages.map((m, i) => (
             m.role === 'user'
-              ? <div key={i} id={`histmsg-${i}`}><HistoryMessage message={m} /></div>
-              : <HistoryMessage key={i} message={m} />
+              ? <div key={i} id={`histmsg-${i}`}><HistoryMessage message={m} sessionId={active.sessionId} /></div>
+              : <HistoryMessage key={i} message={m} sessionId={active.sessionId} />
           ))}
         </div>
         <OutlineMinimap entries={outline.entries} activeId={outline.activeId} onJump={jumpToOutline} />
@@ -658,6 +664,52 @@ function Sparkline({ data, color = 'var(--gold)', width = 120, height = 28, labe
   )
 }
 
+// 回應風格設定（少爺 2026-07-21：官方文字 vs 互動簡報濾鏡；跨裝置存 server present.json）
+function PresentStylePanel() {
+  const [cfg, setCfg] = useState(null)
+  useEffect(() => {
+    fetch('/api/present/config').then(r => r.json()).then(d => setCfg(d.config)).catch(() => {})
+  }, [])
+  function save(patch) {
+    setCfg(c => ({ ...c, ...patch }))
+    fetch('/api/present/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    }).catch(() => {})
+  }
+  if (!cfg) return null
+  return (
+    <div className="bg-[var(--surface-2)] border border-[var(--gold-border)] rounded p-2.5">
+      <div className="text-[10px] uppercase tracking-widest text-[var(--gold)] mb-1.5">🎬 回應風格</div>
+      <div className="flex flex-col gap-1.5">
+        {[
+          { v: 'official', label: '官方文字', desc: '現行 markdown 呈現；每則回覆仍可手動 🎬 演出' },
+          { v: 'present', label: '互動簡報', desc: 'CHAT 新回覆完成後自動轉譯成卡片流演出（原文永遠保留）' },
+        ].map(o => (
+          <label key={o.v} className="flex items-start gap-2 cursor-pointer select-none">
+            <input type="radio" name="present-mode" checked={cfg.mode === o.v}
+              onChange={() => save({ mode: o.v })} className="accent-[var(--gold)] mt-0.5" />
+            <span className="text-[11px] text-[var(--text)]">{o.label}
+              <span className="block text-[9px] text-[var(--text-muted)]">{o.desc}</span>
+            </span>
+          </label>
+        ))}
+        <div className="flex items-center gap-2 mt-0.5">
+          <span className="text-[9px] text-[var(--text-muted)] shrink-0">轉譯模型</span>
+          <select value={cfg.model ?? ''} onChange={e => save({ model: e.target.value })}
+            className="flex-1 bg-[var(--surface)] border border-[var(--border)] rounded px-1.5 py-0.5 text-[10px] text-[var(--text)] focus:outline-none focus:border-[var(--gold-border)]">
+            <option value="claude-haiku-4-5-20251001">Haiku（快，預設）</option>
+            {MODEL_OPTIONS.filter(o => o.value).map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+        </div>
+        <div className="text-[8px] text-[var(--text-muted)]/70">
+          演出上的 👍👎 與快速回饋會累積注入之後的轉譯——這個工具會跟著我們的合作愈調愈準。
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function PreferencesPanel() {
   const [ratings, setRatings]   = useState(() => loadRatingsCache())  // init from cache, then fetch
   const [prefText, setPrefText] = useState(() => localStorage.getItem(PREF_TEXT_KEY) || '')
@@ -746,6 +798,9 @@ function PreferencesPanel() {
           <button onClick={clearAll} className="text-[9px] text-[var(--text-muted)] hover:text-red-400 border border-[var(--border)] rounded px-1.5 py-0.5">清除</button>
         </div>
         <div className="p-3 flex flex-col gap-4">
+
+          {/* 回應風格（少爺 2026-07-21：互動簡報濾鏡） */}
+          <PresentStylePanel />
 
           {/* Stats */}
           <div className="grid grid-cols-2 gap-2">
@@ -1948,6 +2003,10 @@ export default function App() {
     // AutoQA Monitor：轉發給 QAMonitorPanel（decoupled，不佔 App state）
     if (msg.type === 'qa_run_update') {
       try { window.dispatchEvent(new CustomEvent('tc-qa-run-update', { detail: msg.run })) } catch {}
+    }
+    // 打包進度：同樣轉發給 QAMonitorPanel（少爺 2026-08-04 打包控制列）
+    if (msg.type === 'package_update') {
+      try { window.dispatchEvent(new CustomEvent('tc-package-update', { detail: msg.job })) } catch {}
     }
     if (msg.type === 'session') {
       // Auto-watch when a session becomes active
