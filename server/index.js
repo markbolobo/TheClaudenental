@@ -1303,8 +1303,10 @@ function cleanTaggerTranscripts() {
     }
   } catch {}
 }
-cleanTaggerTranscripts()
-scheduleNextNightly()
+// cleanTaggerTranscripts() 與 scheduleNextNightly() 的啟動呼叫已下移到 metrics 初始化區之後
+// （2026-08-06 修：原在此處呼叫時 EVENTS_DIR const 尚在 TDZ → scheduleNextNightly 內的 logEvent
+//  撞 ReferenceError 被 catch 靜默吞掉 → tags.nightly.scheduled 事件記不到；setTimeout 仍會排、
+//  功能正常，但重啟後無法從 events 確認今晚排程 = 可觀測性破損）
 
 // 手動觸發夜間標籤（測試／少爺想立即跑一輪）
 app.post('/api/history/tags/run-nightly', async () => {
@@ -2158,6 +2160,12 @@ function logEvent(kind, data) {
     fs.appendFileSync(file, JSON.stringify({ ts: Date.now(), kind, data }) + '\n', 'utf8')
   } catch {}
 }
+
+// 夜間標籤排程 + tagger transcript 清掃的啟動呼叫（2026-08-06 從模組前段移來）：
+// 必須在 EVENTS_DIR / ensureMetricsDir / logEvent 定義之後才呼叫，否則 scheduleNextNightly 內的
+// logEvent 會撞 EVENTS_DIR 的 TDZ → tags.nightly.scheduled 靜默失敗（見前段移除處註解）
+cleanTaggerTranscripts()
+scheduleNextNightly()
 
 // 過期資料清理（只清「過期」概念明確的：未用 invites + 已死 sessions）
 // 卡片 / events log 不自動真刪 — 對應 memory 三層分離哲學：
