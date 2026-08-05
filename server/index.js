@@ -1006,8 +1006,8 @@ function writeTagResult(sessionId, raw, cleanCount, prevTagsForMerge = null) {
   }
 }
 
-/** ai-tags 快取行寫回 transcript jsonl（append-only；讀取端取最後一行為準） */
-function appendAiTagsLine(sessionId, payload) {
+/** 快取行寫回 transcript jsonl（append-only；讀取端取最後一行為準）——ai-tags / ai-present 共用 */
+function appendTranscriptLine(sessionId, obj) {
   const _fp = findJsonlPath(sessionId)
   if (!_fp) return false
   let _prefix = ''
@@ -1021,7 +1021,12 @@ function appendAiTagsLine(sessionId, payload) {
     }
     fs.closeSync(_fd)
   } catch {}
-  try { fs.appendFileSync(_fp, _prefix + JSON.stringify({ type: 'ai-tags', ...payload }) + '\n', 'utf8'); return true } catch { return false }
+  try { fs.appendFileSync(_fp, _prefix + JSON.stringify(obj) + '\n', 'utf8'); return true } catch { return false }
+}
+
+/** ai-tags 快取行（既有呼叫端介面不變，內部走 appendTranscriptLine） */
+function appendAiTagsLine(sessionId, payload) {
+  return appendTranscriptLine(sessionId, { type: 'ai-tags', ...payload })
 }
 
 function runTagWorker() {
@@ -3203,6 +3208,364 @@ app.post('/api/open-url', async (request) => {
   }
 })
 
+// ─── 打包控制（少爺 2026-08-04：QA 分頁直接打包 Dev / Shipping、看進度、開產物資料夾）──
+// SOP: .agent/workflows/Roman_Packaging_SOP.md ／ 腳本: .agent/scripts/Invoke-RomanPackage.ps1
+// 命名 SSOT 與腳本一致：Windows_<Dev|Shipping>_<yyyyMMdd><suffix>
+
+const PACKAGE_SCRIPT = 'C:\\Project\\RomanPrototype\\.agent\\scripts\\Invoke-RomanPackage.ps1'
+const PACKAGE_BUILD_ROOT = 'C:\\Project\\RomanPrototype\\Build'
+const PACKAGE_TAIL_MAX = 60
+
+// 打包＝跑很久的外部工作，生命週期不可綁在本 server 上（少爺 2026-08-05）：
+//   ① 子進程 detached＋stdout 直寫 log 檔（自己持有 handle）→ server 重啟不影響打包、log 不斷
+//   ② server 只「tail 那個 log 檔」取進度 → 重啟後重讀即可復原進度，不必重接管道
+//   ③ job 狀態 atomicWriteJson 落檔 → 重啟後介面不空白（沿用 TC 既有 sessions/subprocSids 慣例）
+const PACKAGE_JOB_FILE = path.join(os.homedir(), '.claude', 'tc_package_job.json')
+
+let packageJob = null      // { id, config, suffix, status, phase, cook, tail[], results[], pid, logPath }
+let packageProc = null     // 本 server 生命週期內才有；重啟後為 null 但 job 仍可靠 pid + log 續管
+let packageBcastAt = 0
+let packageTailTimer = null
+let packageTailOffset = 0
+let packageTailBuf = ''
+
+function packageDateStamp() {
+  const _d = new Date()
+  return `${_d.getFullYear()}${String(_d.getMonth() + 1).padStart(2, '0')}${String(_d.getDate()).padStart(2, '0')}`
+}
+
+function persistPackageJob() {
+  try {
+    if (packageJob) atomicWriteJson(PACKAGE_JOB_FILE, packageJob)
+    else if (fs.existsSync(PACKAGE_JOB_FILE)) fs.unlinkSync(PACKAGE_JOB_FILE)
+  } catch { /* 落檔失敗不影響打包本身 */ }
+}
+
+// 進程存活判定（重啟後 packageProc 為 null，只能靠 pid）
+function isPackagePidAlive(pid) {
+  if (!pid) return false
+  try { process.kill(pid, 0); return true }
+  catch (e) { return e.code === 'EPERM' }   // EPERM = 存在但無權限 → 仍算活著
+}
+
+function broadcastPackage(force = false) {
+  if (!packageJob) return
+  const _now = Date.now()
+  // 節流：UAT 每秒數十行，逐行推會淹掉 ws（完成/失敗一律 force）
+  if (!force && _now - packageBcastAt < 800) return
+  packageBcastAt = _now
+  persistPackageJob()
+  broadcast({ type: 'package_update', job: packageJob })
+}
+
+// 從 log 檔續讀（offset 制）：這是重啟後唯一的進度來源
+function readPackageLog() {
+  if (!packageJob?.logPath) return
+  try {
+    const _size = fs.statSync(packageJob.logPath).size
+    if (_size <= packageTailOffset) return
+    const _fd = fs.openSync(packageJob.logPath, 'r')
+    const _len = _size - packageTailOffset
+    const _buf = Buffer.alloc(_len)
+    fs.readSync(_fd, _buf, 0, _len, packageTailOffset)
+    fs.closeSync(_fd)
+    packageTailOffset = _size
+    packageTailBuf += _buf.toString('utf-8')
+    const _lines = packageTailBuf.split(/\r?\n/)
+    packageTailBuf = _lines.pop() ?? ''
+    for (const _l of _lines) parsePackageLine(_l)
+  } catch { /* log 還沒建立 / 讀取瞬間被鎖 → 下一輪再試 */ }
+}
+
+function stopPackageTail() {
+  if (packageTailTimer) clearInterval(packageTailTimer)
+  packageTailTimer = null
+}
+
+function startPackageTail() {
+  stopPackageTail()
+  packageTailTimer = setInterval(() => {
+    readPackageLog()
+    if (packageJob?.status !== 'running') return
+    if (packageJob.pid) {
+      // 進程沒了但狀態還停在 running → 由 log 內容定案（涵蓋「server 重啟期間打包結束」）
+      if (!isPackagePidAlive(packageJob.pid)) finalizePackageJob(null)
+    }
+    // PID 還沒從 log 讀到：給 60 秒寬限（powershell 起步＋Start-Transcript），超時＝啟動層失敗
+    else if (Date.now() - packageJob.startedAt > 60000) finalizePackageJob(-1)
+  }, 700)
+}
+
+// 解析腳本與 UAT 輸出 → 進度（少爺要看得到「跑到哪」而不是只有轉圈）
+function parsePackageLine(line) {
+  if (!packageJob) return
+  const _t = line.trim()
+  if (!_t) return
+
+  packageJob.tail.push(_t)
+  if (packageJob.tail.length > PACKAGE_TAIL_MAX) packageJob.tail.shift()
+
+  let _force = false
+
+  // 腳本自報 PID（cmd /c start 啟動法下，這是唯一能拿到真進程的管道）
+  const _pid = _t.match(/^\[Package\] PID=(\d+)/)
+  if (_pid) { packageJob.pid = Number(_pid[1]); _force = true }
+
+  // 腳本自身的階段標記
+  const _sect = _t.match(/^\[Package\] ===== (\w+) \((\w+)\)/)
+  if (_sect) { packageJob.currentTarget = _sect[1]; packageJob.phase = 'starting'; packageJob.cook = null; _force = true }
+  else if (/^\[Package\] RunUAT start/.test(_t)) { packageJob.phase = 'cooking'; _force = true }
+  else if (/^\[Package\] Archiving/.test(_t)) { packageJob.phase = 'archiving'; packageJob.cook = null; _force = true }
+
+  const _done = _t.match(/^\[Package\] (\w+) DONE in (\d+) min/)
+  if (_done) {
+    packageJob.results.push({ target: _done[1], status: 'ok', minutes: Number(_done[2]) })
+    packageJob.phase = 'idle'; packageJob.cook = null; _force = true
+  }
+  const _fail = _t.match(/^\[Package\] (\w+) FAILED \(([^)]*)\)/)
+  if (_fail) {
+    packageJob.results.push({ target: _fail[1], status: 'failed', reason: _fail[2] })
+    packageJob.phase = 'idle'; packageJob.cook = null; _force = true
+  }
+
+  // UAT cook 進度（真正的長時間段落）
+  const _cook = _t.match(/Cooked packages (\d+) Packages Remain (\d+)/)
+  if (_cook) {
+    const _c = Number(_cook[1]), _r = Number(_cook[2])
+    packageJob.cook = { done: _c, remain: _r, percent: (_c + _r) > 0 ? Math.round((_c / (_c + _r)) * 100) : null }
+  }
+
+  broadcastPackage(_force)
+}
+
+// 收尾單一出口：子進程 exit（server 活著）與 tail 偵測到 pid 消失（server 重啟後）共用
+// @param InExitCode 有拿到才傳；重啟後無從得知 → 傳 null，改由 log 是否有 Summary 判定
+function finalizePackageJob(InExitCode) {
+  if (!packageJob || packageJob.status !== 'running') return
+
+  readPackageLog()   // 收尾前再讀一次，避免漏掉最後幾行（含 Summary / FAILED）
+  stopPackageTail()
+
+  packageJob.exitCode = InExitCode
+  packageJob.finishedAt = Date.now()
+  packageJob.phase = 'idle'
+  packageJob.cook = null
+
+  // 腳本跑完必印 Summary。沒有 Summary 時要分清兩種：
+  //   有 exitCode（本 server 全程看著它結束）＝腳本異常結束 → failed（別誤標成中斷）
+  //   無 exitCode（重啟後才發現進程不見）＝中途被斬 → interrupted
+  const _hasSummary = packageJob.tail.some(l => /^\[Package\] ===== Summary/.test(l)) || packageJob.results.length > 0
+  const _anyFail = packageJob.results.some(r => r.status === 'failed')
+  if (!_hasSummary) {
+    packageJob.status = (InExitCode === null) ? 'interrupted' : 'failed'
+    if (packageJob.tail.length === 0) packageJob.tail.push(`（腳本無任何輸出，exit=${InExitCode}；log=${packageJob.logPath}）`)
+  }
+  else packageJob.status = ((InExitCode ?? 0) === 0 && !_anyFail) ? 'done' : 'failed'
+
+  packageProc = null
+
+  // 少爺 2026-08-04：打包失敗 → 自動喚 Claude 分析根因並建立「修復到能順利打包」的 QA Run
+  //（取消/中斷不算失敗、不喚醒；沿用既有 spawnClaude，不自造第二套喚醒）
+  // F4（少爺 2026-08-05）：區分「前置守衛類假失敗」與「真失敗」。
+  //「output already exists」是 -Force 守衛的正確攔阻（產物早已完整、不是打壞），
+  // 喚 Claude 分析純屬浪費（實測噴 13.26M token/Opus）；只有真失敗
+  //（UAT 非 0／cook 炸／staged 缺失／腳本層崩、results 空）才喚醒。
+  if (packageJob.status === 'failed') {
+    const _fails = packageJob.results.filter(r => r.status === 'failed')
+    const _isGuardBlock = (r) => /already exists|exists, need/i.test(r.reason ?? '')
+    const _realFails = _fails.filter(r => !_isGuardBlock(r))
+    const _guardOnly = _fails.length > 0 && _realFails.length === 0   // 有 failed 且全是 exists 類 = 純守衛攔阻
+    // 腳本連 log 都沒寫出來（啟動層就死）＝沒有可分析的素材，喚 Claude 只會空轉燒 token
+    if (!_hasSummary && packageJob.results.length === 0) {
+      packageJob.analysis = { state: 'skipped', reason: '腳本無任何輸出（啟動層失敗）＝無可分析素材，不喚 Claude', at: Date.now() }
+      logEvent('package.failure.no_output', { id: packageJob.id, exitCode: InExitCode })
+    }
+    else if (_guardOnly) {
+      packageJob.analysis = { state: 'skipped', reason: '前置守衛攔阻（產物已存在，需 -Force）＝非真失敗，不喚 Claude', at: Date.now() }
+      logEvent('package.failure.guard_skipped', { id: packageJob.id, config: packageJob.config, reasons: _fails.map(r => r.reason) })
+    }
+    else triggerPackageFailureAnalysis(packageJob)
+  }
+
+  broadcastPackage(true)
+}
+
+// 打包失敗 → 喚 Claude 分析根因＋建立修復 QA Run（少爺 2026-08-04）
+function triggerPackageFailureAnalysis(job) {
+  try {
+    const _cwd = 'C:\\Project\\RomanPrototype'
+    if (!isSafeCwd(_cwd)) return
+    if (claudeProcs.get(_cwd)?.status === 'running') {
+      job.analysis = { state: 'skipped', reason: '該專案已有 Claude 進程執行中', at: Date.now() }
+      return
+    }
+
+    const _failed = job.results.filter(r => r.status === 'failed').map(r => `${r.target}(${r.reason})`).join('、')
+      || `exit ${job.exitCode}`
+    const _tail = job.tail.slice(-25).join('\n')
+
+    const _prompt = [
+      `(TC 打包失敗自動通知) 羅馬打包失敗，請分析並建立修復 QA Run。`,
+      ``,
+      `失敗組態：${_failed}`,
+      `打包設定：config=${job.config}、suffix=${job.suffix}、日期=${job.dateStamp}`,
+      `完整 log：${job.logPath}`,
+      ``,
+      `尾段輸出：`,
+      '```',
+      _tail,
+      '```',
+      ``,
+      `請照以下順序處理：`,
+      `1. 讀 .agent/workflows/Roman_Packaging_SOP.md §四陷阱索引，比對本次失敗是否命中既知陷阱`,
+      `   （PoseSearch cook 卡死＝查 log 裡 "PreCancelled because of X" 的 X 才是元兇／Mover mode ClassWithin cook-only 炸／BP 類子系統打包版不存在）`,
+      `2. 讀完整 log 找真因（tail 只有 25 行，根因通常在更前面；用 grep 找 Error/Fatal/PreCancelled/Missing）`,
+      `3. 列 2-3 個可能根因再收斂（feedback_diagnosis_hold_hypotheses_before_commit），不要太快 commit 單一結論`,
+      `4. POST http://127.0.0.1:3001/api/qa/runs 建立 QA Run：topic 標明「打包修復」、requirement 寫失敗現象與你的根因判斷、`,
+      `   criteria 至少含「C1 該組態能完整打包成功並產出可執行檔」、items 涵蓋修復驗證與回歸（其他組態不被修壞）`,
+      `5. 修復動工前照 QA Mode C 把計畫寫成 QAPC 交少爺審（QA/README.md §Mode C），不要直接改`,
+    ].join('\n')
+
+    // F4（少爺 2026-08-05）：喚醒降 sonnet/low —— 讀 log 找根因＋建 QA Run 不需 Opus 全力，省 token
+    spawnClaude(_cwd, _prompt, null, 'sonnet', 'low')
+    job.analysis = { state: 'spawned', model: 'sonnet', effort: 'low', at: Date.now() }
+    logEvent('package.failure.analysis_spawned', { id: job.id, config: job.config, failed: _failed, model: 'sonnet', effort: 'low' })
+  } catch (e) {
+    job.analysis = { state: 'error', reason: e.message, at: Date.now() }
+  }
+}
+
+app.post('/api/package/start', async (request) => {
+  const { config = 'Both', suffix = '_WithExtraWorks', overwrite = false } = request.body ?? {}
+  if (!['Dev', 'Shipping', 'Both'].includes(config)) return { ok: false, error: 'invalid config' }
+  // 後綴會直接進資料夾名 → 只放行檔名安全字元（擋路徑穿越與參數注入）
+  if (!/^[\w-]*$/.test(suffix)) return { ok: false, error: '後綴只能用英數 / 底線 / 連字號' }
+  if (packageJob?.status === 'running') return { ok: false, error: '已有打包進行中', job: packageJob }
+
+  const _stamp = packageDateStamp()
+
+  // 同日重打會覆寫既有產物（動輒 2GB+）→ 未明確確認前不動手（腳本端也有 -Force 把關，雙保險）
+  if (!overwrite) {
+    const _targets = config === 'Both' ? ['Dev', 'Shipping'] : [config]
+    const _existing = _targets
+      .map(t => `Windows_${t}_${_stamp}${suffix}`)
+      .filter(name => { try { return fs.existsSync(path.join(PACKAGE_BUILD_ROOT, name)) } catch { return false } })
+    if (_existing.length) return { ok: false, needsConfirm: true, existing: _existing }
+  }
+  const _jobId = `pkg${Date.now()}`
+  // 完整輸出落檔：tail 只留 60 行，cook 失敗的真因（PreCancelled because of X）往往在幾千行前
+  const _logDir = path.join(PACKAGE_BUILD_ROOT, '__package_logs')
+  try { fs.mkdirSync(_logDir, { recursive: true }) } catch {}
+  const _logPath = path.join(_logDir, `${_jobId}.log`)
+
+  packageJob = {
+    id: _jobId,
+    config, suffix, dateStamp: _stamp,
+    targets: config === 'Both' ? ['Dev', 'Shipping'] : [config],
+    folders: (config === 'Both' ? ['Dev', 'Shipping'] : [config]).map(t => `Windows_${t}_${_stamp}${suffix}`),
+    status: 'running', phase: 'starting', currentTarget: null, cook: null,
+    startedAt: Date.now(), finishedAt: null,
+    tail: [], results: [], exitCode: null,
+    logPath: _logPath, analysis: null,
+  }
+  // 用 `cmd /c start` 啟動（沿用 TC 既有 open-url 的做法）：start 會配新 console，powershell 才活得下來，
+  // 且 cmd 立刻退出 → powershell 完全脫離本 server，重啟/掛掉都不中斷打包。
+  // ⚠️ 走過的兩條死路（2026-08-05 實測）：
+  //    ① node `detached:true` = DETACHED_PROCESS 不配 console → powershell 秒退、log 0 bytes
+  //    ② `Start-Process` 在 pm2 服務脈絡下無聲失敗（TC 既有註解 line ~4328 已記錄）
+  // ⚠️ log 由腳本自己寫（-LogPath → Start-Transcript）；PID 也由腳本自報（cmd 的 pid 沒用）
+  try {
+    const _psArgs = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', PACKAGE_SCRIPT,
+      '-Config', config, '-Suffix', suffix, '-LogPath', _logPath]
+    if (overwrite) _psArgs.push('-Force')
+    packageProc = spawn('cmd.exe', ['/c', 'start', 'Roman Package', '/min', 'powershell.exe', ..._psArgs], {
+      cwd: 'C:\\Project\\RomanPrototype', detached: true, stdio: 'ignore', windowsHide: true,
+    })
+    packageProc.unref()
+    packageProc = null           // cmd 立刻結束，留著它沒有意義；真 pid 由 log 的 [Package] PID= 補上
+    packageJob.pid = null
+  } catch (e) {
+    packageJob.status = 'failed'; packageJob.finishedAt = Date.now(); packageJob.tail.push(`spawn failed: ${e.message}`)
+    broadcastPackage(true)
+    return { ok: false, error: e.message }
+  }
+
+  // 收尾一律交給 tail 的 pid 存活檢查：cmd /c start 啟動法下我們拿不到真進程物件
+  //（cmd 立刻退出、它的 exit 事件毫無意義），所以這裡不掛任何 exit 監聽
+  packageTailOffset = 0
+  packageTailBuf = ''
+  startPackageTail()
+
+  broadcastPackage(true)
+  return { ok: true, job: packageJob }
+})
+
+app.get('/api/package/status', async () => ({ ok: true, job: packageJob }))
+
+app.post('/api/package/cancel', async () => {
+  // 用 job.pid 而非 packageProc：server 重啟後 packageProc 為 null，但打包還在跑、仍須可中止
+  if (packageJob?.status !== 'running' || !packageJob.pid) return { ok: false, error: '沒有進行中的打包' }
+  try { spawnSync('taskkill', ['/pid', String(packageJob.pid), '/T', '/F']) } catch { /* 已結束 */ }
+  stopPackageTail()
+  readPackageLog()
+  packageJob.status = 'cancelled'
+  packageJob.finishedAt = Date.now()
+  packageJob.phase = 'idle'
+  packageJob.cook = null
+  packageProc = null
+  broadcastPackage(true)
+  return { ok: true }
+})
+
+// 開機復原（少爺 2026-08-05）：server 重啟後把上次的 job 撿回來
+//   還在跑 → 從 log 頭重讀重建進度＋續 tail；已結束 → 直接由 log 定案（含補觸發失敗分析）
+try {
+  const _savedJob = JSON.parse(fs.readFileSync(PACKAGE_JOB_FILE, 'utf-8'))
+  if (_savedJob?.id) {
+    packageJob = _savedJob
+    if (packageJob.status === 'running') {
+      packageTailOffset = 0
+      packageTailBuf = ''
+      packageJob.tail = []
+      packageJob.results = []
+      packageJob.cook = null
+      readPackageLog()   // 重播整份 log → results / phase / cook 全部重建
+      if (isPackagePidAlive(packageJob.pid)) {
+        logEvent('package.restore.resumed', { id: packageJob.id, pid: packageJob.pid })
+        startPackageTail()
+      }
+      else {
+        logEvent('package.restore.finalize', { id: packageJob.id })
+        finalizePackageJob(null)   // server 重啟期間就跑完/被斬了 → 現在定案
+      }
+    }
+  }
+} catch { /* 沒有前次 job 或檔壞掉 → 當作全新開始 */ }
+
+// 開啟產物資料夾（挑該組態「最新一份」；日期為 yyyyMMdd → 字典序即時間序）
+app.post('/api/package/open', async (request) => {
+  const { target = 'Dev', suffix = '' } = request.body ?? {}
+  if (!['Dev', 'Shipping'].includes(target)) return { ok: false, error: 'invalid target' }
+
+  let _dir = PACKAGE_BUILD_ROOT
+  try {
+    const _prefix = `Windows_${target}_`
+    const _all = fs.readdirSync(PACKAGE_BUILD_ROOT, { withFileTypes: true })
+      .filter(e => e.isDirectory() && e.name.startsWith(_prefix)).map(e => e.name).sort()
+    const _matched = suffix ? _all.filter(n => n.endsWith(suffix)) : _all
+    const _pick = (_matched.length ? _matched : _all).pop()
+    if (_pick) _dir = path.join(PACKAGE_BUILD_ROOT, _pick)
+  } catch { /* 讀不到就退回 Build 根目錄 */ }
+
+  try {
+    const _p = spawn('explorer.exe', [_dir], { detached: true, stdio: 'ignore', shell: false })
+    _p.unref()
+    return { ok: true, path: _dir }
+  } catch (e) {
+    return { ok: false, error: e.message }
+  }
+})
+
 // ─── Open in VSCode (markdown link handler) ──────────────────────────────────
 // 對應 docs/customization/project_roots_schema.md
 // 對應 memory/feedback_filepath_markdown_format.md
@@ -3292,6 +3655,174 @@ app.get('/api/sommelier/projects', async (request, reply) => {
   const cfg = readSommelierConfig()
   // 高桌會認可制：enabled=false（除聖）的分館不出現在仕酒師/QA 下拉；資料永久保留
   return { ok: true, projects: (cfg.projects ?? []).filter(p => p.enabled !== false).map(p => ({ id: p.id, name: p.name })) }
+})
+
+// ─── 互動式簡報（少爺 2026-07-21：回應風格濾鏡＋演出回放＋合作資料優化）──────────
+// 轉譯管線沿用 tagger 基建（TAGGER_CWD＝繼承 History/側欄排除、haiku 預設、stream-json 取
+// result、關閉即刪 transcript、s2tw 正規化）；快取＝transcript jsonl 的 type:'ai-present' 行
+//（比照 ai-tags/ai-title），同 msgHash 取最後一行 → 回放零成本。
+const PRESENT_PIPELINE_VER = 1
+const PRESENT_CONFIG_FILE = path.join(os.homedir(), '.claude', 'tc_user_config', 'present.json')
+const PRESENT_FEEDBACK_FILE = path.join(os.homedir(), '.claude', 'tc_present_feedback.jsonl')
+const presentCache = new Map()   // msgHash → { payload, ts }（in-memory 熱路徑；jsonl 為持久層）
+
+function readPresentConfig() {
+  try { return { mode: 'official', model: TAG_LLM_MODEL, ...JSON.parse(fs.readFileSync(PRESENT_CONFIG_FILE, 'utf8')) } }
+  catch { return { mode: 'official', model: TAG_LLM_MODEL } }
+}
+
+app.get('/api/present/config', async () => ({ ok: true, config: readPresentConfig() }))
+
+app.post('/api/present/config', async (request) => {
+  const _next = readPresentConfig()
+  if (['official', 'present'].includes(request.body?.mode)) _next.mode = request.body.mode
+  if (typeof request.body?.model === 'string') _next.model = request.body.model || TAG_LLM_MODEL
+  try { fs.mkdirSync(path.dirname(PRESENT_CONFIG_FILE), { recursive: true }) } catch {}
+  atomicWriteJson(PRESENT_CONFIG_FILE, _next)
+  return { ok: true, config: _next }
+})
+
+function msgHashOf(text) { return crypto.createHash('sha1').update(String(text ?? ''), 'utf8').digest('hex').slice(0, 16) }
+
+/** 簡報回饋聚合 → prompt 指引句（近 80 筆；與評分系統同哲學：少爺的訊號蓋過預設） */
+function getPresentFeedbackGuidance() {
+  try {
+    const _lines = fs.readFileSync(PRESENT_FEEDBACK_FILE, 'utf8').split('\n').filter(Boolean).slice(-80)
+    const _cnt = {}
+    for (const _l of _lines) {
+      try { for (const _t of (JSON.parse(_l).tags ?? [])) _cnt[_t] = (_cnt[_t] ?? 0) + 1 } catch {}
+    }
+    const _g = []
+    if ((_cnt['太碎'] ?? 0) >= 3) _g.push('卡片數量曾被嫌太碎——合併相近重點，上限 5 張')
+    if ((_cnt['太密'] ?? 0) >= 3) _g.push('單張資訊量曾被嫌太密——每張只留一個重點、body 兩句內')
+    if ((_cnt['重點錯'] ?? 0) >= 3) _g.push('重點判讀曾多次失準——verdict 優先摘原文結論句原話，不自行改寫')
+    if ((_cnt['要更多細節'] ?? 0) >= 3) _g.push('少爺想要更多細節——關鍵數字/檔名/路徑保留進卡片')
+    return _g
+  } catch { return [] }
+}
+
+/** 轉譯 prompt：注入規矩偏好文字＋少爺自訂詞（領域詞彙保真）＋簡報回饋指引（優化迴路 v1） */
+function buildPresentPrompt(text) {
+  let _prefs = ''
+  try { _prefs = JSON.parse(fs.readFileSync(PREFS_FILE, 'utf8')).text ?? '' } catch {}
+  const _terms = getCustomTagTerms()
+  const _guides = getPresentFeedbackGuidance()
+  return `你是「互動簡報轉譯器」：把一則 AI 助手的回覆轉成少爺能秒懂的漸進揭示卡片流。只輸出一個 JSON 物件，不要任何其他文字。
+
+JSON 格式：
+{"title":"一句話主旨","verdict":"最重要的結論或答案（沒有明確結論則為 null）","sections":[{"kind":"point|action|risk|info|code","heading":"卡片標題（短）","body":"內容（最多兩句）","code":"（僅 kind=code 時：程式碼或指令原文）"}],"followups":["原文中提到的下一步或待決事項"]}
+
+規則：
+- 全部繁體中文（台灣用語）。
+- verdict 盡量摘原文的結論句原話，不自行改寫語意。
+- sections 3~6 張，每張只講一個重點；行動用 action、風險/坑用 risk、程式碼或指令用 code、背景補充用 info。
+- 檔名、函式名、數字、路徑等關鍵識別字保留原樣，不翻譯不改寫。
+- 只根據原文，不發明原文沒有的內容；followups 沒有就給空陣列。
+${_terms.length ? `- 領域詞彙（出現時保留原樣）：${_terms.join('、')}\n` : ''}${_prefs ? `- 少爺回應偏好：\n${_prefs}\n` : ''}${_guides.length ? `- 少爺對過往簡報的回饋（必須遵守）：\n${_guides.map(g => `  - ${g}`).join('\n')}\n` : ''}
+原文：
+<<<
+${text}
+>>>`
+}
+
+/** 解析＋守門：非法 kind 收斂為 point、張數上限、s2tw 正規化 */
+function parsePresentResult(text) {
+  try {
+    const _m = String(text ?? '').match(/\{[\s\S]*\}/)
+    if (!_m) return null
+    const _p = JSON.parse(_m[0])
+    if (!_p || !Array.isArray(_p.sections) || !_p.sections.length) return null
+    const _tw = (s) => { try { return s == null ? s : s2tw(String(s)) } catch { return s } }
+    return {
+      title: _tw(_p.title ?? ''),
+      verdict: _p.verdict ? _tw(_p.verdict) : null,
+      sections: _p.sections.slice(0, 8).map(s => ({
+        kind: ['point', 'action', 'risk', 'info', 'code'].includes(s.kind) ? s.kind : 'point',
+        heading: _tw(s.heading ?? ''),
+        body: _tw(s.body ?? ''),
+        ...(s.code ? { code: String(s.code) } : {}),
+      })),
+      followups: (_p.followups ?? []).slice(0, 6).map(_tw),
+    }
+  } catch { return null }
+}
+
+function spawnPresentLLM(text, model) {
+  return new Promise((resolve) => {
+    const _cwdNorm = TAGGER_CWD.replace(/\\/g, '/').toLowerCase()
+    try { fs.mkdirSync(TAGGER_CWD, { recursive: true }) } catch {}
+    pendingSpawnCwds.add(_cwdNorm)
+    const args = ['--model', model || TAG_LLM_MODEL, '--output-format', 'stream-json', '--verbose',
+      '--dangerously-skip-permissions', '--max-turns', '1', '-p', buildPresentPrompt(text)]
+    let _proc
+    try { _proc = spawn(getClaudeExe(), args, { cwd: TAGGER_CWD, stdio: ['ignore', 'pipe', 'pipe'] }) }
+    catch { pendingSpawnCwds.delete(_cwdNorm); resolve(null); return }
+    let _sid = null, _text = '', _buf = ''
+    const _timeout = setTimeout(() => { try { _proc.kill() } catch {} }, 120_000)
+    _proc.stdout.on('data', c => {
+      _buf += c.toString()
+      const _lines = _buf.split('\n'); _buf = _lines.pop()
+      for (const l of _lines) {
+        try {
+          const ev = JSON.parse(l)
+          if (ev.type === 'system' && ev.subtype === 'init') { _sid = ev.session_id; subprocessSids.add(_sid) }
+          if (ev.type === 'result' && typeof ev.result === 'string') _text = ev.result
+        } catch {}
+      }
+    })
+    _proc.on('close', () => {
+      clearTimeout(_timeout)
+      pendingSpawnCwds.delete(_cwdNorm)
+      // 轉譯器自己的 transcript 不留（否則 History 長出轉譯器聊天室）
+      if (_sid) { try { const _fp = findJsonlPath(_sid); if (_fp) fs.unlinkSync(_fp) } catch {} }
+      resolve(parsePresentResult(_text))
+    })
+  })
+}
+
+/** 讀 jsonl 快取：同 msgHash 最後一行（ver 不符視同 miss → 自動重譯） */
+function findAiPresentPayload(sessionId, msgHash) {
+  const _fp = findJsonlPath(sessionId)
+  if (!_fp) return null
+  try {
+    const _lines = fs.readFileSync(_fp, 'utf8').split('\n')
+    for (let i = _lines.length - 1; i >= 0; i--) {
+      if (!_lines[i].includes('"ai-present"')) continue
+      try {
+        const _o = JSON.parse(_lines[i])
+        if (_o.type === 'ai-present' && _o.msgHash === msgHash && _o.ver === PRESENT_PIPELINE_VER) return _o.payload
+      } catch {}
+    }
+  } catch {}
+  return null
+}
+
+app.post('/api/present', async (request) => {
+  const { sessionId, text, force } = request.body ?? {}
+  if (!text || !String(text).trim()) return { ok: false, error: 'missing text' }
+  const _hash = msgHashOf(text)
+  if (!force) {
+    const _mem = presentCache.get(_hash)
+    if (_mem) return { ok: true, cached: true, msgHash: _hash, payload: _mem.payload }
+    if (sessionId) {
+      const _disk = findAiPresentPayload(sessionId, _hash)
+      if (_disk) { presentCache.set(_hash, { payload: _disk, ts: Date.now() }); return { ok: true, cached: true, msgHash: _hash, payload: _disk } }
+    }
+  }
+  const _cfg = readPresentConfig()
+  const _payload = await spawnPresentLLM(String(text), _cfg.model)
+  if (!_payload) return { ok: false, error: 'transform failed' }
+  presentCache.set(_hash, { payload: _payload, ts: Date.now() })
+  if (sessionId) appendTranscriptLine(sessionId, { type: 'ai-present', msgHash: _hash, ver: PRESENT_PIPELINE_VER, payload: _payload, ts: Date.now() })
+  logEvent('present.transformed', { sessionId: sessionId ?? null, msgHash: _hash, model: _cfg.model ?? null, cached: false })
+  return { ok: true, cached: false, msgHash: _hash, payload: _payload }
+})
+
+app.post('/api/present/feedback', async (request) => {
+  const { sessionId, msgHash, reaction, tags } = request.body ?? {}
+  if (!reaction && !(tags?.length)) return { ok: false }
+  try { fs.appendFileSync(PRESENT_FEEDBACK_FILE, JSON.stringify({ ts: Date.now(), sessionId: sessionId ?? null, msgHash: msgHash ?? null, reaction: reaction ?? null, tags: tags ?? [] }) + '\n', 'utf8') } catch {}
+  return { ok: true }
 })
 
 // ─── 高桌會（The High Table — 分館/專案認可管理）────────────────────────────
@@ -3734,7 +4265,7 @@ function markWakeUndelivered(sessionId) {
   } catch (e) { logEvent('qa.wake.undelivered.error', { sessionId, error: String(e?.message ?? e) }) }
 }
 
-const QA_WAKE_ACTIONS = { 'start-now': '按了「▶ 立即開跑」→ 請進入階段二（埋 LOG + 雙編譯 + 重啟 Editor）', pause: '要求暫停', resume: '要求繼續', abort: '要求中止', comment: '留言', close: '按了「✔ 結案」→ 階段五（清 QAC LOG + 雙編譯 + 重啟 Editor；無頭啟動 Editor 用 Start-Process detached）＋維護侍酒師閉環：把本 run 需求「實作驗證後的收斂」沉澱回四種血肉（C++ code / 架構 canvas / 拼圖 memory；藍圖 md 暫跳過），Editor 開著時跑 extract_asset_graph.py 更新藍圖資產層，最後 POST /api/sommelier/refresh/roman 重萃取讓侍酒師吃到最新拼圖' }
+const QA_WAKE_ACTIONS = { 'start-now': '按了「▶ 立即開跑」→ 請進入階段二（埋 LOG + 雙編譯 + 重啟 Editor）', pause: '要求暫停', resume: '要求繼續', abort: '要求中止', comment: '留言', close: '按了「✔ 結案」→ 階段五（清 QAC LOG + 雙編譯 + 重啟 Editor；無頭啟動 Editor 用 Start-Process detached）＋維護侍酒師閉環：把本 run 需求「實作驗證後的收斂」沉澱回四種血肉（C++ code / 架構 canvas / 拼圖 memory；藍圖 md 暫跳過），Editor 開著時跑 extract_asset_graph.py 更新藍圖資產層，最後 POST /api/sommelier/refresh/roman 重萃取讓侍酒師吃到最新拼圖＋設計思路模板維護（增量）：分析本 run「需求原話→設計決策/取捨→驗證結果」軌跡，萃取少爺這輪怎麼設計體驗，增量併入 .agent/knowledge/Roman_DesignThinking_Templates.md（基線 2026-07-31 全量、此後僅以 run 為單位增量），有更新列入 knowledgeUpdated 回寫' }
 function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, effort = null, wakeVisible = false) {
   try {
     // monitor 模式＝該 session 自掛監看，不可 spawn（雙寫 transcript）；其餘一律喚醒。
