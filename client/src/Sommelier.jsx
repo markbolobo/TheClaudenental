@@ -793,9 +793,11 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
     if (!(await confirmIfLiveInteractive(sessionId, '送入'))) { setShowSendMenu(false); return }
     setShowSendMenu(false)
     const _path = projectPath ?? 'C:/Project/RomanPrototype'
+    // 少爺 2026-08-06：sessionId=null 只來自「開新聊天室」鈕 → 帶明示 newSession 旗標，
+    // server 忙碌排隊時才不會 fallback 併進 running 中的既有聊天室
     const r = await fetch('/api/claude/run', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ projectPath: _path, prompt: composed, sessionId: sessionId ?? null, attachments, model: sendModel || null, effort: sendEffort || null, qaFlow }),
+      body: JSON.stringify({ projectPath: _path, prompt: composed, sessionId: sessionId ?? null, newSession: !sessionId, attachments, model: sendModel || null, effort: sendEffort || null, qaFlow }),
     }).then(r => r.json()).catch(() => ({ ok: false }))
     if (!r.ok) { flash('送入失敗 — 請改用複製', 6000); return }
     // 少爺 2026-07-07：送入/開新聊天室＝侍酒師工作完成 → 清空購物車與描述(+附檔) + 無接縫導到 Chat（同 History Continue）
@@ -807,7 +809,10 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
     // ⚠️ onGoToChat 會切分頁 unmount Sommelier，[cart,draft] 持久化 effect 可能來不及跑 → 直接同步清 localStorage，
     // 避免 remount 時 draft 從舊值 re-hydrate（少爺 2026-07-08：cart 清了 draft 沒清的不對稱 bug 根因）
     try { localStorage.setItem(CART_STORE_KEY, JSON.stringify({ items: [], draft: '' })) } catch {}
-    flash(r.queued ? `📨 已排入佇列（第 ${r.queuePos} 位）— 已切到 Chat` : '📨 已送入 — 已切到 Chat', 4000)
+    flash(r.queued
+      ? (sessionId ? `📨 已排入佇列（第 ${r.queuePos} 位）— 已切到 Chat`
+                   : `📨 已排入佇列（第 ${r.queuePos} 位）— 前一任務完成後將開「新」聊天室`)
+      : '📨 已送入 — 已切到 Chat', 5000)
     onGoToChat?.({ sessionId: sessionId ?? r.sessionId ?? null, projectPath: _path })
   }
 

@@ -1709,7 +1709,8 @@ function processQueueIfIdle(projectPath) {
   const next = q.shift()
   if (q.length === 0) claudeRunQueue.delete(projectPath)
   // 用佇列裡的 sessionId（同 session 接續）；若空則用最後一個 entry 的
-  const sid = next.sessionId ?? existing?.sessionId ?? null
+  // 少爺 2026-08-06：newSession（仕酒師「開新聊天室」）明示要全新 session——不沿用前一個 entry 的 sessionId
+  const sid = next.newSession ? null : (next.sessionId ?? existing?.sessionId ?? null)
   broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath),
     event: { type: 'system', subtype: 'queue_dequeue', queueRemaining: q.length } })
   spawnClaude(projectPath, next.prompt, sid, next.model ?? null, next.effort ?? null, next.onInit ?? null)
@@ -1862,7 +1863,7 @@ function saveAttachmentFiles(attachments) {
 }
 
 app.post('/api/claude/run', async (request) => {
-  const { projectPath: rawPath, prompt, sessionId, attachments, model, effort, qaFlow } = request.body
+  const { projectPath: rawPath, prompt, sessionId, attachments, model, effort, qaFlow, newSession } = request.body
   if (!prompt && !(attachments?.length)) return { ok: false, error: 'missing prompt' }
   const projectPath = rawPath?.replace(/\//g, path.sep) // normalize to OS path sep
   if (!isSafeCwd(projectPath)) return { ok: false, error: 'invalid projectPath' }
@@ -1883,16 +1884,20 @@ app.post('/api/claude/run', async (request) => {
   if (qaFlow === true) fullPrompt += QA_FLOW_DIRECTIVE
 
   // 思考中（同 projectPath 已有 running process）→ push 到 queue，不 kill 上一個
+  // 少爺 2026-08-06：newSession=true（仕酒師「開新聊天室」）＝明示開全新聊天室——排隊時不得 fallback 沿用
+  // running 進程的 sessionId（否則新需求被併進忙碌中的既有聊天室；sessionId=null 的 fallback 只服務
+  // 「同聊天室接續但 client 尚未拿到 session id」的 ChatPanel 情境）
+  const _newSession = newSession === true
   const existing = claudeProcs.get(projectPath)
   if (existing?.status === 'running') {
     let q = claudeRunQueue.get(projectPath)
     if (!q) { q = []; claudeRunQueue.set(projectPath, q) }
-    q.push({ prompt: fullPrompt, sessionId: sessionId ?? existing.sessionId ?? null, model: _model, effort: _effort })
+    q.push({ prompt: fullPrompt, sessionId: _newSession ? null : (sessionId ?? existing.sessionId ?? null), newSession: _newSession, model: _model, effort: _effort })
     broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath),
-      event: { type: 'system', subtype: 'queue_enqueue', queuePos: q.length } })
+      event: { type: 'system', subtype: 'queue_enqueue', queuePos: q.length, newSession: _newSession } })
     return { ok: true, queued: true, queuePos: q.length }
   }
-  const entry = spawnClaude(projectPath, fullPrompt, sessionId ?? null, _model, _effort)
+  const entry = spawnClaude(projectPath, fullPrompt, _newSession ? null : (sessionId ?? null), _model, _effort)
 
   // Clean up temp files after subprocess closes
   if (tempFiles.length) {
@@ -3673,7 +3678,10 @@ app.post('/api/project/open', async (request) => {
       if (!_file) return { ok: false, error: `根目錄找不到 *${_ext}：${_root}` }
       const _full = path.join(_root, _file)
       // .code-workspace 沒有檔案關聯 → cmd start 開不起來，必用 VS Code CLI；.uproject 有 UE 關聯 → start 開
-      if (target === 'workspace') spawn('code', [_full], { detached: true, stdio: 'ignore', shell: true }).unref()
+      // ⚠️ 必用 'code.cmd' 不可用裸 'code'：PATH 裡 VS Code 根目錄（含 Code.exe）排在 \bin 前、PATHEXT 又 .EXE 優先 .CMD
+      // → 裸 code 會解析到 GUI 的 Code.exe；本進程繼承 ELECTRON_RUN_AS_NODE=1 使 Code.exe 以 node 模式把 workspace 當腳本跑而閃退。
+      // code.cmd 是官方 CLI wrapper，內部走 cli.js 正確處理 node 模式並開 workspace。（少爺 2026-08-06 修）
+      if (target === 'workspace') spawn('code.cmd', [_full], { detached: true, stdio: 'ignore', shell: true }).unref()
       else spawn('cmd', ['/c', 'start', '', _full], { detached: true, stdio: 'ignore' }).unref()
       return { ok: true, opened: _full }
     }
