@@ -3408,6 +3408,15 @@ function parsePackageLine(line) {
   else if (/^\[Package\] RunUAT start/.test(_t)) { packageJob.phase = 'cooking'; _force = true }
   else if (/^\[Package\] Archiving/.test(_t)) { packageJob.phase = 'archiving'; packageJob.cook = null; _force = true }
 
+  // UAT 階段 banner（腳本 2026-08-07 改逐行串流後才 tail 得到；比 RunUAT start 的粗階段更細）
+  // 'cooking'（RunUAT start）保留當 fallback：banner 沒出現時仍有粗階段可顯示
+  const _uat = _t.match(/^\*{5,} (BUILD|COOK|STAGE|PACKAGE|ARCHIVE) COMMAND STARTED/)
+  if (_uat) {
+    packageJob.phase = `uat_${_uat[1].toLowerCase()}`
+    if (_uat[1] !== 'COOK') packageJob.cook = null
+    _force = true
+  }
+
   const _done = _t.match(/^\[Package\] (\w+) DONE in (\d+) min/)
   if (_done) {
     packageJob.results.push({ target: _done[1], status: 'ok', minutes: Number(_done[2]) })

@@ -432,7 +432,9 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
                 <span className="font-mono">{pkgJob.config}{pkgJob.suffix}</span>
                 {pkgJob.currentTarget && <span className="text-[var(--gold)]">▶ {pkgJob.currentTarget}</span>}
                 {pkgJob.phase && pkgJob.phase !== 'idle' && (
-                  <span>{{ starting: '準備中', cooking: 'Cook / Build 中', archiving: '壓縮中' }[pkgJob.phase] ?? pkgJob.phase}</span>
+                  <span>{{ starting: '準備中', cooking: 'Cook / Build 中',
+                    uat_build: '編譯中', uat_cook: 'Cook 中', uat_stage: 'Stage 中', uat_package: 'Pak 中', uat_archive: 'Archive 中',
+                    archiving: '壓縮中' }[pkgJob.phase] ?? pkgJob.phase}</span>
                 )}
                 {pkgJob.cook?.percent !== null && pkgJob.cook?.percent !== undefined && (
                   <span className="font-mono">cook {pkgJob.cook.percent}%（剩 {pkgJob.cook.remain}）</span>
