@@ -36,7 +36,9 @@ function StatusBadge({ status }) {
 
 export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, projects = [], activeProjectId = null, onSelectProject = null, onManageProjects = null }) {
   const [runs, setRuns] = useState([])
-  const [selectedRunId, setSelectedRunId] = useState(null)
+  // 少爺 2026-08-07：記住最後的選擇操作（記憶在 localStorage）——切工具列分頁回來，未選擇就保持未選擇、有選就還原選的那筆
+  const [selectedRunId, setSelectedRunId] = useState(() => localStorage.getItem('tc_qa_selected_run') || null)
+  useEffect(() => { try { localStorage.setItem('tc_qa_selected_run', selectedRunId ?? '') } catch {} }, [selectedRunId])
   // 跨專案：run 未帶 project 欄位者為早期羅馬 run → 視為 'roman'（QA 綁專案；下拉選單與仕酒師共用 active 專案）
   const runMatchesProject = useCallback(
     (r) => !activeProjectId || (r.project ?? 'roman') === activeProjectId,
@@ -141,28 +143,19 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
     }).catch(() => {})
   }, [])
 
+  // 少爺 2026-08-07：進 QA 分頁不再預設自動選最新 run——選擇一律由少爺顯式動作（點 run／新宣告聚焦／會議室聯動）產生
   const reload = useCallback(() => {
     fetch('/api/qa/runs?limit=100').then(r => r.json()).then(d => {
-      const list = d.runs ?? []
-      setRuns(list)
-      // 預設選最新的「進行中」run；沒有就選最新一筆（只在當前專案範圍內選）
-      if (!selectedRunIdRef.current) {
-        const pool = list.filter(runMatchesProject)
-        const live = pool.find(r => ['announced', 'countdown', 'running', 'paused'].includes(r.status))
-        setSelectedRunId((live ?? pool[0])?.id ?? null)
-      }
+      setRuns(d.runs ?? [])
     }).catch(() => {})
-  }, [runMatchesProject])
+  }, [])
 
   useEffect(() => { reload() }, [reload])
 
-  // 切專案：選中 run 不屬於新專案 → 改選該專案最新（進行中優先）
+  // 切專案：選中 run 不屬於新專案 → 清空選擇（少爺 2026-08-07：不自動改選最新，等少爺自己點）
   useEffect(() => {
     const cur = runs.find(r => r.id === selectedRunIdRef.current)
-    if (cur && runMatchesProject(cur)) return
-    const pool = runs.filter(r => !r.archivedAt && runMatchesProject(r))
-    const live = pool.find(r => ['announced', 'countdown', 'running', 'paused'].includes(r.status))
-    setSelectedRunId((live ?? pool[0])?.id ?? null)
+    if (cur && !runMatchesProject(cur)) setSelectedRunId(null)
   }, [activeProjectId])  // eslint-disable-line react-hooks/exhaustive-deps
 
   // ws 即時更新（App.jsx 轉發）+ 10s 輪詢保險
@@ -175,8 +168,7 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
         if (idx >= 0) { const next = [...prev]; next[idx] = run; return next }
         return [run, ...prev]
       })
-      // 新宣告的 run 自動聚焦（少爺打開視窗就是要看它）
-      setSelectedRunId(prev => prev ?? run.id)
+      // 新宣告的 run 自動聚焦（少爺打開視窗就是要看它）；一般更新不補位聚焦（少爺 2026-08-07：預設不自動選）
       if (['announced', 'countdown'].includes(run.status)) setSelectedRunId(run.id)
     }
     window.addEventListener('tc-qa-run-update', onUpdate)
@@ -264,8 +256,9 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
 
   return (
     <div className="flex h-full min-h-0">
-      {/* C 歷史區（左欄） */}
-      <aside className="w-52 shrink-0 border-r border-[var(--border)] bg-[var(--surface)] overflow-y-auto">
+      {/* C 歷史區（左欄）；少爺 2026-08-07：點空白處（run 清單以外的底）＝取消選擇，右側回到乾淨等待畫面 */}
+      <aside onClick={(e) => { if (e.target === e.currentTarget) setSelectedRunId(null) }}
+        className="w-52 shrink-0 border-r border-[var(--border)] bg-[var(--surface)] overflow-y-auto">
         <div className="px-3 py-2 text-[10px] uppercase tracking-widest text-[var(--text-muted)] border-b border-[var(--border)]">
           {/* 跨專案下拉選單：與仕酒師共用 active 專案，任一邊切換兩邊受惠；🏛 = 高桌會分館認可管理 */}
           <div className="flex items-center gap-1 mb-1">
@@ -311,7 +304,8 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
           )}
         </div>
         {_visibleRuns.length === 0 && (
-          <div className="px-3 py-4 text-[10px] text-[var(--text-muted)] text-center">
+          <div onClick={() => setSelectedRunId(null)}
+            className="px-3 py-4 text-[10px] text-[var(--text-muted)] text-center">
             {_projectRuns.length === 0 ? '尚無 QA run' : '無符合篩選的 run'}
           </div>
         )}
