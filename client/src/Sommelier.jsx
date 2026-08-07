@@ -776,8 +776,8 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
   useEffect(() => { try { localStorage.setItem('tc_sommelier_model', sendModel) } catch {} }, [sendModel])
   const [sendEffort, setSendEffort] = useState(() => localStorage.getItem('tc_sommelier_effort') ?? '')
   useEffect(() => { try { localStorage.setItem('tc_sommelier_effort', sendEffort) } catch {} }, [sendEffort])
-  // 少爺 2026-07-14：本次需求是否啟用 QA 流程（一次性勾選——送出後自動關）
-  const [qaFlow, setQaFlow] = useState(false)
+  // 少爺 2026-07-14：本次需求是否啟用 QA 流程；少爺 2026-08-07：預設勾選（送出後歸回預設）
+  const [qaFlow, setQaFlow] = useState(true)
   const openSendMenu = async () => {
     if (!cart.length && !draft.trim()) { flash('購物車是空的——先點選名詞或寫描述'); return }
     // 少爺 2026-07-06：要像 History 那樣列「全部」聊天室 → 改用 /api/history（掃全部 transcript、mtime 新到舊）
@@ -805,7 +805,7 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
     setDraft('')
     setAttachments([])
     setCartOpen(false)
-    setQaFlow(false)  // QA 流程勾選是一次性的——成功送出即歸位
+    setQaFlow(true)  // 成功送出即歸回預設（少爺 2026-08-07：預設勾選）
     // ⚠️ onGoToChat 會切分頁 unmount Sommelier，[cart,draft] 持久化 effect 可能來不及跑 → 直接同步清 localStorage，
     // 避免 remount 時 draft 從舊值 re-hydrate（少爺 2026-07-08：cart 清了 draft 沒清的不對稱 bug 根因）
     try { localStorage.setItem(CART_STORE_KEY, JSON.stringify({ items: [], draft: '' })) } catch {}
@@ -1161,9 +1161,10 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
             </div>
 
             <div className="shrink-0 p-3 border-t border-[var(--border)] space-y-2">
-              <button onClick={checkout}
-                className="w-full py-2 rounded border border-[var(--gold)]/60 text-[var(--gold)] text-[11px] tracking-widest uppercase hover:bg-[var(--gold)]/10">
-                🧾 結帳 — 複製組合 Prompt
+              {/* 少爺 2026-08-07：「開新聊天室」與「結帳」互換位置——最常用的開新聊天室升頂部大按鈕，結帳退到底排 */}
+              <button onClick={() => sendToChat(null, null)}
+                className="w-full py-2 rounded border border-green-500/50 text-green-400 text-[11px] tracking-widest uppercase hover:bg-green-500/10">
+                ➕ 開新聊天室
               </button>
               {/* 結帳出口 2/3（少爺 2026-07-06）：送入聊天室 / 開新聊天室；2026-07-14 加 AI 模型/強度選擇 + QA 流程勾選 */}
               <div className="flex items-center gap-1.5">
@@ -1186,9 +1187,9 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
                   className="flex-1 py-1.5 rounded border border-blue-500/50 text-blue-400 text-[10px] tracking-widest uppercase hover:bg-blue-500/10">
                   📨 送入聊天室…
                 </button>
-                <button onClick={() => sendToChat(null, null)}
-                  className="flex-1 py-1.5 rounded border border-green-500/50 text-green-400 text-[10px] tracking-widest uppercase hover:bg-green-500/10">
-                  ➕ 開新聊天室
+                <button onClick={checkout}
+                  className="flex-1 py-1.5 rounded border border-[var(--gold)]/60 text-[var(--gold)] text-[10px] tracking-widest uppercase hover:bg-[var(--gold)]/10">
+                  🧾 結帳 — 複製組合 Prompt
                 </button>
               </div>
               {showSendMenu && (
