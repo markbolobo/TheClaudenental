@@ -47,6 +47,28 @@ body {
   flex-direction: column;
 }
 
+/* ── 下拉選單（少爺 2026-08-14）：原生 option 清單預設是系統淺灰，與整個介面的暗色不合 ──
+   全域一次改掉（不逐個元件補 class）：select 本體用 surface、展開的 option 清單用 surface-2。
+   color-scheme: dark 是關鍵——Windows Chromium 的 select 彈出層跟著它走，只設 background 仍會留白邊。 */
+select {
+  color-scheme: dark;
+  background-color: var(--surface);
+  color: var(--text);
+}
+
+select option {
+  background-color: var(--surface-2);
+  color: var(--text);
+}
+
+select option:checked,
+select option:hover {
+  background-color: var(--gold-dim);
+  color: var(--text-h);
+}
+
+select option:disabled { color: var(--text-muted); }
+
 /* ── Scrollbar ── */
 ::-webkit-scrollbar { width: 4px; height: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }

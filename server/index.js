@@ -3753,10 +3753,184 @@ app.get('/api/project/health/:projectId', async (request) => {
   }
 })
 
-// ─── 酒窖（Cellar）工具箱（少爺 2026-08-06）：純 launcher——一律 execute 點擊即跑 ──
+// ─── 版控 Commit（少爺 2026-08-14）：手動 commit 面板，固定流程參數化 ────────────
+// 規則 SSOT＝sommelier.json 的 projects[].git（staging / lang / coAuthor）；執行 SSOT＝Invoke-ProjectCommit.ps1。
+// TC 面板與 Claude CLI 共用同一支腳本＝規則只有一份，Claude 不必每次重讀 commit 紀律再手跑 git（少爺的省 token 目的）。
+// 分工：Claude POST /api/git/draft 把訊息草稿推上面板 → 少爺看過／改過 → 面板 POST /api/git/commit 才真的提交。
+const PROJECT_COMMIT_SCRIPT = 'C:\\Project\\MasterBrain\\.agent\\scripts\\Invoke-ProjectCommit.ps1'
+const GIT_DRAFTS_FILE = path.join(USER_CONFIG_DIR, 'git_drafts.json')
+
+function readGitDrafts() {
+  try { return JSON.parse(fs.readFileSync(GIT_DRAFTS_FILE, 'utf8')) } catch { return {} }
+}
+
+function writeGitDrafts(drafts) {
+  atomicWriteJson(GIT_DRAFTS_FILE, drafts)
+  broadcast({ type: 'git_draft_update', drafts })
+}
+
+function gitRepoRoot(proj) {
+  return proj?.git?.repoRoot || proj?.projectRoot || proj?.projectPath || null
+}
+
+// 只認有 git 規則的專案；不看 enabled——TC 自身這種「要 commit 但不是侍酒師分館」的 repo 也要能列
+function findGitProject(projectId) {
+  const _cfg = readSommelierConfig()
+  return (_cfg.projects ?? []).find(p => p.id === projectId && p.git) ?? null
+}
+
+function gitProjectPolicy(proj) {
+  return {
+    staging: proj.git.staging ?? 'none',
+    lang: proj.git.lang ?? 'en',
+    coAuthor: proj.git.coAuthor !== false,
+    allowStageOverride: proj.git.allowStageOverride === true,
+  }
+}
+
+app.get('/api/git/projects', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const _cfg = readSommelierConfig()
+  const _projects = (_cfg.projects ?? []).filter(p => p.git).map(p => {
+    const _root = gitRepoRoot(p)
+    return {
+      id: p.id, name: p.name ?? p.id, repoRoot: _root,
+      exists: !!_root && fs.existsSync(path.join(_root, '.git')),
+      ...gitProjectPolicy(p),
+    }
+  })
+  return { ok: true, projects: _projects, drafts: readGitDrafts() }
+})
+
+// 面板現況：分支＋三類檔案清單（staged／已改未 staged／未追蹤）＋最後一筆 commit
+app.get('/api/git/status', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const _proj = findGitProject(request.query.projectId)
+  if (!_proj) return { ok: false, error: `專案「${request.query.projectId}」未設 git 規則` }
+  const _root = gitRepoRoot(_proj)
+  if (!_root || !fs.existsSync(path.join(_root, '.git'))) return { ok: false, error: `不是 git repo：${_root}` }
+  const _gitRaw = (args) => {
+    const r = spawnSync('git', ['-C', _root, ...args], { encoding: 'utf-8' })
+    return r.status === 0 ? (r.stdout ?? '') : ''
+  }
+  const _git = (args) => _gitRaw(args).trim()
+  // porcelain v1：XY <path>，X=index 狀態、Y=工作區狀態、?? =未追蹤
+  // ⚠️ 這裡不能對整段輸出 trim：未 staged 的行開頭就是空白（" M path"），trim 掉第一行的空白會讓整行位移一格
+  const _staged = [], _unstaged = [], _untracked = []
+  for (const _line of _gitRaw(['status', '--porcelain']).split(/\r?\n/)) {
+    if (!_line.trim()) continue
+    const _x = _line[0], _y = _line[1], _file = _line.slice(3).trim()
+    if (_x === '?') { _untracked.push(_file); continue }
+    if (_x !== ' ') _staged.push({ file: _file, code: _x })
+    if (_y !== ' ') _unstaged.push({ file: _file, code: _y })
+  }
+  return {
+    ok: true,
+    projectId: _proj.id, repoRoot: _root, ...gitProjectPolicy(_proj),
+    // --show-current 在 unborn branch 也答得出來；空字串時退回 rev-parse（detached HEAD 之類）
+    branch: _git(['branch', '--show-current']) || _git(['rev-parse', '--abbrev-ref', 'HEAD']),
+    lastCommit: _git(['log', '-1', '--format=%h %s']),
+    staged: _staged, unstaged: _unstaged, untracked: _untracked,
+  }
+})
+
+// 草稿（Claude → 面板）：message 照專案規則的語言寫，messageZh 是給少爺看的繁中對照（不寫進 commit）
+app.post('/api/git/draft', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const { projectId, message, messageZh, stage, paths, note } = request.body ?? {}
+  if (!findGitProject(projectId)) return { ok: false, error: `專案「${projectId}」未設 git 規則` }
+  if (typeof message !== 'string' || !message.trim()) return { ok: false, error: 'message 不可空白' }
+  const _drafts = readGitDrafts()
+  _drafts[projectId] = {
+    message: message.trim(),
+    messageZh: typeof messageZh === 'string' ? messageZh.trim() : '',
+    stage: ['none', 'all', 'paths'].includes(stage) ? stage : null,
+    paths: Array.isArray(paths) ? paths : [],
+    note: typeof note === 'string' ? note : '',
+    at: Date.now(),
+  }
+  writeGitDrafts(_drafts)
+  logEvent('git.draft', { projectId, stage: _drafts[projectId].stage })
+  return { ok: true, draft: _drafts[projectId] }
+})
+
+app.delete('/api/git/draft/:projectId', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const _drafts = readGitDrafts()
+  delete _drafts[request.params.projectId]
+  writeGitDrafts(_drafts)
+  return { ok: true }
+})
+
+// 真的提交：一律走 Invoke-ProjectCommit.ps1（規則檢查、staging、Co-Author 都在腳本裡，server 不重複一套）
+app.post('/api/git/commit', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const { projectId, message, stage, paths, noCoAuthor, dryRun } = request.body ?? {}
+  const _proj = findGitProject(projectId)
+  if (!_proj) return { ok: false, error: `專案「${projectId}」未設 git 規則` }
+  if (typeof message !== 'string' || !message.trim()) return { ok: false, error: 'commit 訊息不可空白' }
+
+  // 訊息與檔案清單都走暫存檔：命令列傳多行中文會被殼層咬掉、檔名含空白/逗號也不會被拆錯
+  const _stamp = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+  const _msgFile = path.join(os.tmpdir(), `tc_commit_msg_${_stamp}.txt`)
+  const _pathsFile = path.join(os.tmpdir(), `tc_commit_paths_${_stamp}.json`)
+  const _args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', PROJECT_COMMIT_SCRIPT,
+    '-Project', projectId, '-MessageFile', _msgFile]
+  if (['none', 'all', 'paths'].includes(stage)) _args.push('-Stage', stage)
+  if (Array.isArray(paths) && paths.length) _args.push('-PathsFile', _pathsFile)
+  if (noCoAuthor) _args.push('-NoCoAuthor')
+  if (dryRun) _args.push('-DryRun')
+
+  let _result
+  try {
+    fs.writeFileSync(_msgFile, message.trim(), 'utf8')
+    if (Array.isArray(paths) && paths.length) fs.writeFileSync(_pathsFile, JSON.stringify(paths), 'utf8')
+    const _r = spawnSync('powershell.exe', _args, { encoding: 'utf-8', cwd: gitRepoRoot(_proj) })
+    const _lines = (_r.stdout ?? '').split(/\r?\n/).filter(l => l.trim())
+    try { _result = JSON.parse(_lines[_lines.length - 1] ?? '') } catch {
+      _result = { ok: false, error: `腳本輸出無法解析：${(_r.stdout ?? '').trim() || (_r.stderr ?? '').trim() || '無輸出'}` }
+    }
+  } catch (e) {
+    _result = { ok: false, error: e.message }
+  } finally {
+    try { fs.unlinkSync(_msgFile) } catch {}
+    try { fs.unlinkSync(_pathsFile) } catch {}
+  }
+
+  if (_result.ok && !dryRun) {
+    const _drafts = readGitDrafts()
+    delete _drafts[projectId]          // 提交完的草稿留著只會下次誤送
+    writeGitDrafts(_drafts)
+  }
+  logEvent('git.commit', { projectId, ok: !!_result.ok, hash: _result.hash ?? null, dryRun: !!dryRun })
+  return _result
+})
+
+// ─── 酒窖（Cellar）工具箱（少爺 2026-08-06）：純 launcher——點擊即跑 ────────────
 // 工具介面歸工具自己（如 UE_AnimToolkit 的 UE 內 GUI），酒窖只負責啟動。
 // 未來加工具：CELLAR_TOOLS push 一筆即現身（exec 未接上前點擊回「開發中」提示）。
+// kind：execute＝spawn 外部程式／claude＝喚一個 Claude 子進程跑固定 prompt（少爺 2026-08-14）
+const TC_COMMIT_PROMPT = [
+  `(TC 酒窖「TC Commit」一鍵提交) 請把 TheClaudenental 目前的變更提交掉。全程不要問我、不要 push。`,
+  ``,
+  `1. 先看清楚改了什麼：git -C C:\\Project\\TheClaudenental status --short 與 git -C C:\\Project\\TheClaudenental diff`,
+  `   （完全沒有變更就回報「無變更」並結束，不要硬擠一個 commit）`,
+  `2. 寫繁體中文 commit message：subject＝「type(scope)：事實短句」；body＝flat bullet 列「哪個檔／模組改了什麼」，`,
+  `   簡潔事實、不解釋因果（不寫 Why/How）、不巢狀 sub-bullet`,
+  `3. 訊息寫成 UTF-8 檔後執行（staging／語言／Co-Authored-By 都由腳本處理，不要自己跑 git add / git commit）：`,
+  `   powershell -NoProfile -ExecutionPolicy Bypass -File "C:\\Project\\MasterBrain\\.agent\\scripts\\Invoke-ProjectCommit.ps1" -Project tc -MessageFile <訊息檔>`,
+  `4. 腳本回單行 JSON：ok=false 就照 error 修正後重試一次，仍失敗就回報錯誤原文`,
+  `5. 最後回報 hash ＋完整 message ＋標明「未 push」`,
+  ``,
+  `規則細節：C:\\Project\\MasterBrain\\.agent\\workflows\\ProjectCommit_SOP.md（TC＝全 staged、繁中 message、自動補 Co-Author）`,
+].join('\n')
+
 const CELLAR_TOOLS = [
+  {
+    id: 'tc-commit', name: 'TC Commit（一鍵提交）', kind: 'claude',
+    desc: '喚 Claude 讀 TC 變更、照繁中規則寫訊息並直接提交（不 push）',
+    claude: { cwd: 'C:\\Project\\TheClaudenental', model: 'sonnet', effort: 'low', prompt: TC_COMMIT_PROMPT },
+  },
   {
     id: 'cooldown-timer', name: 'Claude 冷卻鬧鐘', kind: 'execute',
     desc: '到冷卻時間自動點擊繼續（AutoClicker）',
@@ -3772,6 +3946,16 @@ app.get('/api/tools', async () => ({ ok: true, tools: CELLAR_TOOLS.map(t => ({ i
 app.post('/api/tools/run/:id', async (request) => {
   const _t = CELLAR_TOOLS.find(t => t.id === request.params.id)
   if (!_t) return { ok: false, error: '未知工具' }
+  // 喚 Claude 型：跑固定 prompt 的子進程（打包失敗自動分析同一套做法）
+  if (_t.kind === 'claude') {
+    const _c = _t.claude ?? {}
+    if (!isSafeCwd(_c.cwd)) return { ok: false, error: `工作目錄不存在：${_c.cwd}` }
+    // 同一 cwd 已有 Claude 在跑就不搶（spawnClaude 不 kill 既有進程，硬送會踩到少爺正在進行的對話）
+    if (claudeProcs.get(_c.cwd)?.status === 'running') return { ok: false, error: `「${_t.name}」：該專案已有 Claude 進程執行中，等它跑完再按` }
+    spawnClaude(_c.cwd, _c.prompt, null, _c.model ?? null, _c.effort ?? null)
+    logEvent('cellar.claude.spawn', { id: _t.id, cwd: _c.cwd, model: _c.model ?? null, effort: _c.effort ?? null })
+    return { ok: true, ran: `${_t.name}（已喚起 Claude，完成後看版控狀態或聊天室）` }
+  }
   if (_t.kind !== 'execute') return { ok: false, error: '此工具非執行型（execute）' }
   if (!_t.exec) return { ok: false, error: `「${_t.name}」尚未接上啟動指令（UE 內 GUI 開發中）` }
   try {
@@ -4127,9 +4311,26 @@ app.patch('/api/projects/registry/:id', async (request, reply) => {
   const body = request.body ?? {}
   if (typeof body.enabled === 'boolean') proj.enabled = body.enabled
   if (typeof body.name === 'string' && body.name.trim()) proj.name = body.name.trim()
+  // commit 規則（少爺 2026-08-14）：從 TC 直接改，不必手改 sommelier.json。
+  // git:null＝撤掉規則（該專案的版控區塊即停用）；欄位逐一驗，沒帶的欄位保留原值。
+  if (body.git === null) delete proj.git
+  else if (body.git && typeof body.git === 'object') {
+    const _g = { ...(proj.git ?? {}) }
+    if (['none', 'all', 'paths'].includes(body.git.staging)) _g.staging = body.git.staging
+    if (['en', 'zh-TW'].includes(body.git.lang)) _g.lang = body.git.lang
+    if (typeof body.git.coAuthor === 'boolean') _g.coAuthor = body.git.coAuthor
+    if (typeof body.git.allowStageOverride === 'boolean') _g.allowStageOverride = body.git.allowStageOverride
+    if (typeof body.git.repoRoot === 'string') {
+      if (body.git.repoRoot.trim()) _g.repoRoot = body.git.repoRoot.trim()
+      else delete _g.repoRoot            // 清空＝回去用 projectRoot / projectPath
+    }
+    _g.staging ??= 'none'                // 新建規則的預設＝最保守：不代為 staged
+    _g.lang ??= 'en'
+    proj.git = _g
+  }
   atomicWriteJson(SOMMELIER_CONFIG_FILE, cfg)
-  logEvent('projects.registry.update', { id: proj.id, enabled: proj.enabled !== false })
-  return { ok: true }
+  logEvent('projects.registry.update', { id: proj.id, enabled: proj.enabled !== false, git: proj.git ?? null })
+  return { ok: true, git: proj.git ?? null }
 })
 
 app.get('/api/sommelier/data/:projectId', async (request, reply) => {

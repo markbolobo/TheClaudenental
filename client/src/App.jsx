@@ -2090,6 +2090,10 @@ export default function App() {
     if (msg.type === 'package_update') {
       try { window.dispatchEvent(new CustomEvent('tc-package-update', { detail: msg.job })) } catch {}
     }
+    // 版控草稿（少爺 2026-08-14）：Claude 推 commit 訊息草稿 → 轉發給 QAMonitorPanel 的版控區塊
+    if (msg.type === 'git_draft_update') {
+      try { window.dispatchEvent(new CustomEvent('tc-git-draft', { detail: msg.drafts })) } catch {}
+    }
     if (msg.type === 'session') {
       // Auto-watch when a session becomes active
       if (msg.session?.status === 'active') autoWatch(msg.session.id)

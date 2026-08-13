@@ -7,6 +7,8 @@ import { useState, useEffect } from 'react'
 
 const KIND_META = {
   execute: { icon: '▶', label: '點擊執行', cls: 'text-green-400 border-green-500/40' },
+  // 喚 Claude 型（少爺 2026-08-14）：點一下喚子進程跑固定流程，結果回聊天室／各自的面板
+  claude: { icon: '🤖', label: '喚 Claude', cls: 'text-[var(--gold)] border-[var(--gold)]/40' },
 }
 
 export default function CellarPanel({ onClose }) {

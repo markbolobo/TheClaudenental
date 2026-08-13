@@ -143,6 +143,104 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
     }).catch(() => {})
   }, [])
 
+  // ─── 版控 Commit（少爺 2026-08-14）：手動 commit——Claude 出草稿、這裡確認送出 ───
+  // 規則（staging／語言／Co-Author）SSOT 在 sommelier.json projects[].git，執行走 Invoke-ProjectCommit.ps1；
+  // 這個面板只負責「看清楚要提交什麼、確認、送出」，不自己複製一套規則。
+  const [gitCollapsed, setGitCollapsed] = useState(() => localStorage.getItem('tc_git_collapsed') !== '0')
+  useEffect(() => { try { localStorage.setItem('tc_git_collapsed', gitCollapsed ? '1' : '0') } catch {} }, [gitCollapsed])
+  // 專案不自己選：一律跟著高桌會切的 activeProjectId（少爺 2026-08-14）。
+  // TC 自身不進這裡——它走酒窖的「TC Commit」一鍵提交。
+  const [gitProjects, setGitProjects] = useState([])
+  const gitProjectId = activeProjectId ?? ''
+  const [gitStatus, setGitStatus] = useState(null)
+  const [gitMessage, setGitMessage] = useState('')
+  const [gitMessageZh, setGitMessageZh] = useState('')
+  const [gitPickedPaths, setGitPickedPaths] = useState([])   // staging=paths 時勾選的檔案
+  const [gitBusy, setGitBusy] = useState(false)
+  const [gitHint, setGitHint] = useState('')
+  const [gitDraftAt, setGitDraftAt] = useState(null)          // 有草稿＝Claude 推來的，標示給少爺看
+  const [gitRuleOpen, setGitRuleOpen] = useState(false)       // 規則編輯（⚙）展開中
+
+  const gitProject = gitProjects.find(p => p.id === gitProjectId) ?? null
+
+  // 草稿套進輸入框（切專案／Claude 推新草稿都走這裡；少爺已在打字時不覆蓋他的內容）
+  const applyGitDraft = useCallback((draft, force = false) => {
+    if (!draft) { if (force) { setGitMessage(''); setGitMessageZh(''); setGitDraftAt(null) } return }
+    setGitMessage(prev => (force || !prev.trim() ? draft.message ?? '' : prev))
+    setGitMessageZh(draft.messageZh ?? '')
+    setGitPickedPaths(Array.isArray(draft.paths) ? draft.paths : [])
+    setGitDraftAt(draft.at ?? null)
+  }, [])
+
+  const loadGitProjects = useCallback(async () => {
+    const _res = await fetch('/api/git/projects').then(r => r.json()).catch(() => ({ ok: false }))
+    if (!_res.ok) return
+    setGitProjects(_res.projects ?? [])
+    if (gitProjectId) applyGitDraft((_res.drafts ?? {})[gitProjectId], true)
+  }, [gitProjectId, applyGitDraft])
+
+  const loadGitStatus = useCallback(async (projectId) => {
+    if (!projectId) { setGitStatus(null); return }
+    const _res = await fetch(`/api/git/status?projectId=${encodeURIComponent(projectId)}`)
+      .then(r => r.json()).catch(e => ({ ok: false, error: e.message }))
+    setGitStatus(_res.ok ? _res : null)
+    setGitHint(_res.ok ? '' : '')      // 未設規則的專案不算錯誤，區塊自己會說明
+  }, [])
+
+  useEffect(() => { loadGitProjects() }, [loadGitProjects])
+  // 切專案＝換 repo：狀態重讀、輸入框清空（訊息屬於前一個 repo，留著只會誤送）
+  useEffect(() => {
+    setGitMessage(''); setGitMessageZh(''); setGitPickedPaths([]); setGitDraftAt(null); setGitHint('')
+    loadGitStatus(gitProjectId)
+  }, [gitProjectId, loadGitStatus])
+
+  // Claude 推草稿上來（ws）→ 若是當前專案就直接填進輸入框並展開區塊
+  useEffect(() => {
+    const onDraft = (e) => {
+      const _drafts = e.detail ?? {}
+      if (!gitProjectId) return
+      const _d = _drafts[gitProjectId]
+      applyGitDraft(_d ?? null, true)
+      if (_d) { setGitCollapsed(false); loadGitStatus(gitProjectId) }
+    }
+    window.addEventListener('tc-git-draft', onDraft)
+    return () => window.removeEventListener('tc-git-draft', onDraft)
+  }, [gitProjectId, applyGitDraft, loadGitStatus])
+
+  // 改該專案的 commit 規則（即改即存）：寫回 sommelier.json projects[].git——規則只有那一份 SSOT
+  const patchGitPolicy = useCallback(async (patch) => {
+    if (!gitProjectId) return
+    setGitBusy(true)
+    const _res = await fetch(`/api/projects/registry/${encodeURIComponent(gitProjectId)}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ git: patch }),
+    }).then(r => r.json()).catch(e => ({ ok: false, error: e.message }))
+    setGitBusy(false)
+    if (!_res.ok) { setGitHint(`⚠️ ${_res.error ?? '規則存檔失敗'}`); return }
+    setGitHint(patch === null ? '已撤掉這個專案的 commit 規則' : '✅ 規則已更新')
+    await loadGitProjects()
+    loadGitStatus(gitProjectId)
+  }, [gitProjectId, loadGitProjects, loadGitStatus])
+
+  const runCommit = useCallback(async (dryRun = false) => {
+    if (!gitProjectId || !gitMessage.trim()) { setGitHint('⚠️ 還沒有 commit 訊息'); return }
+    setGitBusy(true); setGitHint(dryRun ? '試跑中…' : '提交中…')
+    const _res = await fetch('/api/git/commit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        projectId: gitProjectId, message: gitMessage, dryRun,
+        stage: gitProject?.staging === 'paths' ? 'paths' : undefined,
+        paths: gitProject?.staging === 'paths' ? gitPickedPaths : undefined,
+      }),
+    }).then(r => r.json()).catch(e => ({ ok: false, error: e.message }))
+    setGitBusy(false)
+    if (!_res.ok) { setGitHint(`❌ ${_res.error ?? '提交失敗'}`); return }
+    if (dryRun) { setGitHint(`✅ 試跑通過：${_res.files?.length ?? 0} 個檔案會進 commit`); return }
+    setGitHint(`✅ ${_res.hash} · ${_res.subject}（${_res.files?.length ?? 0} 檔、未 push）`)
+    setGitMessage(''); setGitMessageZh(''); setGitPickedPaths([]); setGitDraftAt(null)
+    loadGitStatus(gitProjectId)
+  }, [gitProjectId, gitMessage, gitProject, gitPickedPaths, loadGitStatus])
+
   // 少爺 2026-08-07：進 QA 分頁不再預設自動選最新 run——選擇一律由少爺顯式動作（點 run／新宣告聚焦／會議室聯動）產生
   const reload = useCallback(() => {
     fetch('/api/qa/runs?limit=100').then(r => r.json()).then(d => {
@@ -474,6 +572,163 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
           )}
 
           {pkgHint && <div className="text-[10px] mt-1 text-[var(--text-muted)] font-mono truncate">{pkgHint}</div>}
+          </>)}
+        </div>
+
+        {/* ── 版控 Commit（少爺 2026-08-14）：Claude 出草稿、少爺確認送出；規則隨專案自動套用 ── */}
+        <div className="border-b border-[var(--border)] bg-[var(--surface)] px-3 py-2">
+          <button onClick={() => setGitCollapsed(v => !v)} title="折疊／展開版控"
+            className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] hover:text-[var(--gold)]">
+            {gitCollapsed ? '▸' : '▾'} 版控{gitDraftAt ? ' · 有 Claude 草稿' : ''}
+          </button>
+
+          {!gitCollapsed && (<>
+          <div className="flex items-center gap-2 flex-wrap mt-1.5">
+            {/* 專案跟著上方的專案切換走，這裡只顯示是哪一個 repo */}
+            <span className="text-[11px] text-[var(--text)]">{gitProject?.name ?? (gitProjectId || '未選專案')}</span>
+
+            {/* 規則徽章：這次會怎麼 staged、message 該用什麼語言——送出前一眼看到 */}
+            {gitProject && (<>
+              <span title="staging 規則（sommelier.json projects[].git.staging）"
+                className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)]">
+                {{ none: '只 commit 既有 staged', all: '全部 staged', paths: '挑檔 staged' }[gitProject.staging] ?? gitProject.staging}
+              </span>
+              <span title="commit message 語言規則"
+                className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)]">
+                {gitProject.lang === 'zh-TW' ? '繁中 message' : '英文 message'}
+              </span>
+              {gitProject.coAuthor && (
+                <span className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)]">Co-Author</span>
+              )}
+            </>)}
+
+            {gitStatus && (
+              <span className="text-[10px] text-[var(--text-muted)] font-mono">
+                ⎇ {gitStatus.branch || '—'} · staged {gitStatus.staged.length} / 未 staged {gitStatus.unstaged.length} / 未追蹤 {gitStatus.untracked.length}
+              </span>
+            )}
+
+            <div className="flex-1" />
+            <button onClick={() => setGitRuleOpen(v => !v)} title="設定這個專案的 commit 規則"
+              className={`text-[11px] px-2 py-1 ${gitRuleOpen ? 'text-[var(--gold)]' : 'text-[var(--text-muted)]'} hover:text-[var(--gold)]`}>⚙</button>
+            <button onClick={() => loadGitStatus(gitProjectId)} title="重新讀取 git 狀態"
+              className="text-[11px] px-2 py-1 text-[var(--text-muted)] hover:text-[var(--gold)]">↻</button>
+          </div>
+
+          {/* 沒設規則的專案：說明＋一鍵建規則，不用去手改 sommelier.json */}
+          {!gitProject && gitProjectId && !gitRuleOpen && (
+            <div className="text-[10px] text-[var(--text-muted)] mt-1.5">
+              這個專案還沒設 commit 規則——
+              <button onClick={() => setGitRuleOpen(true)} className="text-[var(--gold)] hover:underline">按這裡設定</button>
+              （或按上方 ⚙）
+            </div>
+          )}
+
+          {/* 規則編輯（即改即存）：寫回 sommelier.json projects[].git，腳本與面板共讀同一份 */}
+          {gitRuleOpen && gitProjectId && (
+            <div className="mt-1.5 border border-[var(--border)] rounded bg-black/20 p-2 space-y-2">
+              {!gitProject && (
+                <div className="text-[10px] text-amber-400">尚未建立規則——改動任一項即建立（未動到的欄位用上面顯示的預設值）</div>
+              )}
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-[10px] text-[var(--text-muted)] w-20 shrink-0">staging</span>
+                <select value={gitProject?.staging ?? 'none'} disabled={gitBusy}
+                  onChange={e => patchGitPolicy({ staging: e.target.value })}
+                  className="text-[11px] bg-black/30 border border-[var(--border)] rounded px-2 py-1 text-[var(--text)]">
+                  <option value="none">只 commit 既有 staged（我不幫你 staged）</option>
+                  <option value="all">全部 staged（提交前 git add -A）</option>
+                  <option value="paths">挑檔 staged（在清單勾選）</option>
+                </select>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-[10px] text-[var(--text-muted)] w-20 shrink-0">message 語言</span>
+                <select value={gitProject?.lang ?? 'en'} disabled={gitBusy}
+                  onChange={e => patchGitPolicy({ lang: e.target.value })}
+                  className="text-[11px] bg-black/30 border border-[var(--border)] rounded px-2 py-1 text-[var(--text)]">
+                  <option value="en">英文（Claude 回覆附繁中對照）</option>
+                  <option value="zh-TW">繁體中文</option>
+                </select>
+              </div>
+              <label className="flex items-center gap-2 text-[10px] text-[var(--text)] cursor-pointer">
+                <input type="checkbox" checked={gitProject?.coAuthor !== false} disabled={gitBusy}
+                  onChange={e => patchGitPolicy({ coAuthor: e.target.checked })} />
+                結尾自動補 Co-Authored-By
+              </label>
+              <label className="flex items-center gap-2 text-[10px] text-[var(--text)] cursor-pointer">
+                <input type="checkbox" checked={gitProject?.allowStageOverride === true} disabled={gitBusy}
+                  onChange={e => patchGitPolicy({ allowStageOverride: e.target.checked })} />
+                允許單次覆寫 staging 規則
+                <span className="text-[var(--text-muted)]">（勾了才擋不住「代你 staged」）</span>
+              </label>
+              <div className="flex items-center gap-2 pt-1 border-t border-[var(--border)]">
+                <span className="text-[9px] text-[var(--text-muted)] flex-1">存進 sommelier.json 的 projects[].git，腳本與面板共用</span>
+                {gitProject && (
+                  <button onClick={() => { if (confirm('撤掉這個專案的 commit 規則？版控區塊會停用。')) patchGitPolicy(null) }}
+                    className="text-[10px] px-2 py-0.5 rounded border border-red-500/40 text-red-400 hover:bg-red-500/10">撤掉規則</button>
+                )}
+                <button onClick={() => setGitRuleOpen(false)}
+                  className="text-[10px] px-2 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text)]">收起</button>
+              </div>
+            </div>
+          )}
+
+          {/* 挑檔模式：勾要進這次 commit 的檔案；其他模式只列出來讓少爺確認範圍 */}
+          {gitProject && gitStatus && (
+            <div className="mt-1.5 max-h-28 overflow-y-auto border border-[var(--border)] rounded bg-black/20 px-2 py-1">
+              {gitProject?.staging === 'paths' ? (
+                [...gitStatus.unstaged.map(f => f.file), ...gitStatus.untracked, ...gitStatus.staged.map(f => f.file)]
+                  .filter((f, i, arr) => arr.indexOf(f) === i)
+                  .map(_f => (
+                    <label key={_f} className="flex items-center gap-1.5 text-[10px] font-mono text-[var(--text)] cursor-pointer">
+                      <input type="checkbox" checked={gitPickedPaths.includes(_f)}
+                        onChange={e => setGitPickedPaths(prev => e.target.checked ? [...prev, _f] : prev.filter(p => p !== _f))} />
+                      {_f}
+                    </label>
+                  ))
+              ) : (
+                (gitProject?.staging === 'none' ? gitStatus.staged.map(f => `${f.code} ${f.file}`)
+                  : [...gitStatus.staged.map(f => `${f.code} ${f.file}`),
+                     ...gitStatus.unstaged.map(f => `${f.code} ${f.file}`),
+                     ...gitStatus.untracked.map(f => `? ${f}`)]
+                ).map((_l, _i) => <div key={_i} className="text-[10px] font-mono text-[var(--text-muted)] truncate">{_l}</div>)
+              )}
+              {gitProject?.staging === 'none' && gitStatus.staged.length === 0 && (
+                <div className="text-[10px] text-amber-400">staged 為空——這個專案只 commit 你自己 staged 好的內容</div>
+              )}
+            </div>
+          )}
+
+          {gitProject && (<>
+          <textarea value={gitMessage} onChange={e => { setGitMessage(e.target.value); setGitDraftAt(null) }}
+            rows={4} placeholder={gitProject.lang === 'zh-TW' ? 'type(scope)：繁中事實描述' : 'type(scope): factual description'}
+            className="w-full mt-1.5 bg-black/30 border border-[var(--border)] rounded px-2 py-1 text-[11px] font-mono text-[var(--text)]" />
+
+          {/* 英文規則專案的繁中對照：只給少爺看，不寫進 commit */}
+          {gitMessageZh && (
+            <div className="mt-1 text-[10px] text-[var(--text-muted)] border-l-2 border-[var(--gold)]/40 pl-2 whitespace-pre-wrap">
+              {gitMessageZh}
+            </div>
+          )}
+
+          <div className="flex items-center gap-2 mt-1.5">
+            {gitDraftAt && <span className="text-[9px] text-[var(--gold)]">Claude 草稿 {fmtTime(gitDraftAt)}</span>}
+            <div className="flex-1" />
+            <button onClick={() => runCommit(true)} disabled={gitBusy || !gitMessage.trim()}
+              title="不真的提交，只驗規則與範圍"
+              className={`text-[11px] px-2.5 py-1 rounded border border-[var(--border)] ${
+                gitBusy || !gitMessage.trim() ? 'text-[var(--text-muted)] opacity-40 cursor-not-allowed' : 'text-[var(--text)] hover:bg-white/10'}`}>
+              試跑
+            </button>
+            <button onClick={() => runCommit(false)} disabled={gitBusy || !gitMessage.trim()}
+              className={`text-[11px] px-2.5 py-1 rounded border ${
+                gitBusy || !gitMessage.trim() ? 'border-[var(--border)] text-[var(--text-muted)] opacity-40 cursor-not-allowed'
+                  : 'border-[var(--gold)]/50 text-[var(--gold)] hover:bg-[var(--gold)]/15'}`}>
+              Commit
+            </button>
+          </div>
+          </>)}
+
+          {gitHint && <div className="text-[10px] mt-1 text-[var(--text-muted)] font-mono break-all">{gitHint}</div>}
           </>)}
         </div>
 
