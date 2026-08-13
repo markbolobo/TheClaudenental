@@ -1643,6 +1643,32 @@ function atomicWriteJson(filePath, data) {
   fs.renameSync(tmp, filePath)
 }
 
+// ─── TC 總設定（使用者偏好池；少爺 2026-08-07 立）─────────────────────────────
+// 跨功能 key-value 偏好：對應少爺當下工作習慣、隨時可調；未來功能的使用者偏好一律掛這裡（namespaced key 如 'qa.newRunCountdownSecs'），不各自開 settings 檔。
+// 值為 null 的 PATCH = 清除該鍵（回「未設定」讓功能端 fallback）。
+const TC_SETTINGS_FILE = path.join(os.homedir(), '.claude', 'tc_settings.json')
+
+function readTcSettings() {
+  try { return JSON.parse(fs.readFileSync(TC_SETTINGS_FILE, 'utf-8')) } catch { return {} }
+}
+
+// 讀單一偏好；未設定回 fallback（功能端唯一取用入口）
+function getTcSetting(key, fallback) {
+  const v = readTcSettings()[key]
+  return v === undefined ? fallback : v
+}
+
+app.get('/api/settings', async () => readTcSettings())
+
+app.patch('/api/settings', async (request) => {
+  const next = { ...readTcSettings(), ...(request.body ?? {}) }
+  for (const k of Object.keys(next)) if (next[k] === null) delete next[k]
+  atomicWriteJson(TC_SETTINGS_FILE, next)
+  broadcast({ type: 'tc_settings_update', settings: next })
+  logEvent('tc.settings.update', { keys: Object.keys(request.body ?? {}) })
+  return { ok: true, settings: next }
+})
+
 app.get('/api/checkpoints', async (request) => {
   const cwd = request.query.cwd
   if (!isSafeCwd(cwd)) return { ok: false, checkpoints: [] }
@@ -4231,9 +4257,12 @@ function qaArmCountdown(run) {
 
 // Claude 宣告新 run（計畫全文上介面 → 倒數攔截窗口）
 // countdownSecs: >0 倒數自動開跑 / 0 立即開跑 / <0 必等少爺按「立即開跑」
+// 總設定 'qa.newRunCountdownSecs' 存在時=少爺強制模式（蓋過 Claude 帶的值，「都直接倒數中」語義）；未設定=Claude 值優先、fallback 30
 app.post('/api/qa/runs', async (request) => {
   const body = request.body ?? {}
-  const countdownSecs = typeof body.countdownSecs === 'number' ? body.countdownSecs : 30
+  const _forcedCountdown = getTcSetting('qa.newRunCountdownSecs', undefined)
+  const countdownSecs = typeof _forcedCountdown === 'number' ? _forcedCountdown
+    : (typeof body.countdownSecs === 'number' ? body.countdownSecs : 30)
   const run = {
     id: `qar${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     topic: body.topic ?? '(untitled)',

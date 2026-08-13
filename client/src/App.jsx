@@ -1385,6 +1385,83 @@ function HighTableModal({ onClose, onChanged }) {
   )
 }
 
+// ─── TC 總設定（少爺 2026-08-07 立）────────────────────────────────────────────
+// 跨功能使用者偏好：schema-driven——未來功能的偏好項只需在此加一條 schema，server key-value 池（/api/settings）與 UI 自動支援。
+const TC_SETTINGS_SCHEMA = [
+  {
+    group: 'QA',
+    key: 'qa.newRunCountdownSecs',
+    label: '新 QA Run 開跑模式',
+    type: 'select',
+    options: [
+      { value: null, label: '跟隨 Claude 判斷（Mode C 待放行、自主 QA 倒數）' },
+      { value: 30,   label: '一律倒數 30 秒——沒攔就自動開跑' },
+      { value: -1,   label: '一律待放行——等我按 ▶' },
+      { value: 0,    label: '一律立即開跑' },
+    ],
+    hint: '強制態：設定後蓋過 Claude 建 run 時帶的模式；「跟隨」= 交回 Claude 依 run 性質決定',
+  },
+]
+
+function TcSettingsModal({ onClose }) {
+  const [settings, setSettings] = useState(null)
+
+  useEffect(() => {
+    fetch('/api/settings').then(r => r.json()).then(setSettings).catch(() => setSettings({}))
+  }, [])
+
+  // 即改即存（少爺「隨時要能調整」）；value=null 送出即清除該鍵回「未設定」
+  const patch = useCallback(async (key, value) => {
+    setSettings(s => {
+      const next = { ...(s ?? {}) }
+      if (value === null) delete next[key]; else next[key] = value
+      return next
+    })
+    try {
+      await fetch('/api/settings', {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [key]: value }),
+      })
+    } catch {}
+  }, [])
+
+  const _groups = [...new Set(TC_SETTINGS_SCHEMA.map(s => s.group))]
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center" onClick={onClose}>
+      <div className="w-[440px] max-w-[92vw] max-h-[80vh] overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--surface)] p-4"
+        onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-3">
+          <span className="text-[10px] uppercase tracking-widest text-[var(--gold)]">⚙ 總設定 · Preferences</span>
+          <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text)] text-xs">✕</button>
+        </div>
+        {settings === null ? (
+          <div className="text-[10px] text-[var(--text-muted)]">載入中…</div>
+        ) : _groups.map(g => (
+          <div key={g} className="mb-4">
+            <div className="text-[9px] uppercase tracking-widest text-[var(--text-muted)] border-b border-[var(--border)] pb-1 mb-2">{g}</div>
+            {TC_SETTINGS_SCHEMA.filter(s => s.group === g).map(s => (
+              <div key={s.key} className="mb-3">
+                <div className="text-[11px] text-[var(--text)] mb-1">{s.label}</div>
+                {s.type === 'select' && (
+                  <select
+                    value={settings[s.key] === undefined ? '__unset__' : String(settings[s.key])}
+                    onChange={e => patch(s.key, e.target.value === '__unset__' ? null : JSON.parse(e.target.value))}
+                    className="w-full text-[11px] bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-[var(--text)]">
+                    {s.options.map(o => (
+                      <option key={String(o.value)} value={o.value === null ? '__unset__' : String(o.value)}>{o.label}</option>
+                    ))}
+                  </select>
+                )}
+                {s.hint && <div className="text-[9px] text-[var(--text-muted)] mt-1">{s.hint}</div>}
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 const TABS = [
   { id: 'chat',      label: 'Chat' },
   { id: 'sommelier', label: '🍷 侍酒師' },
@@ -1758,6 +1835,7 @@ export default function App() {
   const [animQueue, setAnimQueue]               = useState([])
   const [currentAnim, setCurrentAnim]           = useState(null)
   const [showBountySettings, setShowBountySettings] = useState(false)
+  const [showTcSettings, setShowTcSettings] = useState(false)     // 總設定（少爺 2026-08-07）：跨功能使用者偏好 modal
   const [showMarkers, setShowMarkers] = useState(false)
   const [showCellar, setShowCellar] = useState(false)
   const [contractModal, setContractModal]       = useState(null)
@@ -2147,6 +2225,7 @@ export default function App() {
       )}
       {showMarkers && <MarkerPanel onClose={() => setShowMarkers(false)} />}
       {showCellar && <CellarPanel onClose={() => setShowCellar(false)} />}
+      {showTcSettings && <TcSettingsModal onClose={() => setShowTcSettings(false)} />}
       {showBountySettings && (
         <BountySettings
           onClose={() => setShowBountySettings(false)}
@@ -2304,6 +2383,11 @@ export default function App() {
             ))}
             {selected && <StatusDot status={selected.status} />}
             <div className="flex-1" />
+            {/* 總設定（少爺 2026-08-07）：任何分頁可開、隨時調偏好 */}
+            {currentUser?.role !== 'collaborator' && (
+              <button onClick={() => setShowTcSettings(true)} title="總設定：使用者偏好"
+                className="px-2 py-1 text-[12px] text-[var(--text-muted)] hover:text-[var(--gold)] transition-colors shrink-0">⚙</button>
+            )}
             {/* P2 階段 4c：身份指示 + logout */}
             {currentUser?.role === 'collaborator' && (
               <div className="flex items-center gap-2 px-3">
