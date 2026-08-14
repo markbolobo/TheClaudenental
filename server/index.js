@@ -3910,26 +3910,64 @@ app.post('/api/git/commit', async (request, reply) => {
 // 工具介面歸工具自己（如 UE_AnimToolkit 的 UE 內 GUI），酒窖只負責啟動。
 // 未來加工具：CELLAR_TOOLS push 一筆即現身（exec 未接上前點擊回「開發中」提示）。
 // kind：execute＝spawn 外部程式／claude＝喚一個 Claude 子進程跑固定 prompt（少爺 2026-08-14）
-const TC_COMMIT_PROMPT = [
-  `(TC 酒窖「TC Commit」一鍵提交) 請把 TheClaudenental 目前的變更提交掉。全程不要問我、不要 push。`,
-  ``,
-  `1. 先看清楚改了什麼：git -C C:\\Project\\TheClaudenental status --short 與 git -C C:\\Project\\TheClaudenental diff`,
-  `   （完全沒有變更就回報「無變更」並結束，不要硬擠一個 commit）`,
-  `2. 寫繁體中文 commit message：subject＝「type(scope)：事實短句」；body＝flat bullet 列「哪個檔／模組改了什麼」，`,
-  `   簡潔事實、不解釋因果（不寫 Why/How）、不巢狀 sub-bullet`,
-  `3. 訊息寫成 UTF-8 檔後執行（staging／語言／Co-Authored-By 都由腳本處理，不要自己跑 git add / git commit）：`,
-  `   powershell -NoProfile -ExecutionPolicy Bypass -File "C:\\Project\\MasterBrain\\.agent\\scripts\\Invoke-ProjectCommit.ps1" -Project tc -MessageFile <訊息檔>`,
-  `4. 腳本回單行 JSON：ok=false 就照 error 修正後重試一次，仍失敗就回報錯誤原文`,
-  `5. 最後回報 hash ＋完整 message ＋標明「未 push」`,
-  ``,
-  `規則細節：C:\\Project\\MasterBrain\\.agent\\workflows\\ProjectCommit_SOP.md（TC＝全 staged、繁中 message、自動補 Co-Author）`,
-].join('\n')
+// 一鍵 Commit 的 prompt 依「該專案的 git 規則」動態產生（少爺 2026-08-14：
+// 「設定完規則後直接按 Commit，就像我在 VS Code 那樣自動照規則根據專案處理」「我很少手動輸入 commit 內容」）。
+// ⚠️ 單一產生點：酒窖 tc-commit 與版控面板的自動 Commit 共用本函式 —— prompt 只有一份，規則改了兩邊同步。
+function buildAutoCommitPrompt(projectId, proj, policy, entry) {
+  const _root = gitRepoRoot(proj)
+  const _name = proj.name ?? projectId
+  const _zh = policy.lang !== 'en'
+  // staging 規則決定「看哪些變更」與「能不能自己 add」——羅馬 none＝只認少爺已 staged 的，絕不擅自加檔
+  const _stageLine = policy.staging === 'all'
+    ? `本專案規則＝全部變更都會進 commit（staging=all）。`
+    : policy.staging === 'paths'
+      ? `本專案規則＝只提交指定路徑（staging=paths）；沒有指定就不要提交，回報需要少爺先選檔。`
+      : `本專案規則＝**只 commit 既有 staged**（staging=none）。**絕對不要 git add**；若 staged 為空就回報「沒有 staged 檔案」並結束。`
+  return [
+    `(${entry}) 請把「${_name}」目前的變更提交掉。全程不要問我、不要 push。`,
+    ``,
+    `1. 先看清楚改了什麼：git -C ${_root} status --short 與 git -C ${_root} diff --staged`,
+    `   ${_stageLine}`,
+    `   （沒有可提交的變更就回報並結束，不要硬擠一個 commit）`,
+    `2. 寫${_zh ? '繁體中文' : '英文'} commit message：subject＝「type(scope)${_zh ? '：' : ': '}事實短句」；body＝flat bullet 列「哪個檔／模組改了什麼」，`,
+    `   簡潔事實、不解釋因果（不寫 Why/How）、不巢狀 sub-bullet${_zh ? '' : '；訊息本身用英文，回報給少爺時附繁中對照'}`,
+    `3. 訊息寫成 UTF-8 檔後執行（staging／語言／Co-Authored-By 都由腳本處理，不要自己跑 git add / git commit）：`,
+    `   powershell -NoProfile -ExecutionPolicy Bypass -File "C:\\Project\\MasterBrain\\.agent\\scripts\\Invoke-ProjectCommit.ps1" -Project ${projectId} -MessageFile <訊息檔>`,
+    `4. 腳本回單行 JSON：ok=false 就照 error 修正後重試一次，仍失敗就回報錯誤原文`,
+    `5. ⭐ 最後一定要用**繁體中文**回報給少爺（這是他在聊天室唯一會看到的東西，缺了等於沒交付）：`,
+    `   ① hash ＋ 檔案數 ② commit message 原文${_zh ? '' : '（英文）＋**逐條繁中對照**'} ③ 標明「未 push」`,
+    `   ${_zh ? '' : '⚠️ message 本身維持英文寫進 git，但聊天室的回報必須是繁體中文；'}不要只貼英文就結束。`,
+    ``,
+    `規則細節：C:\\Project\\MasterBrain\\.agent\\workflows\\ProjectCommit_SOP.md`,
+    `（${_name}＝${policy.staging === 'all' ? '全 staged' : policy.staging === 'paths' ? '指定路徑' : '只 commit 既有 staged'}、${_zh ? '繁中' : '英文'} message、${policy.coAuthor ? '自動補 Co-Author' : '不補 Co-Author'}）`,
+  ].join('\n')
+}
+
+// 版控面板「一鍵依規則 Commit」：message 留空按下即走此路 —— 喚 Claude 讀 diff、依規則寫訊息、直接提交
+app.post('/api/git/auto-commit', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const { projectId } = request.body ?? {}
+  const _proj = findGitProject(projectId)
+  if (!_proj) return { ok: false, error: `專案「${projectId}」未設 git 規則` }
+  const _root = gitRepoRoot(_proj)
+  if (!_root || !fs.existsSync(path.join(_root, '.git'))) return { ok: false, error: `不是 git repo：${_root}` }
+  if (!isSafeCwd(_root)) return { ok: false, error: `工作目錄不存在：${_root}` }
+  // 同一 cwd 已有 Claude 在跑就不搶（避免踩到少爺正在進行的對話）
+  if (claudeProcs.get(_root)?.status === 'running') return { ok: false, error: `該專案已有 Claude 進程執行中，等它跑完再按` }
+
+  const _policy = gitProjectPolicy(_proj)
+  const _prompt = buildAutoCommitPrompt(projectId, _proj, _policy, 'TC 版控面板「一鍵依規則 Commit」')
+  spawnClaude(_root, _prompt, null, 'sonnet', 'low')
+  logEvent('git.autocommit.spawn', { projectId, staging: _policy.staging, lang: _policy.lang })
+  return { ok: true, spawned: true, message: `已喚起 Claude 依「${_proj.name ?? projectId}」規則提交（${_policy.staging === 'none' ? '只 commit 既有 staged' : _policy.staging === 'all' ? '全部變更' : '指定路徑'}、${_policy.lang === 'en' ? '英文' : '繁中'} message）` }
+})
 
 const CELLAR_TOOLS = [
   {
     id: 'tc-commit', name: 'TC Commit（一鍵提交）', kind: 'claude',
     desc: '喚 Claude 讀 TC 變更、照繁中規則寫訊息並直接提交（不 push）',
-    claude: { cwd: 'C:\\Project\\TheClaudenental', model: 'sonnet', effort: 'low', prompt: TC_COMMIT_PROMPT },
+    // prompt 不寫死：執行時用 buildAutoCommitPrompt 依 sommelier.json 的 tc 規則現算（與版控面板同一產生點）
+    claude: { cwd: 'C:\\Project\\TheClaudenental', model: 'sonnet', effort: 'low', gitProjectId: 'tc' },
   },
   {
     id: 'cooldown-timer', name: 'Claude 冷卻鬧鐘', kind: 'execute',
@@ -3952,7 +3990,15 @@ app.post('/api/tools/run/:id', async (request) => {
     if (!isSafeCwd(_c.cwd)) return { ok: false, error: `工作目錄不存在：${_c.cwd}` }
     // 同一 cwd 已有 Claude 在跑就不搶（spawnClaude 不 kill 既有進程，硬送會踩到少爺正在進行的對話）
     if (claudeProcs.get(_c.cwd)?.status === 'running') return { ok: false, error: `「${_t.name}」：該專案已有 Claude 進程執行中，等它跑完再按` }
-    spawnClaude(_c.cwd, _c.prompt, null, _c.model ?? null, _c.effort ?? null)
+    // gitProjectId 型：prompt 依該專案當下的 git 規則現算（規則改了不必動程式碼）
+    let _prompt = _c.prompt
+    if (_c.gitProjectId) {
+      const _gp = findGitProject(_c.gitProjectId)
+      if (!_gp) return { ok: false, error: `「${_t.name}」：專案「${_c.gitProjectId}」未設 git 規則` }
+      _prompt = buildAutoCommitPrompt(_c.gitProjectId, _gp, gitProjectPolicy(_gp), `TC 酒窖「${_t.name}」`)
+    }
+    if (!_prompt) return { ok: false, error: `「${_t.name}」：沒有可執行的 prompt` }
+    spawnClaude(_c.cwd, _prompt, null, _c.model ?? null, _c.effort ?? null)
     logEvent('cellar.claude.spawn', { id: _t.id, cwd: _c.cwd, model: _c.model ?? null, effort: _c.effort ?? null })
     return { ok: true, ran: `${_t.name}（已喚起 Claude，完成後看版控狀態或聊天室）` }
   }

@@ -222,8 +222,24 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
     loadGitStatus(gitProjectId)
   }, [gitProjectId, loadGitProjects, loadGitStatus])
 
+  // 少爺 2026-08-14：「設定完規則後直接按 Commit」「我很少手動輸入 commit 內容」
+  // → 訊息留空按 Commit＝喚 Claude 依該專案 git 規則讀 diff、寫訊息、直接提交（試跑仍需自備訊息）
+  const runAutoCommit = useCallback(async () => {
+    if (!gitProjectId) return
+    setGitBusy(true); setGitHint('喚 Claude 依規則提交中…')
+    const _res = await fetch('/api/git/auto-commit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectId: gitProjectId }),
+    }).then(r => r.json()).catch(e => ({ ok: false, error: e.message }))
+    setGitBusy(false)
+    setGitHint(_res.ok ? `⚡ ${_res.message ?? '已喚起 Claude'}（完成後這裡會刷新）` : `❌ ${_res.error ?? '喚起失敗'}`)
+  }, [gitProjectId])
+
   const runCommit = useCallback(async (dryRun = false) => {
-    if (!gitProjectId || !gitMessage.trim()) { setGitHint('⚠️ 還沒有 commit 訊息'); return }
+    if (!gitProjectId) return
+    // 訊息空 + 非試跑 → 走自動路徑（由 Claude 依規則產生訊息並提交）
+    if (!gitMessage.trim() && !dryRun) { runAutoCommit(); return }
+    if (!gitMessage.trim()) { setGitHint('⚠️ 試跑需要先有 commit 訊息'); return }
     setGitBusy(true); setGitHint(dryRun ? '試跑中…' : '提交中…')
     const _res = await fetch('/api/git/commit', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -239,7 +255,7 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
     setGitHint(`✅ ${_res.hash} · ${_res.subject}（${_res.files?.length ?? 0} 檔、未 push）`)
     setGitMessage(''); setGitMessageZh(''); setGitPickedPaths([]); setGitDraftAt(null)
     loadGitStatus(gitProjectId)
-  }, [gitProjectId, gitMessage, gitProject, gitPickedPaths, loadGitStatus])
+  }, [gitProjectId, gitMessage, gitProject, gitPickedPaths, loadGitStatus, runAutoCommit])
 
   // 少爺 2026-08-07：進 QA 分頁不再預設自動選最新 run——選擇一律由少爺顯式動作（點 run／新宣告聚焦／會議室聯動）產生
   const reload = useCallback(() => {
@@ -719,11 +735,12 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
                 gitBusy || !gitMessage.trim() ? 'text-[var(--text-muted)] opacity-40 cursor-not-allowed' : 'text-[var(--text)] hover:bg-white/10'}`}>
               試跑
             </button>
-            <button onClick={() => runCommit(false)} disabled={gitBusy || !gitMessage.trim()}
+            <button onClick={() => runCommit(false)} disabled={gitBusy || !gitProjectId}
+              title={gitMessage.trim() ? '用上面的訊息提交' : '訊息留空＝喚 Claude 依本專案規則讀 diff、寫訊息並提交（不 push）'}
               className={`text-[11px] px-2.5 py-1 rounded border ${
-                gitBusy || !gitMessage.trim() ? 'border-[var(--border)] text-[var(--text-muted)] opacity-40 cursor-not-allowed'
+                gitBusy || !gitProjectId ? 'border-[var(--border)] text-[var(--text-muted)] opacity-40 cursor-not-allowed'
                   : 'border-[var(--gold)]/50 text-[var(--gold)] hover:bg-[var(--gold)]/15'}`}>
-              Commit
+              {gitMessage.trim() ? 'Commit' : '⚡ 依規則 Commit'}
             </button>
           </div>
           </>)}
