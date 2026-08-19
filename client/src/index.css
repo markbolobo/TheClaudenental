@@ -182,3 +182,14 @@ select option:disabled { color: var(--text-muted); }
 .md-body strong { font-weight: 700; color: var(--text-h); }
 .md-body em { font-style: italic; color: var(--text-muted); }
 .md-body input[type=checkbox] { accent-color: var(--gold); margin-right: 0.35em; }
+
+/* 列內花費演出：每筆新花費讓綠色 +delta 脈動一下（少爺 2026-08-15「演出要是動態的」） */
+@keyframes cost-pop {
+  0%   { transform: scale(0.7) translateY(2px); opacity: 0; }
+  35%  { transform: scale(1.18) translateY(0);  opacity: 1; }
+  100% { transform: scale(1) translateY(0);     opacity: 1; }
+}
+.cost-pop {
+  display: inline-block;
+  animation: cost-pop 320ms cubic-bezier(0.22, 1, 0.36, 1);
+}

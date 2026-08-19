@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { useCostEngine, BountyOverlay, BountyToast, ContractModal, fmtCost, computeDeltaCost } from './BountySystem.jsx'
+import { useCostEngine, BountyOverlay, BountyToast, ContractModal, fmtCost, computeDeltaCost, setModelPricing } from './BountySystem.jsx'
 import { TodoBoard } from './TodoBoard.jsx'
 import { MetricsDashboard } from './MetricsDashboard.jsx'
 import { SommelierPanel } from './Sommelier.jsx'
@@ -9,12 +9,16 @@ import MarkerPanel from './MarkerPanel.jsx'
 import CellarPanel from './CellarPanel.jsx'
 import { ChatPanel } from './ChatPanel.jsx'
 import { PresentButton } from './PresentationView.jsx'
-import { MODEL_OPTIONS } from './modelOptions.js'
+import { useModelOptions, setModelCatalog } from './modelOptions.js'
 import { useChatOutline, OutlineMinimap, openInVSCode, normPath, RATING_KEY, PREF_TEXT_KEY, loadRatingsCache, loadRatings } from './chatSupport.jsx'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const WS_URL = `ws://${location.host}/ws`
+
+// 每間聊天室的花費演出初始態（少爺 2026-08-15：列內演出各室獨立）
+// stage 1=idle 2=flash 3=running 4=done（4 是全螢幕謝幕＝面板級，只有當前開著的室會進）
+const CHAT_COST_IDLE = { stage: 1, running: 0, lastDelta: null, baseline: 0, deltaSeq: 0 }
 
 const STATUS_ICON = {
   active:   '●',
@@ -120,7 +124,39 @@ function ActivityHeat() {
   )
 }
 
-function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick, autoResumeArmed, autoResumeFireAt, onToggleAutoResume, hitLimit, isChatSession, chatStage = 1, chatRunning = 0, chatLastDelta = null, chatBaseline = 0, onPermissionResponse, showChatPermission = false }) {
+// ─── 列內金額的動態補間（少爺 2026-08-15：「我需要那個演出是動態的」）──────────────
+// 數字不硬跳，用 rAF 從舊值滾到新值；ease-out 讓它一開始快、收尾緩，小字級也看得出在動。
+function useTweenedNumber(InTarget, InMs = 420) {
+  const [val, setVal] = useState(InTarget)
+  const fromRef = useRef(InTarget)
+  const rafRef  = useRef(null)
+  useEffect(() => {
+    // 從「目前顯示到哪」續接，而不是從上一段的起點重來（否則被打斷時數字會往回跳）
+    const _from = fromRef.current
+    if (_from === InTarget) return
+    const _t0 = performance.now()
+    const _tick = now => {
+      const _p = Math.min(1, (now - _t0) / InMs)
+      const _eased = 1 - Math.pow(1 - _p, 3)
+      const _cur = _from + (InTarget - _from) * _eased
+      fromRef.current = _cur          // 隨時記錄當前值，供下一段續接
+      setVal(_cur)
+      if (_p < 1) rafRef.current = requestAnimationFrame(_tick)
+      else { fromRef.current = InTarget; setVal(InTarget) }
+    }
+    rafRef.current = requestAnimationFrame(_tick)
+    return () => cancelAnimationFrame(rafRef.current)
+  }, [InTarget, InMs])
+  return val
+}
+
+/** 會滾動的金額字樣 */
+function RollingCost({ value, className = '', ms = 420 }) {
+  const _v = useTweenedNumber(value ?? 0, ms)
+  return <span className={`tabular-nums ${className}`}>{fmtCost(_v)}</span>
+}
+
+function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick, autoResumeArmed, autoResumeFireAt, onToggleAutoResume, hitLimit, isChatSession, chatStage = 1, chatRunning = 0, chatLastDelta = null, chatBaseline = 0, chatDeltaSeq = 0, onPermissionResponse, showChatPermission = false }) {
   const base = 'flex items-center gap-2 px-3 py-2 rounded cursor-pointer transition-all'
   const selectedCls = isSelected
     ? 'bg-[var(--surface-2)] session-active-glow'
@@ -131,6 +167,7 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick,
   const [displayedCost, setDisplayedCost] = useState(rawCost)
   const [deltaAmt, setDeltaAmt]           = useState(null)   // number | null
   const [deltaPhase, setDeltaPhase]       = useState('idle') // 'idle'|'show'|'fade'
+  const [deltaKey, setDeltaKey]           = useState(0)      // 後蓋前的重播鍵
   const prevRawRef = useRef(rawCost)
   const t1Ref = useRef(null)
   const t2Ref = useRef(null)
@@ -146,22 +183,38 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick,
     }
 
     const d = rawCost - prev
-    // Phase 2: keep showing OLD cost + "+delta" for 0.2 s
+    // 綠色 +delta 亮 1 秒後熄滅；期間又有新變化＝後蓋前：直接換成下一筆金額並重播，不累加、不接續
     setDeltaAmt(d)
     setDeltaPhase('show')
+    setDeltaKey(k => k + 1)
+    setDisplayedCost(rawCost)
 
     clearTimeout(t1Ref.current)
     clearTimeout(t2Ref.current)
 
     t1Ref.current = setTimeout(() => {
-      // Phase 3: switch to new total, delta fades out
-      setDisplayedCost(rawCost)
       setDeltaPhase('fade')
-      t2Ref.current = setTimeout(() => { setDeltaAmt(null); setDeltaPhase('idle') }, 550)
-    }, 200)
+      t2Ref.current = setTimeout(() => { setDeltaAmt(null); setDeltaPhase('idle') }, 400)
+    }, 1000)
 
     return () => { clearTimeout(t1Ref.current); clearTimeout(t2Ref.current) }
   }, [rawCost])
+
+  // ── 列內結算演出（少爺 2026-08-15：結算「兩個都要」，列內每間各自演，全螢幕只有當前那間額外播）
+  // 兩相：先把這輪賺到的標綠攤在總額旁邊，再併成新總額金色亮一下。
+  // 結算用的權威總額：historyCosts 已把本輪花費累加進去，所以它就是「併回後」該顯示的數字
+  const settleTotal = rawCost ?? (chatBaseline + chatRunning)
+  const [settlePhase, setSettlePhase] = useState(0)
+  useEffect(() => {
+    if (chatStage !== 4) { setSettlePhase(0); return }
+    setSettlePhase(1)
+    const _t1 = setTimeout(() => setSettlePhase(2), 900)
+    // 演完自己收尾（phase 3 = 回一般徽章）。⚠️ 不可以只靠父層把 stage 收回 1——父層一旦卡住，
+    // 這一列就會**永久**停在「總額 − 本輪」那一相，看起來就是錢縮水了
+    // （少爺 2026-08-15「金額在總結算後縮水」的真因，診斷 log 實測 stage 卡在 4）
+    const _t2 = setTimeout(() => setSettlePhase(3), 2200)
+    return () => { clearTimeout(_t1); clearTimeout(_t2) }
+  }, [chatStage])
 
   return (
     <div className={`${base} ${selectedCls}`} onClick={onClick} onDoubleClick={onDoubleClick}>
@@ -187,10 +240,29 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick,
               <span className={`transition-colors duration-700 ${chatStage === 2 ? 'text-gray-600' : 'text-gray-500'}`}>
                 {fmtCost(chatBaseline)}
               </span>
-              <span className="text-[var(--gold)]">{fmtCost(chatRunning)}</span>
-              {chatStage === 2 && chatLastDelta != null && (
-                <span className="text-green-400">+{fmtCost(chatLastDelta)}</span>
-              )}
+              {/* 本輪累計：用滾動而非硬跳，才看得出「正在花錢」 */}
+              <RollingCost value={chatRunning} className="text-[var(--gold)]" />
+              {/* 綠色 +delta：每筆花費重新脈動一次，1 秒沒新變化就淡出（階段 2→3） */}
+              <span key={chatDeltaSeq}
+                className={`text-green-400 transition-opacity duration-300 ${
+                  chatStage === 2 && chatLastDelta != null ? 'opacity-100 cost-pop' : 'opacity-0'
+                }`}>
+                {chatLastDelta != null ? `+${fmtCost(chatLastDelta)}` : ''}
+              </span>
+            </button>
+          ) : isChatSession && chatStage === 4 && settlePhase > 0 && settlePhase < 3 ? (
+            // 階段 4 — 列內結算：把這輪賺到的錢併回總額（每間聊天室結束時各自演，不分是否選取）
+            <button onClick={e => { e.stopPropagation(); onCostClick?.() }}
+              className="flex items-center gap-1 tabular-nums text-[9px] font-mono">
+              {/* 結算：起點用「權威總額 − 本輪賺到」反推，終點就是權威總額。
+                  ⚠️ 不可以直接用 chatBaseline：它是本輪開跑時鎖的值，若中途沒回過 idle 就會過期，
+                  結算一觸發畫面會從真總額往下掉＝少爺 2026-08-15 回報的「錢會縮水」。 */}
+              <RollingCost ms={900}
+                value={settlePhase >= 2 ? settleTotal : settleTotal - chatRunning}
+                className={`transition-colors duration-700 ${settlePhase >= 2 ? 'text-[var(--gold)]' : 'text-gray-500'}`} />
+              <span className={`text-green-400 transition-opacity duration-700 ${settlePhase >= 2 ? 'opacity-0' : 'opacity-100'}`}>
+                +{fmtCost(chatRunning)}
+              </span>
             </button>
           ) : displayedCost != null ? (
             // Stage 1 / 4 / 5 (or non-chat session): single total badge
@@ -199,12 +271,13 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick,
                 onClick={e => { e.stopPropagation(); onCostClick?.() }}
                 className="tabular-nums text-[var(--gold)]/80 hover:text-[var(--gold)] transition-colors
                   border-b border-[var(--gold)]/20 hover:border-[var(--gold)]/60 leading-tight text-[9px]">
-                {fmtCost(displayedCost)}
+                <RollingCost value={displayedCost} />
               </button>
               {deltaAmt != null && (
                 <span
+                  key={deltaKey}
                   className={`absolute left-full pl-1 top-0 tabular-nums text-green-400 text-[9px] whitespace-nowrap pointer-events-none transition-opacity duration-500 ${
-                    deltaPhase === 'fade' ? 'opacity-0' : 'opacity-100'
+                    deltaPhase === 'fade' ? 'opacity-0' : 'opacity-100 cost-pop'
                   }`}
                 >
                   +{fmtCost(deltaAmt)}
@@ -668,6 +741,7 @@ function Sparkline({ data, color = 'var(--gold)', width = 120, height = 28, labe
 
 // 回應風格設定（少爺 2026-07-21：官方文字 vs 互動簡報濾鏡；跨裝置存 server present.json）
 function PresentStylePanel() {
+  const MODEL_OPTIONS = useModelOptions()   // server 目錄推來就自動換清單（少爺 2026-08-15）
   const [cfg, setCfg] = useState(null)
   useEffect(() => {
     fetch('/api/present/config').then(r => r.json()).then(d => setCfg(d.config)).catch(() => {})
@@ -1559,7 +1633,7 @@ function MobileTabBar({ activeTab, setActiveTab, currentUser }) {
   )
 }
 
-function MobileSessionsPanel({ sessions, selectedId, setSelectedId, setActiveTab, onContinue, autoResumeMap, onToggleAutoResume, hitLimitSessions, historyCosts, onCostClick, onPermissionResponse, chatStage, chatRunning, chatLastDelta, chatBaseline }) {
+function MobileSessionsPanel({ sessions, selectedId, setSelectedId, setActiveTab, onContinue, autoResumeMap, onToggleAutoResume, hitLimitSessions, historyCosts, onCostClick, onPermissionResponse, chatCostMap }) {
   return (
     <div className="flex flex-col h-full">
       <div className="px-3 py-2 text-[10px] uppercase tracking-widest text-[var(--text-muted)] border-b border-[var(--border)] bg-[var(--surface)] shrink-0">
@@ -1567,31 +1641,36 @@ function MobileSessionsPanel({ sessions, selectedId, setSelectedId, setActiveTab
       </div>
       <ActivityHeat />
       <div className="flex-1 overflow-y-auto py-1 px-1">
-        {sessions.map(s => (
-          <SessionItem
-            key={s.id}
-            session={{ ...s, costUsd: historyCosts?.[s.id] ?? s.costUsd ?? null }}
-            isSelected={s.id === selectedId}
-            onClick={() => {
-              setSelectedId(s.id)
-              setActiveTab('chat')
-              if (s.cwd) onContinue?.({ sessionId: s.id, projectPath: s.cwd })
-            }}
-            onDoubleClick={() => {}}
-            onCostClick={() => onCostClick?.(s)}
-            autoResumeArmed={autoResumeMap?.[s.id]?.enabled === true}
-            autoResumeFireAt={autoResumeMap?.[s.id]?.fireAt ?? null}
-            onToggleAutoResume={() => onToggleAutoResume?.(s.id)}
-            hitLimit={hitLimitSessions?.has(s.id) ?? false}
-            isChatSession={s.id === selectedId}
-            chatStage={s.id === selectedId ? chatStage : 1}
-            chatRunning={s.id === selectedId ? chatRunning : 0}
-            chatLastDelta={s.id === selectedId ? chatLastDelta : null}
-            chatBaseline={s.id === selectedId ? chatBaseline : 0}
-            onPermissionResponse={onPermissionResponse}
-            showChatPermission
-          />
-        ))}
+        {sessions.map(s => {
+          // 列內演出讀「該室自己的」狀態，不再吃當前選取那室（少爺 2026-08-15）
+          const _cc = chatCostMap?.[s.id] ?? CHAT_COST_IDLE
+          return (
+            <SessionItem
+              key={s.id}
+              session={{ ...s, costUsd: historyCosts?.[s.id] ?? s.costUsd ?? null }}
+              isSelected={s.id === selectedId}
+              onClick={() => {
+                setSelectedId(s.id)
+                setActiveTab('chat')
+                if (s.cwd) onContinue?.({ sessionId: s.id, projectPath: s.cwd })
+              }}
+              onDoubleClick={() => {}}
+              onCostClick={() => onCostClick?.(s)}
+              autoResumeArmed={autoResumeMap?.[s.id]?.enabled === true}
+              autoResumeFireAt={autoResumeMap?.[s.id]?.fireAt ?? null}
+              onToggleAutoResume={() => onToggleAutoResume?.(s.id)}
+              hitLimit={hitLimitSessions?.has(s.id) ?? false}
+              isChatSession
+              chatStage={_cc.stage}
+              chatRunning={_cc.running}
+              chatLastDelta={_cc.lastDelta}
+              chatBaseline={_cc.baseline}
+              chatDeltaSeq={_cc.deltaSeq}
+              onPermissionResponse={onPermissionResponse}
+              showChatPermission
+            />
+          )
+        })}
         {sessions.length === 0 && <div className="text-[10px] text-[var(--text-muted)] text-center mt-8">No sessions yet</div>}
       </div>
     </div>
@@ -1840,11 +1919,17 @@ export default function App() {
   const [showCellar, setShowCellar] = useState(false)
   const [contractModal, setContractModal]       = useState(null)
   const [historyCosts, setHistoryCosts]         = useState({})   // { [sessionId]: costUsd }
-  const [chatBaseline, setChatBaseline]         = useState(0)    // historyCosts snapshot when chatInit last fired
   // ── 5-Stage chat cost display (lives in SessionItem Row 3) ──────────────
-  const [chatStage, setChatStage]       = useState(1)   // 1=idle 2=flash 3=running 4=done
-  const [chatRunning, setChatRunning]   = useState(0)   // cost accumulated this chat
-  const [chatLastDelta, setChatLastDelta] = useState(null)
+  // 每間聊天室一份（少爺 2026-08-15：三室同時運作時，演出必須各自演在自己那列，
+  // 不能全部擠到當前選取／最上面那列）。{ [sessionId]: CHAT_COST_IDLE 形狀 }
+  const [chatCostMap, setChatCostMap] = useState({})
+  const streamSeqRef = useRef(0)       // WS 事件流水號
+  const lastSeqRef   = useRef(0)       // 花費階段效果已處理到哪一號
+  const stage3TimersRef = useRef({})   // { [sessionId]: timeoutId } — 每室各自的 2→3 收斂計時
+  const settleTimersRef = useRef({})   // { [sessionId]: timeoutId } — 列內結算演完回 idle
+  const ROW_SETTLE_MS = 2000
+  // 全螢幕結算與列內結算解耦：列內 2 秒收，全螢幕自己跑滿 5 秒，兩者不互相截斷
+  const [settleOverlay, setSettleOverlay] = useState(null)   // { sid, baseline, running } | null
 
 
   // Track which session is currently open in Chat (for animation gating)
@@ -1856,15 +1941,71 @@ export default function App() {
   useEffect(() => { activeChatSessionRef.current = selectedId }, [selectedId])
   useEffect(() => { activeTabRef.current = activeTab }, [activeTab])
 
+  // ── 每室花費演出狀態的存取器 ───────────────────────────────────────────────
+  const chatCostOf = sid => (sid ? chatCostMap[sid] : null) ?? CHAT_COST_IDLE
+
+  // 暫時性診斷：把關鍵判斷路徑打回 server log（瀏覽器 console 我看不到）
+  const dbg = (tag, detail) => {
+    try {
+      fetch('/api/debug/client', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tag, detail }),
+      }).catch(() => {})
+    } catch {}
+  }
+
+  // 串流回呼在事件當下讀 historyCosts，用 ref 取最新值（state 閉包會落後一個 render）
+  const historyCostsRef = useRef({})
+  useEffect(() => { historyCostsRef.current = historyCosts }, [historyCosts])
+
+  // ⚠️ 同步鏡射一份到 ref：setState 的 updater 是「render 時才跑」的，任何想在呼叫當下讀到
+  // 最新階段/金額的邏輯（例如 noteRunEnd 要判斷該不該結算）都不能寫在 updater 裡面。
+  const chatCostMapRef = useRef({})
+  const patchChatCost = useCallback((sessionId, patch) => {
+    if (!sessionId) return
+    setChatCostMap(prev => {
+      const _cur  = prev[sessionId] ?? CHAT_COST_IDLE
+      const _next = typeof patch === 'function' ? patch(_cur) : { ..._cur, ...patch }
+      if (_next === _cur) return prev
+      const _map = { ...prev, [sessionId]: _next }
+      chatCostMapRef.current = _map
+      return _map
+    })
+  }, [])
+
+  // 綠色 +delta 的熄滅計時（少爺 2026-08-15 規格：亮 1 秒後熄滅，期間有新變化就重置刷新時間）。
+  // 階段 2＝綠色亮著，階段 3＝綠色熄了但 running 金額續留。每室各自計時互不干擾。
+  const GREEN_HOLD_MS = 1000
+  const armStage3 = useCallback((sessionId) => {
+    clearTimeout(stage3TimersRef.current[sessionId])
+    stage3TimersRef.current[sessionId] = setTimeout(() => {
+      patchChatCost(sessionId, c => (c.stage === 2 ? { ...c, stage: 3 } : c))
+    }, GREEN_HOLD_MS)
+  }, [patchChatCost])
+
+  useEffect(() => () => {
+    for (const _t of Object.values(stage3TimersRef.current)) clearTimeout(_t)
+    for (const _t of Object.values(settleTimersRef.current)) clearTimeout(_t)
+  }, [])
+
   // Load bounty settings + seed historyCosts from history API once
   useEffect(() => {
     fetch('/api/bounty/settings').then(r => r.json()).then(setBountySettings).catch(() => {})
+    // 模型目錄（少爺 2026-08-15）：下拉清單與成本演出的價目都吃 server 目錄，
+    // 失敗就沿用兩個模組各自的離線退路表，不讓選單變空或成本算不出來
+    fetch('/api/models').then(r => r.json()).then(c => { setModelCatalog(c); setModelPricing(c) }).catch(() => {})
     fetch('/api/history').then(r => r.json()).then(d => {
-      const map = {}
-      for (const s of d.sessions ?? []) {
-        if (s.costUsd != null) map[s.sessionId] = s.costUsd
-      }
-      setHistoryCosts(map)
+      // ⚠️ 合併而非整份取代：這支是非同步的，在它回來之前已經進來的即時花費不能被洗掉。
+      // 並且取大值——花費本質上單調不減，任何會讓金額變小的路徑都是 bug（少爺 2026-08-15
+      // 「錢會縮水，不應該這樣」）。
+      setHistoryCosts(prev => {
+        const _next = { ...prev }
+        for (const s of d.sessions ?? []) {
+          if (s.costUsd == null) continue
+          _next[s.sessionId] = Math.max(s.costUsd, _next[s.sessionId] ?? 0)
+        }
+        return _next
+      })
     }).catch(() => {})
   }, [])
 
@@ -1922,26 +2063,30 @@ export default function App() {
 
   // Cost engine — receives stream events and fires animation triggers
   const costSnap = useCostEngine(streamEvents, (anim) => {
-    const { key, delta } = anim
-    // Resolve session from key
-    const sessById  = key.startsWith('session:') ? sessions.find(s => s.id === key.slice(8)) : null
-    const sessByCwd = !sessById ? sessions.find(s => normPath(s.cwd) === key) : null
-    const sess = sessById ?? sessByCwd
+    const { delta, sessionId: _animSid } = anim
+    // 認人一律先用 sessionId。用 cwd 反查的話，同一專案下的每間聊天室 cwd 都一樣 →
+    // find 永遠命中清單第一列＝所有花費都記到最上面那間（少爺 2026-08-15 回報的病灶）。
+    // cwd 只在事件沒帶 sessionId（init 前的 stderr/queue 類）時當退路。
+    // ⭐ 少爺 2026-08-15：「每個聊天室內的演出，時機與錢的是一樣的」——所以錢與演出必須同一把
+    // 認人鑰匙。原本這裡多一條 cwd 退路、階段效果卻沒有：沒帶 sessionId 的事件會讓錢動（而且因為
+    // 同專案 cwd 相同，永遠落在清單第一列）但演出不動＝兩者脫鉤，也就是最上面那列莫名跳錢的來源。
+    // 統一只認 sessionId：認不出來就兩邊都不動，寧可不演也不要演錯人。
+    const _sess = _animSid ? sessions.find(s => s.id === _animSid) : null
 
-    // ADD delta to historyCosts baseline for live subprocess runs only.
-    // session_live events are historical replays already captured in the API baseline — skip them.
-    const trueTotal = (historyCosts[sess?.id] ?? 0) + delta
-    if (sess && !key.startsWith('session:')) {
-      setHistoryCosts(prev => ({ ...prev, [sess.id]: (prev[sess.id] ?? 0) + delta }))
+    // 兩種來源都要累加到該室的總額（少爺 2026-08-15 定調：Sessions 列內的錢＋錢旁邊的演出
+    // 不分聊天室一律要演）。原本只認 subprocess（source==='stream'）、把 session_live 當歷史重播跳過，
+    // 導致 VS Code 出身的聊天室那一欄金額從頭到尾不動 —— 演出沒有「錢」可以長。
+    // 重播不會重複計：server 的 tail 從當下行數起算（index.js parseNewLines(filePath, 0) 只取新行），
+    // 且 subprocess 跑動中不發 session_live（emitSessionLive 明文擋掉），兩路來源不重疊。
+    const _trueTotal = (historyCosts[_sess?.id] ?? 0) + delta
+    if (_sess) {
+      setHistoryCosts(prev => ({ ...prev, [_sess.id]: (prev[_sess.id] ?? 0) + delta }))
     }
 
-    // Fire animation only when Chat tab is active AND this is the currently open session
-    const activeSid = activeChatSessionRef.current
-    const isCurrentChat = sess
-      ? sess.id === activeSid
-      : key === normPath('') // fallback: never match
-    if (activeTabRef.current === 'chat' && isCurrentChat) {
-      setAnimQueue(q => [...q, { ...anim, total: trueTotal, sessionName: sess?.displayName ?? '' }])
+    // 面板級演出（BountyToast / BountyOverlay 全螢幕）只有當前開著的那間聊天室能播；
+    // 逐室的演出走 SessionItem 列內 5 階段顯示，不從這裡出。
+    if (activeTabRef.current === 'chat' && _sess && _sess.id === activeChatSessionRef.current) {
+      setAnimQueue(q => [...q, { ...anim, total: _trueTotal, sessionName: _sess.displayName ?? '' }])
     }
   })
 
@@ -1967,10 +2112,8 @@ export default function App() {
   function handleContinueInChat({ sessionId, projectPath }) {
     chatProjectPathRef.current = projectPath ?? ''
     setSelectedId(sessionId)   // sync selected session so name + cost animations match chat
-    setChatBaseline(historyCosts[sessionId] ?? 0)
-    setChatRunning(0)
-    setChatLastDelta(null)
-    setChatStage(1)
+    clearTimeout(stage3TimersRef.current[sessionId])
+    patchChatCost(sessionId, { ...CHAT_COST_IDLE, baseline: historyCosts[sessionId] ?? 0 })
     setChatInit({ sessionId, projectPath })
     setActiveTab('chat')
   }
@@ -1987,81 +2130,127 @@ export default function App() {
     setActiveTab('chat')
   }
 
-  // Reset stage state whenever the selected session changes
+  // Arm the replay guard whenever the selected session changes（只影響當前室的 session_live
+  // 重播判定；各室自己的演出狀態留在 chatCostMap 裡，切換聊天室不再把它洗掉）
   useEffect(() => {
     if (!selectedId) return
-    setChatBaseline(historyCosts[selectedId] ?? 0)
-    setChatRunning(0)
-    setChatLastDelta(null)
-    setChatStage(1)
-    // Give replays 3s to flush before we start processing session_live cost events
     sessionLiveStartRef.current = Date.now() + 3000
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId])
 
-  // Keep chatBaseline in sync when historyCosts loads (covers async API + auto-selected sessions)
+  // Keep baseline in sync when historyCosts loads (covers async API + auto-selected sessions)
   const selectedCost = selectedId ? (historyCosts[selectedId] ?? 0) : 0
   useEffect(() => {
-    if (selectedId && chatStage === 1) setChatBaseline(selectedCost)
+    patchChatCost(selectedId, c => (c.stage === 1 && c.baseline !== selectedCost ? { ...c, baseline: selectedCost } : c))
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedCost])
+  }, [selectedCost, selectedId])
 
-  // Stage 2 → 3 auto-transition (2.5s after first token)
-  useEffect(() => {
-    if (chatStage !== 2) return
-    const t = setTimeout(() => setChatStage(3), 2500)
-    return () => clearTimeout(t)
-  }, [chatStage])
+  // 某室收到本輪第一筆 token：鎖 baseline（跑動中 historyCosts 會邊長，baseline 必須凍在開跑那刻）
+  function noteAssistantCost(sessionId, delta) {
+    // ⚠️ 不用「靜默 N 秒」判定收工：一個長工具呼叫就靜默好幾十秒，結算會在對話中途亂演。
+    // 收工訊號＝claude_stream 的 result 事件，或 session status 由 active 轉離（見 WS session 分支）。
+    //
+    // 每一筆花費都重新點亮綠色並重置 1 秒熄滅計時（少爺 2026-08-15 規格）。原本只有「本輪第一筆」
+    // 才 arm、之後固定 2.5 秒轉階段 3，等於後續再怎麼花錢都不會再亮綠。
+    // ⚠️ 計時器在 updater 外面 arm：patchChatCost 的 updater 在 StrictMode 會被呼叫兩次。
+    armStage3(sessionId)
+    clearTimeout(settleTimersRef.current[sessionId])   // 又有新花費＝這輪還沒結束
+    patchChatCost(sessionId, c => {
+      const _fresh = c.stage === 1 || c.stage === 4    // 從閒置或結算中被新花費喚醒＝本輪起點
+      return {
+        stage:     2,                                   // 有新變化就回到「綠色亮著」
+        // 後蓋前：每筆花費把序號 +1，讓綠色那顆 remount＝跳過當前進度重播下一筆
+        // （少爺 2026-08-15：不可以用金額當 key，連續兩筆同額就不會重播）
+        deltaSeq:  (c.deltaSeq ?? 0) + 1,
+        // 開跑鎖 baseline＝本輪之前的權威總額；historyCosts 尚未 seed 時退回舊值，不要鎖成 0
+        baseline:  _fresh ? (historyCostsRef.current[sessionId] ?? c.baseline ?? 0) : c.baseline,
+        running:   _fresh ? delta : c.running + delta,
+        lastDelta: delta,
+      }
+    })
+  }
 
-  // Watch streamEvents to drive chat cost stages (both dashboard chat and external VS Code)
+  // 某室跑完：全螢幕謝幕是面板級演出 → 只有當前開著的室播；背景室直接回 idle，
+  // 免得少爺之後切過去才突然補演一段過期的謝幕
+  function noteRunEnd(sessionId) {
+    if (hitLimitSessions.has(sessionId)) return
+    clearTimeout(stage3TimersRef.current[sessionId])
+    // 🐛 這裡原本把「讀當前值」寫在 patchChatCost 的 updater 裡，而 updater 要等 render 才跑 →
+    // 同步讀到的永遠是 null → 一律提早 return → 滿版結算從來沒開過、列內也沒人把它收回 idle
+    // （少爺 2026-08-15 回報「卡在這個階段而且沒有滿版結算」的真因）。改成同步讀 ref。
+    const _cur = chatCostMapRef.current[sessionId]
+    dbg('noteRunEnd', {
+      sid: sessionId.slice(0, 8), stage: _cur?.stage ?? null, running: _cur?.running ?? null,
+      selected: (activeChatSessionRef.current ?? '').slice(0, 8), tab: activeTabRef.current,
+    })
+    // 放寬：只要這輪確實有花到錢就結算，不再硬性要求停在階段 2/3
+    // （階段可能被其他路徑改掉，卡在條件上就整段不演＝少爺 2026-08-15「又沒看到總結算」）
+    if (!_cur || !(_cur.running > 0)) return
+    patchChatCost(sessionId, c => ({ ...c, stage: 4 }))           // 列內結算：每間都演
+    // 全螢幕結算是面板級的，只有當前開著的那間額外播
+    if (sessionId === activeChatSessionRef.current) {
+      setSettleOverlay({ sid: sessionId, baseline: _cur.baseline, running: _cur.running })
+    }
+    clearTimeout(settleTimersRef.current[sessionId])
+    settleTimersRef.current[sessionId] = setTimeout(() => {
+      // 收尾時 baseline 對齊權威總額（historyCosts），下一輪才不會再拿到過期的 baseline
+      patchChatCost(sessionId, c => (c.stage === 4
+        ? { ...CHAT_COST_IDLE, baseline: historyCostsRef.current[sessionId] ?? (c.baseline + c.running) }
+        : c))
+    }, ROW_SETTLE_MS)
+  }
+
+  // Watch streamEvents to drive per-session chat cost stages (dashboard chat + external VS Code)
   useEffect(() => {
-    if (!streamEvents.length || !selectedId) return
-    const ev = streamEvents[streamEvents.length - 1]
+    if (!streamEvents.length) return
+    // 補處理所有還沒看過的事件（不是只看最後一筆）——否則同批次進來的花費會被吞掉、該跳的錢不跳
+    const _fresh = streamEvents.filter(e => (e._seq ?? 0) > lastSeqRef.current)
+    if (!_fresh.length) return
+    lastSeqRef.current = _fresh[_fresh.length - 1]._seq ?? lastSeqRef.current
+    for (const ev of _fresh) handleStreamEvent(ev)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streamEvents])
+
+  function handleStreamEvent(ev) {
 
     // ── claude_stream: subprocess events from dashboard ChatPanel ─────────
+    // 認人只靠 server 帶的 sessionId（index.js:1836 自 init 起每筆都有）。原本比對 projectPath＝
+    // 同專案多室共用一把鍵，別室的花費會記到當前選取那列（少爺 2026-08-15 回報的病灶）。
     if (ev.type === 'claude_stream') {
-      // Match against chatProjectPathRef (reliable) OR active session cwd (fallback)
-      const chatPath = chatProjectPathRef.current
-      const activeSession = sessions.find(s => s.id === selectedId)
-      const expectedPath = chatPath || activeSession?.cwd || ''
-      if (!expectedPath || normPath(ev.projectPath) !== normPath(expectedPath)) return
+      const _sid = ev.sessionId
+      if (!_sid) return
       const { event } = ev
       if (event?.type === 'system' && event?.subtype === 'init') {
         // New run starting — reset stage so Stage 2 can fire again
-        setChatStage(1)
+        clearTimeout(stage3TimersRef.current[_sid])
+        patchChatCost(_sid, c => ({ ...CHAT_COST_IDLE, baseline: c.baseline }))
       } else if (event?.type === 'assistant' && event.message?.usage) {
-        const d = computeDeltaCost(event.message?.model ?? '', event.message.usage)
-        setChatRunning(r => r + d)
-        setChatLastDelta(d)
-        setChatStage(s => s === 1 ? 2 : s)
+        noteAssistantCost(_sid, computeDeltaCost(event.message?.model ?? '', event.message.usage))
       } else if (event?.type === 'result') {
-        if (!hitLimitSessions.has(selectedId)) {
-          setChatStage(s => (s === 2 || s === 3) ? 4 : s)
-        }
+        noteRunEnd(_sid)
       }
       return
     }
 
     // ── session_live: VS Code external session live tail ─────────────────
-    if (ev.type === 'session_live' && ev.sessionId === selectedId) {
-      // Skip replay batches arriving within 3s of session switch
-      if ((ev._arrivalTs ?? 0) < sessionLiveStartRef.current) return
+    if (ev.type === 'session_live') {
+      const _sid = ev.sessionId
+      if (!_sid) return
+      // Skip replay batches arriving within 3s of session switch（只有當前室會被切換影響）
+      if (_sid === selectedId && (ev._arrivalTs ?? 0) < sessionLiveStartRef.current) return
+      // session_live 訊息形狀＝{ role, text, ts, _usage:{model,usage} }，沒有 type/message 欄位
+      // （server parseNewLines 實查）。原本比對 msg.type==='assistant' 永遠不成立＝這條路從沒通過。
+      // _usage 掛在該批最後一則上（可能是 tool_use/thinking），所以只認 _usage。
       for (const msg of ev.messages ?? []) {
-        if (msg.type === 'assistant' && msg.message?.usage) {
-          const d = computeDeltaCost(msg.message?.model ?? '', msg.message.usage)
-          setChatRunning(r => r + d)
-          setChatLastDelta(d)
-          setChatStage(s => s === 1 ? 2 : s)
+        if (msg._usage?.usage) {
+          noteAssistantCost(_sid, computeDeltaCost(msg._usage.model ?? '', msg._usage.usage))
         }
-        if (msg.type === 'result') {
-          if (!hitLimitSessions.has(selectedId)) {
-            setChatStage(s => (s === 2 || s === 3) ? 4 : s)
-          }
-        }
+        // 收工訊號改吃 transcript 內建的 stop_reason='end_turn'（server 標成 _turnEnd）。
+        // 不再依賴 Stop hook —— 實測那個 hook 從沒送達 TC，而 PostToolUse 用同樣寫法卻正常，
+        // 所以問題不在背景執行（我先前的推論錯了），而是 Stop 根本沒被呼叫。
+        if (msg._turnEnd) { dbg('turnEnd', { sid: _sid.slice(0, 8) }); noteRunEnd(_sid) }
       }
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [streamEvents])
+  }
   // Auto-watch active sessions so session_live events flow into cost engine
   const watchedRef = useRef(new Set())
   function autoWatch(sessionId) {
@@ -2077,6 +2266,11 @@ export default function App() {
     if (msg.type === 'state') {
       setSessions(msg.sessions)
       setSelectedId(prev => prev ?? msg.sessions[0]?.id ?? null)
+      // ⚠️ 先清 autoWatch 記憶再重掛（少爺 2026-08-15「演出不見了」的真因）：
+      // server 重啟會清空 watchedSessions，但這份 ref 活過 WS 重連 → 每個 session 都被當成
+      // 「已經掛過了」而不再送 /api/session/watch → 檔案 tail 永遠不重掛 → session_live 斷流
+      // → 列內花費演出整個消失，且要重整頁面才會好。state 是每次新連線必到的訊息，在這裡歸零最準。
+      watchedRef.current.clear()
       // Auto-watch all active sessions on reconnect
       for (const s of msg.sessions ?? []) {
         if (s.status === 'active') autoWatch(s.id)
@@ -2094,9 +2288,22 @@ export default function App() {
     if (msg.type === 'git_draft_update') {
       try { window.dispatchEvent(new CustomEvent('tc-git-draft', { detail: msg.drafts })) } catch {}
     }
+    // 模型目錄更新（少爺 2026-08-15）：server 每日重掃或手動 refresh 後推來，選單與價目就地換新
+    if (msg.type === 'model_catalog') {
+      setModelCatalog(msg.catalog)
+      setModelPricing(msg.catalog)
+    }
     if (msg.type === 'session') {
       // Auto-watch when a session becomes active
       if (msg.session?.status === 'active') autoWatch(msg.session.id)
+      // 結算演出的正確觸發點＝「當前會話結束」（少爺 2026-08-15 原話）。
+      // VS Code 出身的聊天室 transcript 沒有 result 事件（實查 548adb89 只有 user/assistant/
+      // attachment/queue-operation），先前我改用「靜默 5 秒」判定收工是錯的——我跑一個長工具就
+      // 靜默超過 5 秒，結算會在對話中途反覆亂演。改用 server 推的 status 由 active 轉離。
+      if (msg.session?.id && msg.session.status !== 'active') {
+        dbg('session-not-active', { sid: msg.session.id.slice(0, 8), status: msg.session.status })
+        noteRunEnd(msg.session.id)
+      }
       // Cancel armed auto-resume if session woke up on its own (credits added / account switched)
       if (msg.session?.status !== 'sleeping') {
         setAutoResumeMap(prev => {
@@ -2132,7 +2339,9 @@ export default function App() {
       // 故不清 selectedId — 讓使用者繼續看歷史內容，即便該 session 被 server 從 active 清單移除。
     }
     if (msg.type === 'claude_stream' || msg.type === 'session_live') {
-      setStreamEvents(prev => [...prev.slice(-200), { ...msg, _arrivalTs: Date.now() }])
+      // _seq：同一個 render 批次可能吞進多筆 WS 訊息，消費端只看最後一筆會漏掉中間的花費，
+      // 造成「有些 token 沒跳錢」。加流水號讓消費端補齊所有沒處理過的（少爺 2026-08-15）
+      setStreamEvents(prev => [...prev.slice(-200), { ...msg, _arrivalTs: Date.now(), _seq: ++streamSeqRef.current }])
 
       // Detect usage limit hit — auto-arm ⏰ button
       const isLimit = (() => {
@@ -2207,14 +2416,15 @@ export default function App() {
       {isOverlay && currentAnim && (
         <BountyOverlay key={currentAnim._uid ?? 'overlay'} anim={currentAnim} settings={bountySettings} onDone={handleAnimDone} />
       )}
-      {/* Stage 4 — full-screen chat session summary */}
-      {chatStage === 4 && (
+      {/* 全螢幕結算 — 面板級，只有當前開著的聊天室額外播（列內那份每間都演，見 SessionItem 階段 4）。
+          用獨立 state 而非讀 chatCostMap：列內 2 秒就收，全螢幕要跑滿自己的 5 秒，兩者不能互相截斷。*/}
+      {settleOverlay && (
         <div className="fixed inset-0 z-[75] flex flex-col items-center justify-center gap-4 overlay-in"
           style={{ background: 'rgba(0,0,0,0.96)' }}>
           <div className="text-[7px] text-[var(--gold)]/40 tracking-[0.35em] uppercase">─── The Continental ───</div>
           <div className="text-[10px] text-[var(--gold)]/70 tracking-widest uppercase mb-2">Chat Session Settled</div>
-          <Stage4Anim baseline={chatBaseline} chatRunning={chatRunning}
-            onDone={() => setChatStage(1)} />
+          <Stage4Anim baseline={settleOverlay.baseline} chatRunning={settleOverlay.running}
+            onDone={() => setSettleOverlay(null)} />
         </div>
       )}
       {contractModal && (
@@ -2346,11 +2556,12 @@ export default function App() {
                     autoResumeFireAt={autoResumeMap[s.id]?.fireAt ?? null}
                     onToggleAutoResume={() => toggleAutoResume(s.id)}
                     hitLimit={hitLimitSessions.has(s.id)}
-                    isChatSession={s.id === selectedId}
-                    chatStage={s.id === selectedId ? chatStage : 1}
-                    chatRunning={s.id === selectedId ? chatRunning : 0}
-                    chatLastDelta={s.id === selectedId ? chatLastDelta : null}
-                    chatBaseline={s.id === selectedId ? chatBaseline : 0}
+                    isChatSession
+                    chatStage={chatCostOf(s.id).stage}
+                    chatRunning={chatCostOf(s.id).running}
+                    chatLastDelta={chatCostOf(s.id).lastDelta}
+                    chatBaseline={chatCostOf(s.id).baseline}
+                    chatDeltaSeq={chatCostOf(s.id).deltaSeq}
                     onPermissionResponse={(permId, action) => send({ type: 'permission_response', permissionId: permId, action })}
                     showChatPermission
                   />
@@ -2428,7 +2639,7 @@ export default function App() {
                 setContractModal({ sessionName: s.displayName, costData: { total, byType: live?.byType ?? d.byType ?? {}, byModel: live?.byModel ?? d.byModel ?? {} } })
               }}
               onPermissionResponse={(permId, action) => send({ type: 'permission_response', permissionId: permId, action })}
-              chatStage={chatStage} chatRunning={chatRunning} chatLastDelta={chatLastDelta} chatBaseline={chatBaseline}
+              chatCostMap={chatCostMap}
             />}
             {activeTab === 'more'      && <MobileMorePanel sessions={sessions} onTriggerChat={handleTodoTriggerChat} />}
           </div>

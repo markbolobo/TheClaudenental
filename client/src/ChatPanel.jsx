@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef, useLayoutEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { MODEL_OPTIONS, EFFORT_OPTIONS } from './modelOptions.js'
+import { useModelOptions, EFFORT_OPTIONS } from './modelOptions.js'
 import { confirmIfLiveInteractive } from './liveSessionGuard.js'
 import {
   useChatOutline, OutlineMinimap, mdComponents, normPath, Tooltip,
@@ -244,6 +244,7 @@ function ThinkingBlock({ text, fullMessage }) {
 }
 
 function ChatPanel({ streamEvents, chatInit, selectedId }) {
+  const MODEL_OPTIONS = useModelOptions()   // server 目錄推來就自動換清單（少爺 2026-08-15）
   const [projectPath, setProjectPath] = useState('C:/Project/RomanPrototype')
   // 少爺 2026-07-14：Chat 可選 AI 模型＋強度（空字串=預設；記憶在 localStorage 跨開啟保留）
   const [chatModel, setChatModel] = useState(() => localStorage.getItem('tc_chat_model') ?? '')

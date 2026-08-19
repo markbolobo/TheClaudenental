@@ -2,12 +2,26 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
+// 離線退路價目表。實際值由 server `/api/models` 推來後就地覆寫（見 setModelPricing）——
+// 少爺 2026-08-15：原本這三個條目停在 4.6 世代，Opus 5 / Sonnet 5 的花費全部按 Sonnet 4.6 回算＝錯價。
 export const MODEL_PRICING = {
-  'claude-sonnet-4-6':         { input: 3,  output: 15, cacheRead: 0.30, cacheWrite: 3.75 },
-  'claude-opus-4-6':           { input: 5,  output: 25, cacheRead: 0.50, cacheWrite: 6.25 },
-  'claude-haiku-4-5-20251001': { input: 1,  output: 5,  cacheRead: 0.10, cacheWrite: 1.25 },
+  'claude-opus-5':     { input: 5,  output: 25, cacheRead: 0.50, cacheWrite: 6.25 },
+  'claude-sonnet-5':   { input: 3,  output: 15, cacheRead: 0.30, cacheWrite: 3.75 },
+  'claude-haiku-4-5':  { input: 1,  output: 5,  cacheRead: 0.10, cacheWrite: 1.25 },
 }
-const DEFAULT_P    = MODEL_PRICING['claude-sonnet-4-6']
+let DEFAULT_P = MODEL_PRICING['claude-sonnet-5']
+
+/**
+ * 用 server 目錄覆寫價目表。就地改 MODEL_PRICING 的 key（ContractModal 直接列舉它，
+ * 換整個物件參考的話那份顯示會停在舊值），並重設未知模型的退路價。
+ */
+export function setModelPricing(InCatalog) {
+  const _models = InCatalog?.models
+  if (!Array.isArray(_models) || !_models.length) return
+  for (const _k of Object.keys(MODEL_PRICING)) delete MODEL_PRICING[_k]
+  for (const _m of _models) MODEL_PRICING[_m.id] = { ..._m.pricing }
+  DEFAULT_P = MODEL_PRICING['claude-sonnet-5'] ?? _models[0].pricing
+}
 export const S_MILESTONES = [1, 3, 7, 15]
 export const ALL_TIERS = ['L1','L2','L3','L4','H1','H2','H3','H4','S1','S2','S3','S4','C']
 
@@ -76,9 +90,9 @@ function fmtTok(n) {
 // ─── useCostEngine ────────────────────────────────────────────────────────────
 
 export function useCostEngine(streamEvents, onAnimate) {
-  const cbRef  = useRef(onAnimate)
-  const data   = useRef({})   // { [normProjectPath]: CostData }
-  const lastEv = useRef(null)
+  const cbRef   = useRef(onAnimate)
+  const data    = useRef({})   // { [costKey]: CostData }
+  const lastSeq = useRef(0)    // 已處理到第幾號事件
   const [snap, setSnap] = useState({})
 
   // Keep callback ref fresh
@@ -86,12 +100,17 @@ export function useCostEngine(streamEvents, onAnimate) {
 
   useEffect(() => {
     if (!streamEvents.length) return
-    const ev = streamEvents[streamEvents.length - 1]
-    if (ev === lastEv.current) return
-    lastEv.current = ev
+    // ⚠️ 逐筆補處理所有沒看過的事件。原本只讀 streamEvents 最後一筆：同一個 render 批次吞進
+    // 多筆 WS 訊息時，中間那幾筆的花費直接消失＝少爺 2026-08-15 回報的「又開始漏錢」。
+    // App 的階段效果早先已改成逐筆，這裡沒跟上，兩邊因此對不起來（錢少、演出有）。
+    const fresh = streamEvents.filter(e => (e._seq ?? 0) > lastSeq.current)
+    if (!fresh.length) return
+    lastSeq.current = fresh[fresh.length - 1]._seq ?? lastSeq.current
 
     // ── Helper: process a single assistant event object ──────────────────
-    function processAssistant(event, key) {
+    // meta = { sessionId, projectPath, source } — 一路帶到 onAnimate，讓呼叫端用 sessionId
+    // 認人，不必從 key 字串反推（少爺 2026-08-15：演出對象必須是產生花費的那間聊天室）
+    function processAssistant(event, key, meta) {
       const model = event.message?.model
       const usage = event.message?.usage
       if (!usage) return
@@ -122,14 +141,14 @@ export function useCostEngine(streamEvents, onAnimate) {
         const m = S_MILESTONES[i]
         if (d.total >= m && !d.milestonesFired.has(m)) {
           d.milestonesFired.add(m)
-          cbRef.current({ tier: 'S', level: i + 1, delta, total: d.total, key })
+          cbRef.current({ tier: 'S', level: i + 1, delta, total: d.total, key, ...meta })
           sTiered = true
           break
         }
       }
       if (!sTiered) {
         const t = classifyTier(delta)
-        cbRef.current({ ...t, delta, total: d.total, key })
+        cbRef.current({ ...t, delta, total: d.total, key, ...meta })
       }
       setSnap(prev => ({
         ...prev,
@@ -137,23 +156,38 @@ export function useCostEngine(streamEvents, onAnimate) {
       }))
     }
 
+    for (const ev of fresh) handleOne(ev)
+
+    function handleOne(ev) {
     // ── claude_stream (subprocess / Chat panel) ──────────────────────────
+    // 身分鍵以 sessionId 為主：server 自 init 起每筆 stdout 事件都帶 sessionId（index.js:1836）。
+    // projectPath 在同一專案開多間聊天室時不是唯一鍵，只當拿不到 sessionId 時的退路。
     if (ev.type === 'claude_stream') {
-      const { event, projectPath } = ev
-      const key = normPath(projectPath)
-      if (event?.type === 'assistant') processAssistant(event, key)
+      const { event, projectPath, sessionId } = ev
+      const key  = sessionId ? `session:${sessionId}` : normPath(projectPath)
+      const meta = { sessionId: sessionId ?? null, projectPath: projectPath ?? null, source: 'stream' }
+      if (event?.type === 'assistant') processAssistant(event, key, meta)
       if (event?.type === 'result') {
         const d = data.current[key]
-        if (d?.total > 0) cbRef.current({ tier: 'C', level: null, delta: 0, total: d.total, key })
+        if (d?.total > 0) cbRef.current({ tier: 'C', level: null, delta: 0, total: d.total, key, ...meta })
       }
     }
 
     // ── session_live (VS Code live tail) ─────────────────────────────────
+    // ⚠️ session_live 的訊息形狀是 { role, text, ts, _usage:{model,usage} }，**不是** claude_stream
+    // 的 { type:'assistant', message:{...} }（server index.js parseNewLines 實查）。原本這裡比對
+    // msg.type==='assistant' 永遠不成立 → VS Code 出身的聊天室從來沒有進過成本引擎，
+    // 列內花費演出對它們等於不存在（少爺 2026-08-15 回報「兩種演出都沒看到」的真因）。
+    // 另：_usage 是掛在該批最後一則訊息上，那則可能是 tool_use/thinking，所以只認 _usage 不看 role。
     if (ev.type === 'session_live') {
-      const key = `session:${ev.sessionId}`   // keyed by sessionId
+      const key  = `session:${ev.sessionId}`   // keyed by sessionId
+      const meta = { sessionId: ev.sessionId ?? null, projectPath: null, source: 'live' }
       for (const msg of ev.messages ?? []) {
-        if (msg.type === 'assistant') processAssistant(msg, key)
+        if (msg._usage?.usage) {
+          processAssistant({ message: { model: msg._usage.model, usage: msg._usage.usage } }, key, meta)
+        }
       }
+    }
     }
   }, [streamEvents])
 

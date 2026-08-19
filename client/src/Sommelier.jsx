@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
-import { MODEL_OPTIONS, EFFORT_OPTIONS } from './modelOptions.js'
+import { useModelOptions, EFFORT_OPTIONS } from './modelOptions.js'
 import { confirmIfLiveInteractive, fetchLiveInteractiveIds } from './liveSessionGuard.js'
 import { WorkflowLauncher } from './WorkflowLauncher.jsx'
 
@@ -494,6 +494,7 @@ function AssetView({ assetGraph, projectId, query, onJumpToSymbol, cartKeys, onT
 }
 
 export function SommelierPanel({ onGoToChat, projects: projectsProp = null, activeProjectId = null, onSelectProject = null, onManageProjects = null }) {
+  const MODEL_OPTIONS = useModelOptions()   // server 目錄推來就自動換清單（少爺 2026-08-15）
   // 跨專案切換：App 傳入共享狀態時用它（與 QA 分頁同步切換）；未傳入則退回面板內自管（獨立使用相容）
   const [projectsLocal, setProjectsLocal] = useState([])
   const [projectIdLocal, setProjectIdLocal] = useState(null)

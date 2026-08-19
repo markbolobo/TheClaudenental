@@ -3,7 +3,7 @@
 // A 計畫區（目的+方法）/ B 即時區（進度+截圖+異常）/ C 歷史區 + 留言雙向
 // ws 更新走 window 'tc-qa-run-update' 自訂事件（App.jsx handleServerMessage 一行轉發，不侵入既有結構）
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { MODEL_OPTIONS, EFFORT_OPTIONS } from './modelOptions.js'
+import { useModelOptions, EFFORT_OPTIONS } from './modelOptions.js'
 import { confirmIfLiveInteractive } from './liveSessionGuard.js'
 import { WorkflowLauncher } from './WorkflowLauncher.jsx'
 
@@ -35,6 +35,7 @@ function StatusBadge({ status }) {
 }
 
 export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, projects = [], activeProjectId = null, onSelectProject = null, onManageProjects = null }) {
+  const MODEL_OPTIONS = useModelOptions()   // server 目錄推來就自動換清單（少爺 2026-08-15）
   const [runs, setRuns] = useState([])
   // 少爺 2026-08-07：記住最後的選擇操作（記憶在 localStorage）——切工具列分頁回來，未選擇就保持未選擇、有選就還原選的那筆
   const [selectedRunId, setSelectedRunId] = useState(() => localStorage.getItem('tc_qa_selected_run') || null)

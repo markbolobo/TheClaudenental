@@ -7,15 +7,16 @@ import path from 'path'
 import { spawnSync, spawn } from 'child_process'
 import os from 'os'
 import crypto from 'crypto'
+import { buildCatalog, getCatalog, priceFor } from './modelCatalog.js'
 
 const PORT = 3001
 const CLAUDIA_URL = 'http://localhost:48901'
 
-const PRICING = {
-  'claude-sonnet-4-6':         { input: 3,  output: 15, cacheRead: 0.30, cacheWrite: 3.75 },
-  'claude-opus-4-6':           { input: 5,  output: 25, cacheRead: 0.50, cacheWrite: 6.25 },
-  'claude-haiku-4-5-20251001': { input: 1,  output: 5,  cacheRead: 0.10, cacheWrite: 1.25 },
-}
+// 模型定價改由 modelCatalog 供應（少爺 2026-08-15「與時俱進」＋「要能自動更新」）——
+// 原本三個硬編條目已停在 4.6 世代，Opus 5 / Sonnet 5 的花費全部用錯價回算。
+// 目錄＝內建表 ∪ 掃 claude.exe 得到的 alias ∪ 手動覆寫，開機與每日重建一次。
+const MODEL_REFRESH_MS = 24 * 60 * 60 * 1000
+function priceOf(InModelId) { return priceFor(InModelId, getClaudeExe()) }
 
 const app = Fastify({ logger: false, bodyLimit: 50 * 1024 * 1024 }) // 50MB — supports large image base64 payloads
 await app.register(wsPlugin)
@@ -654,7 +655,7 @@ app.get('/api/usage/heat', async () => {
   // Claude Code JSONL stores type:"assistant" entries with message.usage token counts.
   // There is no type:"result" with total_cost_usd — must compute cost from usage fields.
   const computeCost = (model, usage) => {
-    const p = PRICING[model] ?? PRICING['claude-sonnet-4-6']
+    const p = priceOf(model)
     return (
       (usage.input_tokens                ?? 0) * p.input      / 1_000_000 +
       (usage.output_tokens               ?? 0) * p.output     / 1_000_000 +
@@ -1162,8 +1163,8 @@ function foldHistoryLine(entry, obj) {
     entry.resultUsd = (entry.resultUsd ?? 0) + obj.total_cost_usd
   if (obj.type === 'assistant' && obj.message?.usage) {
     const u  = obj.message.usage
-    const mn = obj.message.model ?? 'claude-sonnet-4-6'
-    const p  = PRICING[mn] ?? PRICING['claude-sonnet-4-6']
+    const mn = obj.message.model ?? null
+    const p  = priceOf(mn)
     entry.estUsd = (entry.estUsd ?? 0) + (
       (u.input_tokens ?? 0) * p.input +
       (u.output_tokens ?? 0) * p.output +
@@ -1408,7 +1409,6 @@ app.get('/api/history/:sessionId', async (request) => {
   let costUsd = null
   const byType   = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
   const byModel  = {}   // { [model]: { input, output, cacheRead, cacheWrite, cost } }
-  const DEFAULT_P = PRICING['claude-sonnet-4-6']
   try {
     const lines = fs.readFileSync(filePath, 'utf-8').split('\n').filter(Boolean)
     for (const l of lines) {
@@ -1435,7 +1435,7 @@ app.get('/api/history/:sessionId', async (request) => {
           if (obj.message?.usage) {
             const u   = obj.message.usage
             const mn  = obj.message.model ?? 'unknown'
-            const p   = PRICING[mn] ?? DEFAULT_P
+            const p   = priceOf(mn)
             byType.input      += u.input_tokens                ?? 0
             byType.output     += u.output_tokens               ?? 0
             byType.cacheRead  += u.cache_read_input_tokens     ?? 0
@@ -1535,6 +1535,13 @@ function parseNewLines(filePath, fromLine) {
             const last = messages[messages.length - 1]
             if (last) last._usage = { model: obj.message.model, usage: obj.message.usage }
           }
+          // 回合結束標記（少爺 2026-08-15「總結算沒播」根治）——不靠 Stop hook。
+          // 實查本機 transcript：中途呼叫工具的 assistant 訊息 stop_reason='tool_use'（436 筆），
+          // 真正講完那一則才是 'end_turn'（15 筆）。這是 transcript 內建、不會漏的收工訊號。
+          if (obj.message?.stop_reason === 'end_turn') {
+            const last = messages[messages.length - 1]
+            if (last) last._turnEnd = true
+          }
         }
       } catch {}
     }
@@ -1567,9 +1574,17 @@ function flushSessionLive(sessionId) {
 app.post('/api/session/watch', async (request) => {
   const { sessionId } = request.body
   if (!sessionId) return { ok: false }
-  // Stop watching previous session if different
+  // 監看多室並存（少爺 2026-08-15：花費演出要對在各自聊天室）——原本「切換聊天室就關掉其他
+  // 所有 tail」，同時運作的多間聊天室只有一間發得出 session_live，其餘無從演出。改成只回收
+  // 「已不活躍」的監看：清理照舊做，active/waiting 的聊天室各自保留 tail。
+  // ⚠️ 停監看要用 fs.unwatchFile（StatWatcher 沒有 close()，原本那行是被 catch 吞掉的空動作＝
+  // 只從 map 移除、poller 實際仍掛著）
   for (const [id, w] of watchedSessions) {
-    if (id !== sessionId) { try { w.watcher.close() } catch {}; watchedSessions.delete(id) }
+    if (id === sessionId) continue
+    const _s = sessions.get(id)
+    if (_s && (_s.status === 'active' || _s.status === 'waiting')) continue
+    try { fs.unwatchFile(w.filePath) } catch {}
+    watchedSessions.delete(id)
   }
   // ── Continue in Chat 側欄聯動（少爺 2026-07-20）──────────────────────────────
   // 側欄自動退場（SESSION_RETIRE_MS, 8b92c09）後歷史聊天室不在 sessions 清單，而 App 的
@@ -2036,7 +2051,36 @@ app.get('/health', async () => ({
   name: 'TheClaudenental',
   sessions: sessions.size,
   clients: clients.size,
+  // 診斷用（少爺 2026-08-15「演出看不到」）：列內花費演出的活水源頭是 session_live，
+  // 而 session_live 只有掛著 tail 的聊天室才會發 —— 沒掛上就是靜默無演出，從外面看不出差別
+  watched: [...watchedSessions.keys()],
+  activeSessions: [...sessions.values()].filter(s => s.status === 'active').map(s => s.id),
 }))
+
+// ─── client 診斷回報（少爺 2026-08-15「總結算又沒看到」）──────────────────────
+// 瀏覽器 console 我看不到，讓 client 把關鍵判斷路徑打回 server log，用實據定位而非推論。
+// ⚠️ 暫時性診斷，問題收斂後移除。
+app.post('/api/debug/client', async (request) => {
+  const { tag, detail } = request.body ?? {}
+  console.log(`[client] ${tag} ${JSON.stringify(detail ?? {})}`)
+  emitLog(null, `[client] ${tag} ${JSON.stringify(detail ?? {})}`, 'debug')
+  return { ok: true }
+})
+
+// ─── 模型目錄 ─────────────────────────────────────────────────────────────────
+// client 的模型下拉與成本演出都吃這支，不再各自硬編一份（少爺 2026-08-15）
+
+app.get('/api/models', async () => getCatalog(getClaudeExe()))
+
+app.post('/api/models/refresh', async () => {
+  const _cat = buildCatalog(getClaudeExe())
+  broadcast({ type: 'model_catalog', catalog: _cat })
+  logEvent('models.refresh', {
+    source: _cat.source, count: _cat.models.length,
+    newlyDiscovered: _cat.newlyDiscovered, estimated: _cat.estimated,
+  })
+  return _cat
+})
 
 // ─── JSONL directory scanner (fallback session discovery) ────────────────────
 // Runs every 8s. Discovers sessions whose hooks may have been missed (e.g. after
@@ -4946,3 +4990,19 @@ for (const [, s] of sessions) {
 // Start JSONL scanner
 scanJsonlSessions()
 setInterval(scanJsonlSessions, SCAN_INTERVAL_MS)
+
+// 模型目錄：開機建一次、每日重建一次。Claude Code 升版帶進新模型 alias 時自動被掃到，
+// 不必有人記得去改三份硬編清單（少爺 2026-08-15「要能自動更新這個功能」）
+{
+  const _cat = buildCatalog(getClaudeExe())
+  console.log(`[models] ${_cat.models.length} models (${_cat.source})`
+    + (_cat.newlyDiscovered.length ? ` · 新發現 ${_cat.newlyDiscovered.join(', ')}` : ''))
+}
+setInterval(() => {
+  const _cat = buildCatalog(getClaudeExe())
+  if (_cat.newlyDiscovered.length) {
+    console.log(`[models] 新發現 ${_cat.newlyDiscovered.join(', ')} — 價格暫沿用同 tier，請到 ${'~/.claude/tc_model_catalog.json'} overrides 校正`)
+    logEvent('models.discovered', { ids: _cat.newlyDiscovered })
+  }
+  broadcast({ type: 'model_catalog', catalog: _cat })
+}, MODEL_REFRESH_MS)
