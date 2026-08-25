@@ -55,7 +55,19 @@ const monitorHeartbeats  = new Map()   // sessionId → last Watch-QAComments he
 // 監看存活 = 最後心跳在 MONITOR_ALIVE_MS 內（Watch-QAComments 輪詢 5s，20s 容 3 拍遺失不誤判死）
 const MONITOR_ALIVE_MS = 20 * 1000
 function isMonitorAlive(sessionId) {
-  return sessionId ? (Date.now() - (monitorHeartbeats.get(sessionId) ?? 0) < MONITOR_ALIVE_MS) : false
+  if (!sessionId) return false
+  const _beat = monitorHeartbeats.get(sessionId)
+  if (!_beat) return false
+  const _ts = typeof _beat === 'object' ? _beat.ts : _beat
+  if (Date.now() - (_ts ?? 0) >= MONITOR_ALIVE_MS) return false
+  // ⭐ 心跳新鮮不等於監看還接得到聊天室（少爺 2026-08-21）：Claude session 收掉後 Watch-QAComments 會變孤兒、
+  //    心跳照送 → 這裡誤判「原地聯動會處理」→ 結案喚醒整個沒送出去。監看端已補自我了結，
+  //    server 這邊再驗一次回報的 PID 還在不在（雙保險：舊版監看還在跑時也擋得住）
+  const _pid = typeof _beat === 'object' ? _beat.pid : null
+  if (_pid) {
+    try { process.kill(_pid, 0) } catch { monitorHeartbeats.delete(sessionId); return false }
+  }
+  return true
 }
 
 // 解析真 python.exe 絕對路徑（少爺 2026-07-17：Monitor 非互動 shell 下裸 `python`＝WindowsApps store shim → exit 127；
@@ -535,15 +547,18 @@ app.post('/hook/UserPromptSubmitSync', async (request, reply) => {
 // 每輪 POST 一次；UserPromptSubmitSync 靠這判斷要不要重掛、qaWake 靠這決定監看死了就秒退無頭
 app.post('/hook/monitor-heartbeat', async (request) => {
   const _sid = request.body?.session
-  if (_sid) monitorHeartbeats.set(_sid, Date.now())
+  const _pid = Number(request.body?.pid) || null
+  if (_sid) monitorHeartbeats.set(_sid, { ts: Date.now(), pid: _pid })
   return { ok: true }
 })
 
 // 監看存活狀態（少爺 2026-07-17：讓「原地聯動有沒有掛上」變成可觀察）——驗證用 + QA 面板顯示
 app.get('/api/qa/monitor-status', async (request) => {
   const _sid = request.query?.session
-  const _beat = _sid ? (monitorHeartbeats.get(_sid) ?? null) : null
-  return { session: _sid ?? null, alive: isMonitorAlive(_sid), lastBeatMs: _beat, ageMs: _beat ? (Date.now() - _beat) : null }
+  const _raw = _sid ? (monitorHeartbeats.get(_sid) ?? null) : null
+  const _beat = _raw ? (typeof _raw === 'object' ? _raw.ts : _raw) : null
+  const _pid = _raw && typeof _raw === 'object' ? _raw.pid : null
+  return { session: _sid ?? null, alive: isMonitorAlive(_sid), lastBeatMs: _beat, pid: _pid, ageMs: _beat ? (Date.now() - _beat) : null }
 })
 
 app.post('/hook/UserPromptSubmit', async (request) => {
@@ -3813,6 +3828,17 @@ function writeGitDrafts(drafts) {
   broadcast({ type: 'git_draft_update', drafts })
 }
 
+// 依規則 Commit 紀錄（少爺 2026-08-20）：auto-commit 子進程提交完把雙語內容回寫，面板「展開檢視」用
+const GIT_AUTOCOMMIT_RESULTS_FILE = path.join(USER_CONFIG_DIR, 'git_autocommit_results.json')
+
+function readGitAutoResults() {
+  try { return JSON.parse(fs.readFileSync(GIT_AUTOCOMMIT_RESULTS_FILE, 'utf8')) } catch { return {} }
+}
+
+function writeGitAutoResults(results) {
+  atomicWriteJson(GIT_AUTOCOMMIT_RESULTS_FILE, results)
+}
+
 function gitRepoRoot(proj) {
   return proj?.git?.repoRoot || proj?.projectRoot || proj?.projectPath || null
 }
@@ -3843,7 +3869,7 @@ app.get('/api/git/projects', async (request, reply) => {
       ...gitProjectPolicy(p),
     }
   })
-  return { ok: true, projects: _projects, drafts: readGitDrafts() }
+  return { ok: true, projects: _projects, drafts: readGitDrafts(), autoResults: readGitAutoResults() }
 })
 
 // 面板現況：分支＋三類檔案清單（staged／已改未 staged／未追蹤）＋最後一筆 commit
@@ -3903,6 +3929,28 @@ app.delete('/api/git/draft/:projectId', async (request, reply) => {
   const _drafts = readGitDrafts()
   delete _drafts[request.params.projectId]
   writeGitDrafts(_drafts)
+  return { ok: true }
+})
+
+// 依規則 Commit 完成回寫（子進程照 buildAutoCommitPrompt 第 5 步 POST）：每專案存最近 10 筆＋推播面板
+app.post('/api/git/auto-commit/result', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const { projectId, hash, message, messageZh, files, branch } = request.body ?? {}
+  if (!findGitProject(projectId)) return { ok: false, error: `專案「${projectId}」未設 git 規則` }
+  if (typeof message !== 'string' || !message.trim()) return { ok: false, error: 'message 不可空白' }
+  const _results = readGitAutoResults()
+  const _entry = {
+    hash: typeof hash === 'string' ? hash.trim() : '',
+    message: message.trim(),
+    messageZh: typeof messageZh === 'string' ? messageZh.trim() : '',
+    files: Array.isArray(files) ? files : [],
+    branch: typeof branch === 'string' ? branch.trim() : '',
+    at: Date.now(),
+  }
+  _results[projectId] = [_entry, ...(_results[projectId] ?? [])].slice(0, 10)
+  writeGitAutoResults(_results)
+  broadcast({ type: 'git_autocommit_result', projectId, result: _entry })
+  logEvent('git.autocommit.result', { projectId, hash: _entry.hash })
   return { ok: true }
 })
 
@@ -3978,7 +4026,10 @@ function buildAutoCommitPrompt(projectId, proj, policy, entry) {
     `3. 訊息寫成 UTF-8 檔後執行（staging／語言／Co-Authored-By 都由腳本處理，不要自己跑 git add / git commit）：`,
     `   powershell -NoProfile -ExecutionPolicy Bypass -File "C:\\Project\\MasterBrain\\.agent\\scripts\\Invoke-ProjectCommit.ps1" -Project ${projectId} -MessageFile <訊息檔>`,
     `4. 腳本回單行 JSON：ok=false 就照 error 修正後重試一次，仍失敗就回報錯誤原文`,
-    `5. ⭐ 最後一定要用**繁體中文**回報給少爺（這是他在聊天室唯一會看到的東西，缺了等於沒交付）：`,
+    `5. 提交成功後把最終內容回寫版控面板（少爺會在 TC 版控區「展開」檢視，缺了他就看不到你寫了什麼）：`,
+    `   POST http://127.0.0.1:3001/api/git/auto-commit/result，JSON 欄位 {projectId:'${projectId}', hash, message（原文全文）, messageZh${_zh ? '（=message）' : '（**逐條繁中對照**全文）'}, files（檔案路徑陣列）, branch}`,
+    `   （中文 body 走 UTF-8 bytes：Invoke-RestMethod -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($json))，同 ProjectCommit_SOP 草稿作法）`,
+    `6. ⭐ 最後一定要用**繁體中文**回報給少爺（這是他在聊天室唯一會看到的東西，缺了等於沒交付）：`,
     `   ① hash ＋ 檔案數 ② commit message 原文${_zh ? '' : '（英文）＋**逐條繁中對照**'} ③ 標明「未 push」`,
     `   ${_zh ? '' : '⚠️ message 本身維持英文寫進 git，但聊天室的回報必須是繁體中文；'}不要只貼英文就結束。`,
     ``,
@@ -4806,13 +4857,20 @@ function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, e
         return
       }
       armAckEarlyFlip(run.id, _mFp, _mBefore)
+      // ⭐ 看門狗判準＝「這次喚醒有沒有被處理」，不是「聊天室有沒有在講話」（少爺 2026-08-21 實錄）：
+      //    舊版比對 transcript assistant 活動 → 少爺剛好在同一個聊天室聊別的事，就被當成「已送達」→
+      //    結案通知整個蒸發（監看是孤兒、根本沒人收）。改看 run.claudeAck 是否仍停在 pending：
+      //    只有真的有人接手（Claude 觸碰 API 時翻 working）才算送達，否則一律無頭補送。
+      //    順帶把 150s 縮到 45s——少爺按下去到補送的空窗要短。
       setTimeout(() => {
         try {
-          const _mAfter = lastAssistantActivityMs(_mFp)
-          if (_mAfter > _mBefore) return   // 監看有反應（分頁活著、有真回應）
-          _doHeadlessFallback('stalled-150s')
+          const _d = readQaRuns()
+          const _r = _d.runs.find(x => x.id === run.id)
+          if (!_r) return
+          if (_r.claudeAck?.state && _r.claudeAck.state !== 'pending') return   // 有人接手了（working/done）
+          _doHeadlessFallback('ack-still-pending-45s')
         } catch {}
-      }, 150 * 1000)
+      }, 45 * 1000)
       return
     }
     // 少爺 2026-07-14「QA 送出＝仕酒師同做法」：未綁定聊天室（或 wakeMode none）不再沉默——

@@ -1799,6 +1799,46 @@ if (typeof window !== 'undefined' && !window.__tcFetchPatched) {
   window.__tcFetchPatched = true
 }
 
+// 酒窖「TC Commit（一鍵提交）」完成的彈跳視窗（少爺 2026-08-20）：
+// tc 不在版控面板清單（那裡只服務高桌會專案），子進程回寫的內容改用 modal 呈現，附 ✕／關閉／backdrop 三種關法。
+function TcCommitResultModal({ result, onClose }) {
+  if (!result) return null
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center" onClick={onClose}>
+      <div className="w-[30rem] max-h-[70vh] overflow-y-auto bg-[var(--surface)] border border-[var(--border)] rounded-lg p-4 shadow-2xl" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-1">
+          <div className="text-[var(--gold)] text-xs tracking-widest uppercase">⚡ TC Commit 完成</div>
+          <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text)] text-sm leading-none">✕</button>
+        </div>
+        <div className="flex items-center gap-2 text-[10px] text-[var(--text-muted)] font-mono mb-2">
+          {result.hash && <span className="text-[var(--gold)]">{result.hash}</span>}
+          {result.branch && <span>⎇ {result.branch}</span>}
+          <span>{result.files?.length ?? 0} 檔 · 未 push</span>
+          <span className="flex-1 text-right">{new Date(result.at ?? Date.now()).toLocaleTimeString('zh-TW', { hour12: false })}</span>
+        </div>
+        <pre className="text-[11px] font-mono text-[var(--text)] whitespace-pre-wrap break-all border border-[var(--border)] rounded bg-black/20 p-2">{result.message}</pre>
+        {result.messageZh && result.messageZh !== result.message && (
+          <div className="mt-1.5 text-[10px] text-[var(--text-muted)] border-l-2 border-[var(--gold)]/40 pl-2 whitespace-pre-wrap">{result.messageZh}</div>
+        )}
+        {result.files?.length > 0 && (
+          <details className="mt-2">
+            <summary className="text-[9px] text-[var(--text-muted)] cursor-pointer hover:text-[var(--gold)]">檔案清單（{result.files.length}）</summary>
+            {result.files.map((f, i) => (
+              <div key={i} className="text-[9px] font-mono text-[var(--text-muted)] truncate pl-2">{f}</div>
+            ))}
+          </details>
+        )}
+        <div className="mt-3 flex justify-end">
+          <button onClick={onClose}
+            className="text-[10px] px-3 py-1 rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text)] hover:bg-white/10">
+            關閉
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
   const [sessions, setSessions] = useState([])
   const [selectedId, setSelectedId] = useState(() => {
@@ -1917,6 +1957,7 @@ export default function App() {
   const [showTcSettings, setShowTcSettings] = useState(false)     // 總設定（少爺 2026-08-07）：跨功能使用者偏好 modal
   const [showMarkers, setShowMarkers] = useState(false)
   const [showCellar, setShowCellar] = useState(false)
+  const [tcCommitPopup, setTcCommitPopup] = useState(null)   // 酒窖 TC Commit 完成的彈跳視窗（少爺 2026-08-20）
   const [contractModal, setContractModal]       = useState(null)
   const [historyCosts, setHistoryCosts]         = useState({})   // { [sessionId]: costUsd }
   // ── 5-Stage chat cost display (lives in SessionItem Row 3) ──────────────
@@ -2288,6 +2329,12 @@ export default function App() {
     if (msg.type === 'git_draft_update') {
       try { window.dispatchEvent(new CustomEvent('tc-git-draft', { detail: msg.drafts })) } catch {}
     }
+    // 依規則 Commit 完成（少爺 2026-08-20）：子進程回寫最終雙語內容 → 轉發給版控區塊展開檢視；
+    // tc 自身不在版控面板（只服務高桌會專案）→ 改用彈跳視窗呈現（少爺 2026-08-20）
+    if (msg.type === 'git_autocommit_result') {
+      try { window.dispatchEvent(new CustomEvent('tc-git-autocommit', { detail: msg })) } catch {}
+      if (msg.projectId === 'tc' && msg.result) setTcCommitPopup(msg.result)
+    }
     // 模型目錄更新（少爺 2026-08-15）：server 每日重掃或手動 refresh 後推來，選單與價目就地換新
     if (msg.type === 'model_catalog') {
       setModelCatalog(msg.catalog)
@@ -2440,6 +2487,7 @@ export default function App() {
       {showMarkers && <MarkerPanel onClose={() => setShowMarkers(false)} />}
       {showCellar && <CellarPanel onClose={() => setShowCellar(false)} />}
       {showTcSettings && <TcSettingsModal onClose={() => setShowTcSettings(false)} />}
+      {tcCommitPopup && <TcCommitResultModal result={tcCommitPopup} onClose={() => setTcCommitPopup(null)} />}
       {showBountySettings && (
         <BountySettings
           onClose={() => setShowBountySettings(false)}

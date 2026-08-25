@@ -161,6 +161,8 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
   const [gitHint, setGitHint] = useState('')
   const [gitDraftAt, setGitDraftAt] = useState(null)          // 有草稿＝Claude 推來的，標示給少爺看
   const [gitRuleOpen, setGitRuleOpen] = useState(false)       // 規則編輯（⚙）展開中
+  const [gitAutoResults, setGitAutoResults] = useState([])    // 依規則 Commit 的回寫紀錄（當前專案，新→舊）
+  const [gitAutoOpen, setGitAutoOpen] = useState(false)       // 紀錄展開中
 
   const gitProject = gitProjects.find(p => p.id === gitProjectId) ?? null
 
@@ -178,6 +180,7 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
     if (!_res.ok) return
     setGitProjects(_res.projects ?? [])
     if (gitProjectId) applyGitDraft((_res.drafts ?? {})[gitProjectId], true)
+    setGitAutoResults(gitProjectId ? ((_res.autoResults ?? {})[gitProjectId] ?? []) : [])
   }, [gitProjectId, applyGitDraft])
 
   const loadGitStatus = useCallback(async (projectId) => {
@@ -192,6 +195,7 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
   // 切專案＝換 repo：狀態重讀、輸入框清空（訊息屬於前一個 repo，留著只會誤送）
   useEffect(() => {
     setGitMessage(''); setGitMessageZh(''); setGitPickedPaths([]); setGitDraftAt(null); setGitHint('')
+    setGitAutoOpen(false)
     loadGitStatus(gitProjectId)
   }, [gitProjectId, loadGitStatus])
 
@@ -207,6 +211,21 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
     window.addEventListener('tc-git-draft', onDraft)
     return () => window.removeEventListener('tc-git-draft', onDraft)
   }, [gitProjectId, applyGitDraft, loadGitStatus])
+
+  // 依規則 Commit 完成（ws）→ 是當前專案就記一筆、自動展開紀錄並刷新 git 狀態
+  useEffect(() => {
+    const onAuto = (e) => {
+      const _d = e.detail ?? {}
+      if (!gitProjectId || _d.projectId !== gitProjectId || !_d.result) return
+      setGitAutoResults(prev => [_d.result, ...prev].slice(0, 10))
+      setGitAutoOpen(true)
+      setGitCollapsed(false)
+      setGitHint(`✅ 依規則 Commit 完成：${_d.result.hash || '(hash 未回報)'}（未 push）`)
+      loadGitStatus(gitProjectId)
+    }
+    window.addEventListener('tc-git-autocommit', onAuto)
+    return () => window.removeEventListener('tc-git-autocommit', onAuto)
+  }, [gitProjectId, loadGitStatus])
 
   // 改該專案的 commit 規則（即改即存）：寫回 sommelier.json projects[].git——規則只有那一份 SSOT
   const patchGitPolicy = useCallback(async (patch) => {
@@ -745,6 +764,48 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
             </button>
           </div>
           </>)}
+
+          {/* 依規則 Commit 紀錄（少爺 2026-08-20）：子進程提交完回寫的內容，按鍵展開檢視英文 message＋繁中對照 */}
+          {gitProject && gitAutoResults.length > 0 && (
+            <div className="mt-1.5 border border-[var(--border)] rounded bg-black/20">
+              <button onClick={() => setGitAutoOpen(v => !v)}
+                className="w-full flex items-center gap-2 px-2 py-1 text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)]">
+                <span>{gitAutoOpen ? '▾' : '▸'}</span>
+                <span>⚡ 依規則 Commit 紀錄（{gitAutoResults.length}）</span>
+                <span className="flex-1 text-right font-mono truncate">
+                  {gitAutoResults[0].hash && `${gitAutoResults[0].hash} · `}{fmtTime(gitAutoResults[0].at)}
+                </span>
+              </button>
+              {gitAutoOpen && (
+                <div className="px-2 pb-2 space-y-2 max-h-64 overflow-y-auto">
+                  {gitAutoResults.map((_r, _i) => (
+                    <div key={_r.at ?? _i} className={`${_i > 0 ? 'border-t border-[var(--border)] pt-2' : ''}`}>
+                      <div className="flex items-center gap-2 text-[9px] text-[var(--text-muted)] font-mono">
+                        {_r.hash && <span className="text-[var(--gold)]">{_r.hash}</span>}
+                        {_r.branch && <span>⎇ {_r.branch}</span>}
+                        <span>{_r.files?.length ?? 0} 檔 · 未 push</span>
+                        <span className="flex-1 text-right">{fmtTime(_r.at)}</span>
+                      </div>
+                      <pre className="mt-1 text-[10px] font-mono text-[var(--text)] whitespace-pre-wrap break-all">{_r.message}</pre>
+                      {_r.messageZh && _r.messageZh !== _r.message && (
+                        <div className="mt-1 text-[10px] text-[var(--text-muted)] border-l-2 border-[var(--gold)]/40 pl-2 whitespace-pre-wrap">
+                          {_r.messageZh}
+                        </div>
+                      )}
+                      {_r.files?.length > 0 && (
+                        <details className="mt-1">
+                          <summary className="text-[9px] text-[var(--text-muted)] cursor-pointer hover:text-[var(--gold)]">檔案清單（{_r.files.length}）</summary>
+                          {_r.files.map((_f, _j) => (
+                            <div key={_j} className="text-[9px] font-mono text-[var(--text-muted)] truncate pl-2">{_f}</div>
+                          ))}
+                        </details>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {gitHint && <div className="text-[10px] mt-1 text-[var(--text-muted)] font-mono break-all">{gitHint}</div>}
           </>)}
