@@ -1067,8 +1067,10 @@ function runTagWorker() {
   catch { pendingSpawnCwds.delete(_cwdNorm); _release(); return }
   let _sid = null, _text = '', _buf = ''
   const _timeout = setTimeout(() => { try { proc.kill() } catch {} }, 180_000)   // 批次放寬到 180s
+  // setEncoding 必加：中文每字 3 bytes，被切在 chunk 邊界時逐塊 toString() 會各自解出替換字元且原位元組已丟失
+  proc.stdout.setEncoding('utf-8')
   proc.stdout.on('data', c => {
-    _buf += c.toString()
+    _buf += c
     const _lines = _buf.split('\n'); _buf = _lines.pop()
     for (const l of _lines) {
       try {
@@ -1382,7 +1384,8 @@ function listWindowsMarkers() {
     try {
       // windowsHide 必加：否則 pm2 背景 node spawn console 程式會閃 powershell 視窗（少爺 2026-08-06 回報「按 Marker 跳視窗」根因）
       const _ps = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', _script], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
-      _ps.stdout.on('data', d => { _out += d.toString('utf-8') })
+      _ps.stdout.setEncoding('utf-8')   // 逐塊 toString 會切壞跨 chunk 的中文字（3 bytes/字）
+      _ps.stdout.on('data', d => { _out += d })
       _ps.on('close', () => {
         try {
           const _j = JSON.parse(_out.trim() || 'null')
@@ -1831,8 +1834,13 @@ function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort
   }
 
   let buf = ''
+  // ⚠️ setEncoding 必加（少爺 2026-09-08 回報「TC 的 Commit 出現的字是亂碼，而 Fork 是正確的繁體中文」根因）：
+  //    繁中每字 3 bytes，Claude 串流的 chunk 邊界可能切在字元中間；逐塊 chunk.toString() 會把半截位元組
+  //    各自解成替換字元、原位元組隨即丟失無法還原 → 英文正常、中文壞掉。setEncoding 讓 Node 走 StringDecoder，
+  //    跨 chunk 保留未完成的多位元組序列。（既有的 buf/lines.pop() 只處理「行」邊界，處理不到「字元」邊界）
+  proc.stdout.setEncoding('utf-8')
   proc.stdout.on('data', chunk => {
-    buf += chunk.toString()
+    buf += chunk
     const lines = buf.split('\n')
     buf = lines.pop() // keep incomplete line
     for (const line of lines) {
@@ -1874,8 +1882,9 @@ function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort
     if (_sess) _sess.lastSeenAt = Date.now()
   })
 
+  proc.stderr.setEncoding('utf-8')
   proc.stderr.on('data', chunk => {
-    const text = chunk.toString().trim()
+    const text = String(chunk).trim()
     if (text) broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath), event: { type: 'stderr', text } })
   })
 
@@ -4445,8 +4454,9 @@ function spawnPresentLLM(text, model) {
     catch { pendingSpawnCwds.delete(_cwdNorm); resolve(null); return }
     let _sid = null, _text = '', _buf = ''
     const _timeout = setTimeout(() => { try { _proc.kill() } catch {} }, 120_000)
+    _proc.stdout.setEncoding('utf-8')   // 同上：避免跨 chunk 的中文字被切壞
     _proc.stdout.on('data', c => {
-      _buf += c.toString()
+      _buf += c
       const _lines = _buf.split('\n'); _buf = _lines.pop()
       for (const l of _lines) {
         try {
