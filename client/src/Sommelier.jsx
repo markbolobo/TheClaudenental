@@ -108,6 +108,14 @@ function composePrompt(draft, items) {
         if (it.text) lines.push(`   內容: ${it.text.replace(/\n+/g, ' / ').slice(0, 500)}`)
         return
       }
+      if (it.nodeKind === 'intent') {
+        lines.push(`${idx + 1}. 【設計脈絡】${it.intentTitle}（${(it.scope ?? []).join('/')}）`)
+        if (it.intent) lines.push(`   意圖: ${it.intent.replace(/\n+/g, ' / ').slice(0, 400)}`)
+        if (it.invariants?.length) lines.push(`   不變量: ${it.invariants.map(v => `${v.checked ? '✓' : '○'}${v.id} ${v.text}`).join(' | ').slice(0, 900)}`)
+        if (it.openDecisions?.length) lines.push(`   ⬜ 待定奪(需業主決策): ${it.openDecisions.map(d => `${d.id} ${d.title}${d.options ? `〔選項 ${d.options}〕` : ''}`).join(' | ').slice(0, 700)}`)
+        if (it.symbolRefs?.length) lines.push(`   關聯符號: ${it.symbolRefs.join(', ')}`)
+        return
+      }
       if (it.nodeKind === 'bp') {
         lines.push(`${idx + 1}. 【藍圖】${it.bpName}（${it.bpClass}）繼承 ${it.parentName ?? '?'}`)
         if (it.deps?.length) lines.push(`   引用資產: ${it.deps.slice(0, 14).map(d => `${d.class}:${d.name}`).join(', ')}`)
@@ -271,9 +279,10 @@ const MEMORY_TYPE_META = {
 const memoryNoteKey = (pid, noteName) => `${pid}:mem:${noteName}`
 
 // 📓 拼圖視圖 — type 分組 → note → 逛拼圖網（[[link]]）+ 引用符號/canvas 跳轉
-function MemoryView({ memory, projectId, query, onJumpToSymbol, onJumpToCanvas, cartKeys, onToggleNoteCart }) {
+function MemoryView({ memory, projectId, query, jumpName, onJumpToSymbol, onJumpToCanvas, cartKeys, onToggleNoteCart }) {
   const notes = memory?.notes ?? []
   const [noteName, setNoteName] = useState(null)
+  useEffect(() => { if (jumpName) setNoteName(jumpName) }, [jumpName])
 
   const byName = useMemo(() => new Map(notes.map(n => [n.name, n])), [notes])
   const grouped = useMemo(() => {
@@ -363,6 +372,217 @@ function MemoryView({ memory, projectId, query, onJumpToSymbol, onJumpToCanvas, 
                   {note.canvasRefs.map(c => (
                     <button key={c.file} onClick={() => onJumpToCanvas(c.file)}
                       className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--gold)]/30 text-[var(--gold)]/80 hover:border-[var(--gold)]">🗺️ {c.title}</button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+const intentKey = (pid, intentId) => `${pid}:intent:${intentId}`
+
+// 🧭 設計脈絡視圖 — design_intent/*.md：機制的意圖 / 不變量 / 狀態機 / 清理責任 / 驗收 / 事故史；引用符號 / canvas / 拼圖可跳
+function IntentView({ designIntent, projectId, query, initialId, onJumpToSymbol, onJumpToCanvas, onJumpToMemory, cartKeys, onToggleIntentCart }) {
+  const intents = designIntent?.intents ?? []
+  const [intentId, setIntentId] = useState(initialId ?? null)
+  useEffect(() => { if (initialId) setIntentId(initialId) }, [initialId])
+
+  const byId = useMemo(() => new Map(intents.map(i => [i.id, i])), [intents])
+  const grouped = useMemo(() => {
+    const g = new Map()
+    const _tokens = searchTokens(query)
+    for (const it of intents) {
+      if (!tokensMatchAll(_tokens, it.id, it.title, it.intent, it.text)) continue
+      const scope = it.scope?.[0] ?? '(未分類)'
+      if (!g.has(scope)) g.set(scope, [])
+      g.get(scope).push(it)
+    }
+    return g
+  }, [intents, query])
+
+  const it = intentId ? byId.get(intentId) : null
+
+  if (!intents.length) return (
+    <div className="flex-1 flex items-center justify-center text-[var(--text-muted)] text-xs px-6 text-center">
+      尚無設計脈絡資料 — 在 sommelier.json 該專案加 designIntentDir（design_intent/*.md）後跑刷新指令
+    </div>
+  )
+
+  return (
+    <div className="flex-1 flex min-h-0">
+      {/* 左：scope 分組 */}
+      <div className="w-72 shrink-0 border-r border-[var(--border)] overflow-y-auto p-2">
+        {/* 全專案待定奪彙總入口 */}
+        {(() => {
+          const _allOpen = intents.reduce((n, x) => n + (x.openDecisions ?? []).filter(d => !d.resolved).length, 0)
+          if (!_allOpen) return null
+          return (
+            <button onClick={() => setIntentId('__ALL_OPEN__')}
+              className={`w-full text-left px-2 py-1 mb-2 rounded border text-[11px] ${intentId === '__ALL_OPEN__' ? 'bg-amber-400/15 border-amber-400/60 text-amber-300' : 'border-amber-400/30 text-amber-400/80 hover:bg-amber-400/10'}`}>
+              ⬜ 待定奪總覽 <span className="font-bold">{_allOpen}</span> 筆 <span className="text-[9px] opacity-70">· 需要你決策</span>
+            </button>
+          )
+        })()}
+        {[...grouped.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([scope, arr]) => (
+          <div key={scope} className="mb-1">
+            <div className="px-1 py-0.5 text-[10px] uppercase tracking-widest text-[var(--gold)]/70">🧭 {scope} <span className="text-[8px]">({arr.length})</span></div>
+            {arr.map(x => {
+              const _checked = x.invariants.filter(v => v.checked).length
+              return (
+                <button key={x.id} onClick={() => setIntentId(x.id)}
+                  className={`w-full text-left pl-4 pr-2 py-0.5 rounded text-[11px] flex items-center gap-1 ${intentId === x.id ? 'bg-[var(--gold)]/10 text-[var(--gold)]' : 'text-[var(--text)] hover:bg-[var(--surface)]'}`}>
+                  <span className="truncate flex-1">{x.title}</span>
+                  <span className="text-[8px] text-[var(--text-muted)] shrink-0" title="不變量 已確認/總數">{_checked}/{x.invariants.length}</span>
+                  {(x.openDecisions ?? []).filter(d => !d.resolved).length > 0 &&
+                    <span className="text-[8px] px-1 rounded bg-amber-400/20 text-amber-300 shrink-0" title="待你定奪的開放問題">⬜{(x.openDecisions ?? []).filter(d => !d.resolved).length}</span>}
+                  {x.status === 'draft' && <span className="text-[8px] px-1 rounded border border-amber-400/40 text-amber-400/80 shrink-0" title="骨架：意圖＋部分不變量，其餘待動到再補">草稿</span>}
+                </button>
+              )
+            })}
+          </div>
+        ))}
+      </div>
+
+      {/* 右：細節 */}
+      <div className="flex-1 overflow-y-auto p-3 min-w-0">
+        {intentId === '__ALL_OPEN__' ? (
+          <div className="max-w-4xl space-y-3">
+            <div className="text-[var(--gold)] text-sm">⬜ 待定奪總覽 — 需要你決策的開放問題</div>
+            <p className="text-[10px] text-[var(--text-muted)] leading-relaxed">
+              這裡只放<b>我不能自行決定</b>的事（設計取捨／要不要做／哪個方案）。可以自己驗證的項目留在各機制的不變量未勾處，那是我的工作。
+              做到某個機制時，該機制的待定奪會在它自己的頁面一併出現，順帶問掉就好。
+            </p>
+            {intents.flatMap(x => (x.openDecisions ?? []).filter(d => !d.resolved).map(d => ({ ...d, _intent: x })))
+              .map((d, i) => (
+                <div key={i} className="border border-amber-400/30 rounded p-2 space-y-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-400/20 text-amber-300">{d.id}</span>
+                    <button onClick={() => setIntentId(d._intent.id)}
+                      className="text-[10px] text-[var(--gold)]/70 hover:text-[var(--gold)]">🧭 {d._intent.title}</button>
+                    {d.raised && <span className="text-[9px] text-[var(--text-muted)]">提出 {d.raised}</span>}
+                  </div>
+                  <div className="text-[11px] text-[var(--text)]">{d.title}</div>
+                  {d.status && <div className="text-[10px] text-[var(--text-muted)]"><b>現況</b>：{d.status}</div>}
+                  {d.reason && <div className="text-[10px] text-[var(--text-muted)]"><b>要你定的原因</b>：{d.reason}</div>}
+                  {d.options && <div className="text-[10px] text-emerald-300/80"><b>選項</b>：{d.options}</div>}
+                  {d.affects && <div className="text-[9px] text-[var(--text-muted)]">牽動 {d.affects}</div>}
+                </div>
+              ))}
+          </div>
+        ) : !it ? (
+          <div className="text-[var(--text-muted)] text-[11px] leading-relaxed max-w-lg mx-auto mt-10 space-y-2">
+            <div className="text-[var(--gold)] text-sm">🧭 設計脈絡</div>
+            <p>每個機制一張「設計意圖與不變量」：它為什麼存在、動工前後<b>永遠必須成立的條件</b>（不變量，可勾選＝已機檢／已驗證）、狀態機與每條轉移的清理責任、驗收方式、事故史。</p>
+            <p>引用的 <b>C++ 符號</b>／<b>架構 canvas</b>／<b>拼圖</b> 都可跳；點 🛒 把整張脈絡帶進 prompt，讓 Claude 動工前就背著不變量。</p>
+            <p className="text-[10px]">來源：<code>design_intent/*.md</code>（由 kickoff 對映、結案機檢 B7 守門）</p>
+          </div>
+        ) : (
+          <div className="max-w-3xl space-y-3">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--gold)]/40 text-[var(--gold)]">🧭 {(it.scope ?? []).join(' / ') || '設計脈絡'}</span>
+              <code className="text-base text-[var(--text)]">{it.title}</code>
+              <span className="text-[9px] text-[var(--text-muted)]">{it.status} · {it.owner} · 更新 {it.updated}</span>
+              <button onClick={() => onToggleIntentCart(it)}
+                className={`text-[9px] px-1.5 py-0.5 rounded border ${cartKeys.has(intentKey(projectId, it.id)) ? 'border-[var(--gold)]/60 text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] hover:border-[var(--gold)]/50'}`}>
+                {cartKeys.has(intentKey(projectId, it.id)) ? '🛒✓ 已在購物車' : '🛒 加入設計脈絡'}
+              </button>
+            </div>
+
+            {it.intent && (
+              <div className="space-y-1">
+                <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">意圖</div>
+                <div className="text-[11px] text-[var(--text)] whitespace-pre-wrap border-l-2 border-[var(--gold)]/30 pl-2">{it.intent}</div>
+              </div>
+            )}
+
+            {(it.openDecisions ?? []).length > 0 && (
+              <div className="space-y-1">
+                <div className="text-[9px] uppercase tracking-widest text-amber-400/80">⬜ 待定奪（需要你決策）</div>
+                {it.openDecisions.map(d => (
+                  <div key={d.id} className={`border rounded p-2 space-y-1 ${d.resolved ? 'border-[var(--border)] opacity-60' : 'border-amber-400/30'}`}>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className={`text-[9px] px-1.5 py-0.5 rounded ${d.resolved ? 'bg-emerald-500/20 text-emerald-300' : 'bg-amber-400/20 text-amber-300'}`}>{d.resolved ? '✓ 已定' : d.id}</span>
+                      <span className="text-[11px] text-[var(--text)]">{d.title}</span>
+                    </div>
+                    {!d.resolved && d.status && <div className="text-[10px] text-[var(--text-muted)]"><b>現況</b>：{d.status}</div>}
+                    {!d.resolved && d.reason && <div className="text-[10px] text-[var(--text-muted)]"><b>要你定的原因</b>：{d.reason}</div>}
+                    {!d.resolved && d.options && <div className="text-[10px] text-emerald-300/80"><b>選項</b>：{d.options}</div>}
+                    {!d.resolved && d.affects && <div className="text-[9px] text-[var(--text-muted)]">牽動 {d.affects}</div>}
+                    {d.resolved && d.resolution && <div className="text-[10px] text-emerald-300/80">{d.resolvedAt} 定案：{d.resolution}</div>}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {it.invariants.length > 0 && (
+              <div className="space-y-1">
+                <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">不變量（{it.invariants.filter(v => v.checked).length}/{it.invariants.length} 已確認）</div>
+                {it.invariants.map(v => (
+                  <div key={v.id} className="flex items-start gap-2 text-[11px]">
+                    <span className={`shrink-0 mt-0.5 ${v.checked ? 'text-emerald-400' : 'text-[var(--text-muted)]'}`}>{v.checked ? '☑' : '☐'}</span>
+                    <div className="min-w-0"><code className="text-[10px] text-[var(--gold)]/80 mr-1">{v.id}</code><span className="text-[var(--text)]">{v.text}</span></div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {it.stateMachine && (
+              <div className="space-y-1">
+                <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">狀態機</div>
+                <pre className="text-[10px] text-[var(--text)] bg-[var(--surface)] rounded p-2 overflow-x-auto whitespace-pre">{it.stateMachine}</pre>
+              </div>
+            )}
+
+            {it.cleanup && (
+              <div className="space-y-1">
+                <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">清理責任</div>
+                <pre className="text-[10px] text-[var(--text)] whitespace-pre-wrap">{it.cleanup}</pre>
+              </div>
+            )}
+
+            {it.acceptance && (
+              <div className="space-y-1">
+                <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">驗收</div>
+                <div className="text-[11px] text-[var(--text)] whitespace-pre-wrap">{it.acceptance}</div>
+              </div>
+            )}
+
+            {it.incidents.length > 0 && (
+              <div className="space-y-1">
+                <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">事故史</div>
+                {it.incidents.map((inc, i) => (
+                  <div key={i} className="text-[11px] text-[var(--text)]"><code className="text-[10px] text-[var(--text-muted)] mr-1">{inc.date}</code>{inc.text}</div>
+                ))}
+              </div>
+            )}
+
+            {(it.symbolRefs.length > 0 || it.canvasRefs.length > 0 || it.memoryLinks.length > 0 || (it.intentLinks ?? []).length > 0 || (it.missingIntentLinks ?? []).length > 0) && (
+              <div className="space-y-1">
+                <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">引用（點跳）{(it.missingIntentLinks ?? []).length > 0 && <span className="ml-2 text-amber-400/80 normal-case tracking-normal">⚠ 依賴鏈缺 {it.missingIntentLinks.length} 份意圖檔</span>}</div>
+                <div className="flex flex-wrap gap-1">
+                  {(it.intentLinks ?? []).map(l => (
+                    <button key={'i:' + l} onClick={() => setIntentId(l)}
+                      className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--gold)]/40 text-[var(--gold)] hover:border-[var(--gold)]">🧭 {byId.get(l)?.title ?? l}</button>
+                  ))}
+                  {(it.missingIntentLinks ?? []).map(l => (
+                    <span key={'m:' + l} title="相關脈絡指向尚未建立的意圖檔（沿依賴鏈順帶補）"
+                      className="text-[10px] px-1.5 py-0.5 rounded border border-dashed border-amber-400/40 text-amber-400/70">🧭 {l}（未建檔）</span>
+                  ))}
+                  {it.symbolRefs.map(r => (
+                    <button key={r.name} onClick={() => onJumpToSymbol(r.name)}
+                      className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:border-[var(--gold)] hover:text-[var(--gold)]"><code>{r.name}</code></button>
+                  ))}
+                  {it.canvasRefs.map(c => (
+                    <button key={c.file} onClick={() => onJumpToCanvas(c.file)}
+                      className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--gold)]/30 text-[var(--gold)]/80 hover:border-[var(--gold)]">🗺️ {c.title}</button>
+                  ))}
+                  {it.memoryLinks.map(l => (
+                    <button key={l} onClick={() => onJumpToMemory(l)}
+                      className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:border-[var(--gold)] hover:text-[var(--gold)]">📓 [[{l}]]</button>
                   ))}
                 </div>
               </div>
@@ -597,7 +817,11 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
   const symbolMemoryIndex = payload?.symbolMemoryIndex ?? {}
   const assetGraph = payload?.assetGraph
   const symbolBpIndex = payload?.symbolBpIndex ?? {}
+  const designIntent = payload?.designIntent
+  const symbolIntentIndex = payload?.symbolIntentIndex ?? {}
   const symbols = data?.symbols ?? []
+  const [intentJumpId, setIntentJumpId] = useState(null)   // 骨架/拼圖 → 設計脈絡 指定條目
+  const [memoryJumpName, setMemoryJumpName] = useState(null) // 設計脈絡 → 拼圖 指定條目
 
   const byName = useMemo(() => {
     const m = new Map()
@@ -738,6 +962,22 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
   const jumpToCanvas = () => setMode('arch')
 
   // 拼圖 → 選件（帶摘要 + 內文）
+  const jumpToIntent = (id) => { setIntentJumpId(id); setMode('intent') }
+  const jumpToMemoryNote = (name) => { setMemoryJumpName(name); setMode('memory') }
+
+  const toggleCartIntent = (it) => {
+    const key = intentKey(projectId, it.id)
+    if (cartKeys.has(key)) { setCart(c => c.filter(i => i.key !== key)); return }
+    setCart(c => [...c, {
+      key, project: data?.project, nodeKind: 'intent',
+      intentId: it.id, intentTitle: it.title, scope: it.scope, intent: it.intent,
+      invariants: it.invariants.map(v => ({ id: v.id, text: v.text, checked: v.checked })),
+      openDecisions: (it.openDecisions ?? []).filter(d => !d.resolved).map(d => ({ id: d.id, title: d.title, options: d.options })),
+      symbolRefs: it.symbolRefs.map(r => r.name),
+    }])
+    flash(`已加入設計脈絡：${it.title}`, 1500)
+  }
+
   const toggleCartNote = (note) => {
     const key = memoryNoteKey(projectId, note.name)
     if (cartKeys.has(key)) { setCart(c => c.filter(i => i.key !== key)); return }
@@ -867,6 +1107,7 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
           <button onClick={() => setMode('arch')} className={`px-2 py-0.5 text-[10px] ${mode === 'arch' ? 'bg-[var(--gold)]/20 text-[var(--gold)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'}`}>🗺️ 架構關聯</button>
           <button onClick={() => setMode('memory')} className={`px-2 py-0.5 text-[10px] ${mode === 'memory' ? 'bg-[var(--gold)]/20 text-[var(--gold)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'}`}>📓 拼圖</button>
           <button onClick={() => setMode('asset')} className={`px-2 py-0.5 text-[10px] ${mode === 'asset' ? 'bg-[var(--gold)]/20 text-[var(--gold)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'}`}>🎨 藍圖資產</button>
+          <button onClick={() => setMode('intent')} className={`px-2 py-0.5 text-[10px] ${mode === 'intent' ? 'bg-[var(--gold)]/20 text-[var(--gold)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'}`}>🧭 設計脈絡</button>
         </div>
         <div className="flex-1" />
         {/* 常駐搜尋欄（四視圖共用；placeholder 隨視圖變）*/}
@@ -875,6 +1116,7 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
           placeholder={mode === 'skeleton' ? '搜尋名詞 / 成員 / 註解(中文可) · 空格＝且 · 快捷鍵 /'
             : mode === 'arch' ? '搜尋架構 canvas / 節點 / 引用符號 · 空格＝且'
             : mode === 'memory' ? '搜尋拼圖（名稱 / 摘要 / 內文）· 空格＝且'
+            : mode === 'intent' ? '搜尋設計脈絡（機制 / 意圖 / 不變量）· 空格＝且'
             : '搜尋藍圖 / 父類 · 空格＝且'}
           className="w-64 max-w-full bg-transparent border border-[var(--border)] focus:border-[var(--gold)]/60 rounded px-2 py-1 text-[11px] text-[var(--text)] outline-none" />
         <button onClick={() => setCartOpen(o => !o)}
@@ -892,8 +1134,12 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
           <ArchView arch={arch} projectId={projectId} query={query} onJumpToSymbol={jumpToSymbol}
             cartKeys={cartKeys} onToggleNodeCart={toggleCartNode} />
         ) : mode === 'memory' ? (
-          <MemoryView memory={memory} projectId={projectId} query={query} onJumpToSymbol={jumpToSymbol}
+          <MemoryView memory={memory} projectId={projectId} query={query} jumpName={memoryJumpName} onJumpToSymbol={jumpToSymbol}
             onJumpToCanvas={jumpToCanvas} cartKeys={cartKeys} onToggleNoteCart={toggleCartNote} />
+        ) : mode === 'intent' ? (
+          <IntentView designIntent={designIntent} projectId={projectId} query={query} initialId={intentJumpId}
+            onJumpToSymbol={jumpToSymbol} onJumpToCanvas={jumpToCanvas} onJumpToMemory={jumpToMemoryNote}
+            cartKeys={cartKeys} onToggleIntentCart={toggleCartIntent} />
         ) : mode === 'asset' ? (
           <AssetView assetGraph={assetGraph} projectId={projectId} query={query} onJumpToSymbol={jumpToSymbol}
             cartKeys={cartKeys} onToggleBpCart={toggleCartBp} />
@@ -1036,6 +1282,19 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
                 </div>
               )}
 
+              {/* 🧭 設計脈絡：這個符號受哪些設計意圖／不變量約束 */}
+              {symbolIntentIndex[selected.name]?.length > 0 && (
+                <div className="mt-3 space-y-1">
+                  <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">🧭 設計脈絡（受這些設計意圖約束）</div>
+                  {symbolIntentIndex[selected.name].slice(0, 8).map((ref, i) => (
+                    <button key={i} onClick={() => jumpToIntent(ref.id)}
+                      className="block w-full text-left text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)]">
+                      <span className="text-[var(--gold)]/60">{(ref.scope ?? []).join('/')}</span> → {ref.title} <span className="text-[8px]">({ref.invariants} 不變量)</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
               {/* 🎨 藍圖脈絡：這個 C++ 類被哪些藍圖繼承 */}
               {symbolBpIndex[selected.name]?.length > 0 && (
                 <div className="mt-3 space-y-1">
@@ -1131,11 +1390,11 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
                   {cart.map(it => (
                     <div key={it.key} className="flex items-start gap-2 px-2 py-1 rounded border border-[var(--border)]">
                       <span className="text-[9px] text-[var(--text-muted)] w-3 text-center shrink-0">
-                        {it.nodeKind === 'archNode' ? '🗺️' : it.nodeKind === 'memoryNote' ? '📓' : it.nodeKind === 'bp' ? '🎨' : it.member ? (MEMBER_ICON[it.kind] ?? '·') : (KIND_META[it.kind]?.icon ?? '◆')}
+                        {it.nodeKind === 'archNode' ? '🗺️' : it.nodeKind === 'memoryNote' ? '📓' : it.nodeKind === 'bp' ? '🎨' : it.nodeKind === 'intent' ? '🧭' : it.member ? (MEMBER_ICON[it.kind] ?? '·') : (KIND_META[it.kind]?.icon ?? '◆')}
                       </span>
                       <div className="flex-1 min-w-0">
                         <code className="text-[10px] text-[var(--text)] break-all">
-                          {it.nodeKind === 'archNode' ? it.nodeTitle : it.nodeKind === 'memoryNote' ? it.noteTitle : it.nodeKind === 'bp' ? it.bpName : it.member ? `${it.symbol}::${it.member}` : it.symbol}
+                          {it.nodeKind === 'archNode' ? it.nodeTitle : it.nodeKind === 'memoryNote' ? it.noteTitle : it.nodeKind === 'bp' ? it.bpName : it.nodeKind === 'intent' ? it.intentTitle : it.member ? `${it.symbol}::${it.member}` : it.symbol}
                         </code>
                         {it.nodeKind === 'archNode'
                           ? <div className="text-[9px] text-[var(--text-muted)] truncate">{it.canvasTitle}</div>
@@ -1143,6 +1402,8 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
                           ? <div className="text-[9px] text-[var(--text-muted)] truncate">{it.description || MEMORY_TYPE_META[it.noteType]?.label}</div>
                           : it.nodeKind === 'bp'
                           ? <div className="text-[9px] text-[var(--text-muted)] truncate">{it.bpClass} · 繼承 {it.parentName}</div>
+                          : it.nodeKind === 'intent'
+                          ? <div className="text-[9px] text-[var(--text-muted)] truncate">{(it.scope ?? []).join('/')} · {it.invariants?.length ?? 0} 不變量</div>
                           : it.comment && <div className="text-[9px] text-[var(--text-muted)] truncate">{it.comment.split('\n')[0]}</div>}
                       </div>
                       <button onClick={() => setCart(c => c.filter(x => x.key !== it.key))}

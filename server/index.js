@@ -513,13 +513,16 @@ app.post('/hook/PermissionRequest', async (request) => {
 })
 
 // UserPromptSubmit
-// 同步 hook（少爺 2026-07-15「不要中斷心流」）：少爺在互動介面對「TC 出身＋綁 spawn 模式 QA run」的
-// 聊天室打字時，注入一次性指令讓該分頁自己掛 Monitor＋轉 monitor 模式——VS Code 原地聯動全自動化。
+// 同步 hook（少爺 2026-07-15「不要中斷心流」）：少爺在互動介面對「綁定 QA run 的聊天室」打字時，
+// 若原地聯動的監看已斷，注入一次性指令讓該分頁自己重掛 Monitor＋轉 monitor 模式——VS Code 原地聯動全自動化。
+// ⚠️ 2026-08-27 修：原本卡 `subprocessSids.has(_sid)` = 只認 TC spawn 出身的 session，
+//    導致「少爺自己開的互動 VS Code session 綁 run」在 process 重啟、監看死掉後永遠不自動重掛（需手動）。
+//    拿掉該 gate：改由下游守衛把關（無頭進程在跑 / 監看還活 / 無綁定 run 一律不注入），兩類 session 皆涵蓋。
 // 這個端點只做注入判斷（session 註冊仍走既有非同步 /hook/UserPromptSubmit，不重複處理）
 app.post('/hook/UserPromptSubmitSync', async (request, reply) => {
   const e = request.body ?? {}
   const _sid = e.session_id
-  if (!_sid || !subprocessSids.has(_sid)) return ''
+  if (!_sid) return ''
   const _prompt = String(e.prompt ?? '')
   if (_prompt.startsWith('(TC')) return ''   // TC 自己的喚醒/通知 prompt 不注入
   // TC 自家無頭進程正在跑這個 session ＝ 這句不是少爺在互動介面打的
@@ -534,8 +537,8 @@ app.post('/hook/UserPromptSubmitSync', async (request, reply) => {
     hookSpecificOutput: {
       hookEventName: 'UserPromptSubmit',
       additionalContext:
-        `(TC 自動聯動設定) 本聊天室已被少爺在互動介面開啟，且綁定 QA run「${_run.topic}」(${_run.id})目前為 spawn 喚醒模式。` +
-        `請在處理少爺訊息前先完成兩步（一次性設定，轉成 monitor 後不再出現）：` +
+        `(TC 自動聯動設定) 本聊天室已被少爺在互動介面開啟，且綁定 QA run「${_run.topic}」(${_run.id})，但原地聯動的監看已中斷（process 重啟或監看死亡）。` +
+        `請在處理少爺訊息前先完成兩步（重掛監看、恢復 VS Code 原地聯動）：` +
         `(1) 用 Monitor 工具執行 command='"${getPythonExe()}" -u C:/Project/MasterBrain/.agent/scripts/Watch-QAComments.py --session ${_sid}'、persistent=true；` +
         `(2) PATCH http://127.0.0.1:3001/api/qa/runs/${_run.id} body {"wakeMode":"monitor"}。` +
         `完成後照常處理少爺的訊息，並簡短告知已完成聯動設定。`,
@@ -3894,12 +3897,16 @@ app.get('/api/git/status', async (request, reply) => {
     if (_x !== ' ') _staged.push({ file: _file, code: _x })
     if (_y !== ' ') _unstaged.push({ file: _file, code: _y })
   }
+  // 領先／落後上游幾筆（少爺 2026-08-29）：逐筆推送要先知道會推幾筆；沒設上游時 rev-list 會失敗＝回空字串
+  const _ahead = Number(_git(['rev-list', '--count', '@{u}..HEAD'])) || 0
+  const _behind = Number(_git(['rev-list', '--count', 'HEAD..@{u}'])) || 0
   return {
     ok: true,
     projectId: _proj.id, repoRoot: _root, ...gitProjectPolicy(_proj),
     // --show-current 在 unborn branch 也答得出來；空字串時退回 rev-parse（detached HEAD 之類）
     branch: _git(['branch', '--show-current']) || _git(['rev-parse', '--abbrev-ref', 'HEAD']),
     lastCommit: _git(['log', '-1', '--format=%h %s']),
+    ahead: _ahead, behind: _behind,
     staged: _staged, unstaged: _unstaged, untracked: _untracked,
   }
 })
@@ -4055,6 +4062,145 @@ app.post('/api/git/auto-commit', async (request, reply) => {
   spawnClaude(_root, _prompt, null, 'sonnet', 'low')
   logEvent('git.autocommit.spawn', { projectId, staging: _policy.staging, lang: _policy.lang })
   return { ok: true, spawned: true, message: `已喚起 Claude 依「${_proj.name ?? projectId}」規則提交（${_policy.staging === 'none' ? '只 commit 既有 staged' : _policy.staging === 'all' ? '全部變更' : '指定路徑'}、${_policy.lang === 'en' ? '英文' : '繁中'} message）` }
+})
+
+// ─── 逐筆推送（少爺 2026-08-29）：把遠端還沒有的 commits 由舊到新一筆一筆推上去 ──────────
+// 為什麼不是一次 push：commit 累積太多時單次傳輸量會爆掉（GitHub 單次 push 上限 2GiB）。
+// 與 commit 同一個原則——面板不自己複製一套 git 規則，一律委派 MasterBrain 共用腳本（repoRoot 也讀同一份 sommelier.json）。
+// 打包是「讀 log 檔續管」因為 UAT 跑很久且 server 可能重啟；逐筆推是幾分鐘的事，直接接管 stdout 就夠。
+const PROJECT_PUSH_SCRIPT = 'C:\\Project\\MasterBrain\\.agent\\scripts\\Invoke-ProjectPushOneByOne.ps1'
+const GIT_PUSH_TAIL_MAX = 200
+
+let gitPushJob = null      // { projectId, projectName, status, dryRun, total, done, current, remote, branch, tail[], result, startedAt, finishedAt }
+let gitPushProc = null     // 本 server 生命週期內才有；重啟後為 null（狀態一併視為中斷）
+let gitPushBuf = ''
+
+function broadcastGitPush() {
+  if (!gitPushJob) return
+  broadcast({ type: 'git_push_update', job: gitPushJob })
+}
+
+// 解析腳本的進度行（協定見 Invoke-ProjectPushOneByOne.ps1 檔頭）：少爺要看得到「推到第幾筆」而不是只有轉圈
+function parseGitPushLine(line) {
+  if (!gitPushJob) return
+  const _t = (line ?? '').replace(/\r$/, '')
+  if (!_t.trim()) return
+
+  gitPushJob.tail.push(_t)
+  if (gitPushJob.tail.length > GIT_PUSH_TAIL_MAX) gitPushJob.tail.shift()
+
+  const _plan = _t.match(/^\[Push\] plan (\d+) (\S+) (\S+)$/)
+  if (_plan) {
+    gitPushJob.total = Number(_plan[1])
+    gitPushJob.remote = _plan[2]
+    gitPushJob.branch = _plan[3]
+    broadcastGitPush()
+    return
+  }
+  const _step = _t.match(/^\[Push\] step (\d+)\/(\d+) (\S+) ?(.*)$/)
+  if (_step) {
+    gitPushJob.done = Number(_step[1]) - 1        // 這筆才正要推，完成數還是前一筆
+    gitPushJob.total = Number(_step[2])
+    gitPushJob.current = { index: Number(_step[1]), short: _step[3], subject: _step[4] ?? '' }
+    broadcastGitPush()
+    return
+  }
+  const _ok = _t.match(/^\[Push\] ok (\d+)\/(\d+) /)
+  if (_ok) {
+    gitPushJob.done = Number(_ok[1])
+    gitPushJob.total = Number(_ok[2])
+    broadcastGitPush()
+    return
+  }
+  if (/^\[Push\] log /.test(_t)) { broadcastGitPush(); return }
+
+  // 非進度行＝腳本的收尾 JSON（或雜訊）；解析成功就是最終結果
+  try {
+    const _j = JSON.parse(_t)
+    if (typeof _j === 'object' && _j !== null && 'ok' in _j) gitPushJob.result = _j
+  } catch { /* 不是 JSON 就只留在 tail 裡 */ }
+}
+
+function finalizeGitPushJob(code) {
+  if (!gitPushJob) return
+  gitPushProc = null
+  gitPushJob.finishedAt = Date.now()
+  gitPushJob.current = null
+  const _r = gitPushJob.result
+  gitPushJob.status = _r?.ok ? 'done' : 'failed'
+  if (!_r) {
+    // 腳本沒吐出收尾 JSON＝啟動層就掛了（PowerShell 找不到腳本、語法錯…）；把 tail 當錯誤原文回報
+    gitPushJob.status = 'failed'
+    gitPushJob.result = { ok: false, error: `腳本沒有回傳結果（exit ${code}）：${gitPushJob.tail.slice(-5).join(' / ') || '無輸出'}` }
+  }
+  if (_r?.ok && typeof _r.pushed === 'number') gitPushJob.done = _r.pushed
+  broadcastGitPush()
+  logEvent('git.push.finish', { projectId: gitPushJob.projectId, ok: !!gitPushJob.result?.ok, pushed: gitPushJob.done, total: gitPushJob.total })
+}
+
+app.get('/api/git/push/status', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  return { ok: true, job: gitPushJob }
+})
+
+app.post('/api/git/push/start', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const { projectId, dryRun } = request.body ?? {}
+  const _proj = findGitProject(projectId)
+  if (!_proj) return { ok: false, error: `專案「${projectId}」未設 git 規則` }
+  const _root = gitRepoRoot(_proj)
+  if (!_root || !fs.existsSync(path.join(_root, '.git'))) return { ok: false, error: `不是 git repo：${_root}` }
+  if (gitPushJob?.status === 'running') {
+    return { ok: false, error: `「${gitPushJob.projectName}」的推送還在跑（${gitPushJob.done}/${gitPushJob.total}），等它跑完再按` }
+  }
+  if (!fs.existsSync(PROJECT_PUSH_SCRIPT)) return { ok: false, error: `找不到推送腳本：${PROJECT_PUSH_SCRIPT}` }
+
+  gitPushBuf = ''
+  gitPushJob = {
+    projectId, projectName: _proj.name ?? projectId, repoRoot: _root,
+    status: 'running', dryRun: !!dryRun,
+    total: 0, done: 0, current: null, remote: '', branch: '',
+    tail: [], result: null, startedAt: Date.now(), finishedAt: null,
+  }
+  broadcastGitPush()
+
+  const _args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', PROJECT_PUSH_SCRIPT, '-Project', projectId]
+  if (dryRun) _args.push('-DryRun')
+  try {
+    gitPushProc = spawn('powershell.exe', _args, { cwd: _root, windowsHide: true })
+  } catch (e) {
+    gitPushJob.status = 'failed'
+    gitPushJob.result = { ok: false, error: `啟動推送腳本失敗：${e.message}` }
+    broadcastGitPush()
+    return { ok: false, error: gitPushJob.result.error }
+  }
+
+  gitPushProc.stdout.setEncoding('utf-8')
+  gitPushProc.stdout.on('data', (chunk) => {
+    gitPushBuf += chunk
+    const _lines = gitPushBuf.split(/\r?\n/)
+    gitPushBuf = _lines.pop() ?? ''        // 最後一段可能是半行，留到下一批再併
+    for (const _l of _lines) parseGitPushLine(_l)
+  })
+  // 腳本把該說的都寫進 stdout；stderr 只在 PowerShell 自己出事時有東西，收進 tail 當診斷用
+  gitPushProc.stderr.setEncoding('utf-8')
+  gitPushProc.stderr.on('data', (chunk) => {
+    for (const _l of String(chunk).split(/\r?\n/)) {
+      if (_l.trim()) gitPushJob?.tail.push(`[stderr] ${_l}`)
+    }
+  })
+  gitPushProc.on('close', (code) => {
+    if (gitPushBuf.trim()) { parseGitPushLine(gitPushBuf); gitPushBuf = '' }
+    finalizeGitPushJob(code)
+  })
+  gitPushProc.on('error', (e) => {
+    if (!gitPushJob) return
+    gitPushJob.result = { ok: false, error: `推送腳本執行失敗：${e.message}` }
+    finalizeGitPushJob(-1)
+  })
+
+  logEvent('git.push.start', { projectId, dryRun: !!dryRun, repoRoot: _root })
+  return { ok: true, started: true, job: gitPushJob }
 })
 
 const CELLAR_TOOLS = [
@@ -4525,7 +4671,17 @@ app.get('/api/sommelier/data/:projectId', async (request, reply) => {
         if (sym) (symbolBpIndex[sym] ??= []).push({ name: bp.name, path: bp.path, class: bp.class })
       }
     } catch { /* asset_graph.json 不存在 → 前三層照回,前端優雅降級 */ }
-    return { ok: true, data, arch, symbolCanvasIndex, memory, symbolMemoryIndex, assetGraph, symbolBpIndex, extractCommand: proj.extractCommand ?? null }
+    // 設計脈絡層（第五血肉，選配，少爺 2026-09-07 立）：design_intent/*.md 由 extract_design_intent.mjs 萃取；建 symbol→intent 反查索引
+    let designIntent = null
+    const symbolIntentIndex = {}
+    try {
+      designIntent = JSON.parse(fs.readFileSync(path.join(proj.dataDir, 'generated', 'design_intent.json'), 'utf8'))
+      for (const it of designIntent.intents ?? [])
+        for (const ref of it.symbolRefs ?? []) {
+          (symbolIntentIndex[ref.name] ??= []).push({ id: it.id, title: it.title, scope: it.scope, invariants: (it.invariants ?? []).length })
+        }
+    } catch { /* design_intent.json 不存在 → 前四層照回,前端優雅降級 */ }
+    return { ok: true, data, arch, symbolCanvasIndex, memory, symbolMemoryIndex, assetGraph, symbolBpIndex, designIntent, symbolIntentIndex, extractCommand: proj.extractCommand ?? null }
   } catch (e) {
     reply.code(404)
     return { ok: false, error: `尚無萃取資料:${e.message}`, hint: proj.extractCommand ?? null }

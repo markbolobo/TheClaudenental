@@ -163,8 +163,11 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
   const [gitRuleOpen, setGitRuleOpen] = useState(false)       // 規則編輯（⚙）展開中
   const [gitAutoResults, setGitAutoResults] = useState([])    // 依規則 Commit 的回寫紀錄（當前專案，新→舊）
   const [gitAutoOpen, setGitAutoOpen] = useState(false)       // 紀錄展開中
+  // 逐筆推送（少爺 2026-08-29）：server 全域一次只跑一個，所以這裡也只存一個 job
+  const [gitPushJob, setGitPushJob] = useState(null)
 
   const gitProject = gitProjects.find(p => p.id === gitProjectId) ?? null
+  const gitPushRunning = gitPushJob?.status === 'running'
 
   // 草稿套進輸入框（切專案／Claude 推新草稿都走這裡；少爺已在打字時不覆蓋他的內容）
   const applyGitDraft = useCallback((draft, force = false) => {
@@ -227,6 +230,22 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
     return () => window.removeEventListener('tc-git-autocommit', onAuto)
   }, [gitProjectId, loadGitStatus])
 
+  // 逐筆推送進度（ws）：job 是 server 全域的，所以不論哪個專案在推都收下來——
+  // 少爺切走再切回來也看得到進度，跑完的那一刻順手刷新 git 狀態（ahead 會歸零）
+  useEffect(() => {
+    fetch('/api/git/push/status').then(r => r.json()).then(d => setGitPushJob(d.job ?? null)).catch(() => {})
+    const onPush = (e) => {
+      const _job = e.detail ?? null
+      setGitPushJob(_job)
+      if (_job && _job.status !== 'running') {
+        setGitCollapsed(false)
+        if (_job.projectId === gitProjectId) loadGitStatus(gitProjectId)
+      }
+    }
+    window.addEventListener('tc-git-push', onPush)
+    return () => window.removeEventListener('tc-git-push', onPush)
+  }, [gitProjectId, loadGitStatus])
+
   // 改該專案的 commit 規則（即改即存）：寫回 sommelier.json projects[].git——規則只有那一份 SSOT
   const patchGitPolicy = useCallback(async (patch) => {
     if (!gitProjectId) return
@@ -254,6 +273,28 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
     setGitBusy(false)
     setGitHint(_res.ok ? `⚡ ${_res.message ?? '已喚起 Claude'}（完成後這裡會刷新）` : `❌ ${_res.error ?? '喚起失敗'}`)
   }, [gitProjectId])
+
+  // 逐筆推送（少爺 2026-08-29）：把遠端還沒有的 commits 由舊到新一筆一筆推上去，
+  // 避免累積太多 commit 時單次傳輸量爆掉。規則與 repo 來源都在 Invoke-ProjectPushOneByOne.ps1，這裡只負責按下去與看進度。
+  const runPushOneByOne = useCallback(async () => {
+    if (!gitProjectId || !gitStatus) return
+    const _ahead = gitStatus.ahead ?? 0
+    if (_ahead === 0) { setGitHint('沒有需要推送的 commits，已與遠端同步'); return }
+    // push 是對外動作：確認框把「推幾筆、推去哪、哪個 repo」講清楚再走
+    if (!confirm(
+      `逐筆推送「${gitProject?.name ?? gitProjectId}」？\n\n`
+      + `分支：${gitStatus.branch}\n待推：${_ahead} 筆（由舊到新一筆一筆推）\n`
+      + `repo：${gitStatus.repoRoot}\n\n這會把 commits 推上遠端。`
+    )) return
+    setGitBusy(true); setGitHint('')
+    const _res = await fetch('/api/git/push/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectId: gitProjectId }),
+    }).then(r => r.json()).catch(e => ({ ok: false, error: e.message }))
+    setGitBusy(false)
+    if (!_res.ok) { setGitHint(`❌ ${_res.error ?? '推送啟動失敗'}`); return }
+    setGitPushJob(_res.job ?? null)
+  }, [gitProjectId, gitProject, gitStatus])
 
   const runCommit = useCallback(async (dryRun = false) => {
     if (!gitProjectId) return
@@ -641,6 +682,8 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
             {gitStatus && (
               <span className="text-[10px] text-[var(--text-muted)] font-mono">
                 ⎇ {gitStatus.branch || '—'} · staged {gitStatus.staged.length} / 未 staged {gitStatus.unstaged.length} / 未追蹤 {gitStatus.untracked.length}
+                {gitStatus.ahead > 0 && <span className="text-[var(--gold)]"> · ↑{gitStatus.ahead} 未推</span>}
+                {gitStatus.behind > 0 && <span className="text-amber-400"> · ↓{gitStatus.behind} 落後</span>}
               </span>
             )}
 
@@ -749,6 +792,19 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
           <div className="flex items-center gap-2 mt-1.5">
             {gitDraftAt && <span className="text-[9px] text-[var(--gold)]">Claude 草稿 {fmtTime(gitDraftAt)}</span>}
             <div className="flex-1" />
+            {/* 逐筆推送（少爺 2026-08-29）：與 commit 分開的動作——commit 只進本地，這顆才會動到遠端。
+                刻意不用金色：金色是「Commit」那顆主動作的顏色，別讓兩顆看起來像同一件事 */}
+            <button onClick={runPushOneByOne}
+              disabled={gitBusy || gitPushRunning || !(gitStatus?.ahead > 0)}
+              title={gitPushRunning ? '已有推送在進行中'
+                : !(gitStatus?.ahead > 0) ? '沒有待推的 commits'
+                  : `把 ${gitStatus.ahead} 筆未推 commits 由舊到新逐筆推上 ${gitStatus.branch}（避免單次傳輸量過大）`}
+              className={`text-[11px] px-2.5 py-1 rounded border ${
+                gitBusy || gitPushRunning || !(gitStatus?.ahead > 0)
+                  ? 'border-[var(--border)] text-[var(--text-muted)] opacity-40 cursor-not-allowed'
+                  : 'border-emerald-500/50 text-emerald-400 hover:bg-emerald-500/15'}`}>
+              ⬆ 逐筆推送{gitStatus?.ahead > 0 ? `（${gitStatus.ahead}）` : ''}
+            </button>
             <button onClick={() => runCommit(true)} disabled={gitBusy || !gitMessage.trim()}
               title="不真的提交，只驗規則與範圍"
               className={`text-[11px] px-2.5 py-1 rounded border border-[var(--border)] ${
@@ -764,6 +820,69 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
             </button>
           </div>
           </>)}
+
+          {/* 逐筆推送進度（少爺 2026-08-29）：job 是 server 全域的——別的專案在推也看得到，免得兩邊互相搶 */}
+          {gitPushJob && (
+            <div className="mt-1.5 border border-[var(--border)] rounded bg-black/20 px-2 py-1.5">
+              <div className="flex items-center gap-2 text-[10px] font-mono">
+                {/* 試算不能寫「推送完成」——那會讓人以為東西已經上遠端了 */}
+                <span className={gitPushRunning ? 'text-[var(--gold)]'
+                  : gitPushJob.result?.ok ? 'text-emerald-400' : 'text-red-400'}>
+                  {gitPushRunning ? (gitPushJob.dryRun ? '⬆ 試算中' : '⬆ 推送中')
+                    : gitPushJob.result?.ok ? (gitPushJob.dryRun ? '✅ 試算完成（未推送）' : '✅ 推送完成')
+                      : gitPushJob.dryRun ? '❌ 試算失敗' : '❌ 推送失敗'}
+                </span>
+                <span className="text-[var(--text-muted)]">
+                  {gitPushJob.projectName}
+                  {gitPushJob.branch && ` · ${gitPushJob.remote}/${gitPushJob.branch}`}
+                </span>
+                <span className="flex-1 text-right text-[var(--text-muted)]">
+                  {gitPushJob.dryRun ? `${gitPushJob.total} 筆待推` : `${gitPushJob.done}/${gitPushJob.total || '?'} 筆`}
+                </span>
+              </div>
+
+              {/* 進度條：total 還沒解析出來（fetch 階段）就不畫，免得顯示一條假的滿格；
+                  試算沒有「推到第幾筆」可言，畫一條永遠 0% 的條只會像卡住 */}
+              {gitPushJob.total > 0 && !gitPushJob.dryRun && (
+                <div className="mt-1 h-1 rounded bg-white/10 overflow-hidden">
+                  <div className={`h-full ${gitPushRunning ? 'bg-[var(--gold)]' : gitPushJob.result?.ok ? 'bg-emerald-500' : 'bg-red-500'}`}
+                    style={{ width: `${Math.round((gitPushJob.done / gitPushJob.total) * 100)}%` }} />
+                </div>
+              )}
+
+              {gitPushRunning && gitPushJob.current && (
+                <div className="mt-1 text-[10px] font-mono text-[var(--text)] truncate">
+                  {gitPushJob.current.short} {gitPushJob.current.subject}
+                </div>
+              )}
+
+              {!gitPushRunning && gitPushJob.result && (
+                <div className={`mt-1 text-[10px] ${gitPushJob.result.ok ? 'text-[var(--text-muted)]' : 'text-red-400'} whitespace-pre-wrap break-all`}>
+                  {gitPushJob.result.ok ? gitPushJob.result.message : gitPushJob.result.error}
+                </div>
+              )}
+
+              {gitPushJob.result?.warnings?.length > 0 && (
+                <div className="mt-1 text-[10px] text-amber-400 whitespace-pre-wrap break-all">
+                  {gitPushJob.result.warnings.map((_w, _i) => <div key={_i}>⚠ {_w}</div>)}
+                </div>
+              )}
+
+              {/* 逐筆輸出：失敗時要看得到是哪一筆炸的、git 說了什麼 */}
+              {gitPushJob.tail?.length > 0 && (
+                <details className="mt-1">
+                  <summary className="text-[9px] text-[var(--text-muted)] cursor-pointer hover:text-[var(--gold)]">
+                    推送輸出（{gitPushJob.tail.length} 行）
+                  </summary>
+                  <div className="mt-1 max-h-40 overflow-y-auto">
+                    {gitPushJob.tail.map((_l, _i) => (
+                      <div key={_i} className="text-[9px] font-mono text-[var(--text-muted)] whitespace-pre-wrap break-all">{_l}</div>
+                    ))}
+                  </div>
+                </details>
+              )}
+            </div>
+          )}
 
           {/* 依規則 Commit 紀錄（少爺 2026-08-20）：子進程提交完回寫的內容，按鍵展開檢視英文 message＋繁中對照 */}
           {gitProject && gitAutoResults.length > 0 && (

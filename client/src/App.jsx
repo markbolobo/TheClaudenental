@@ -2329,6 +2329,10 @@ export default function App() {
     if (msg.type === 'git_draft_update') {
       try { window.dispatchEvent(new CustomEvent('tc-git-draft', { detail: msg.drafts })) } catch {}
     }
+    // 逐筆推送進度（少爺 2026-08-29）：推到第幾筆 → 轉發給 QAMonitorPanel 的版控區塊
+    if (msg.type === 'git_push_update') {
+      try { window.dispatchEvent(new CustomEvent('tc-git-push', { detail: msg.job })) } catch {}
+    }
     // 依規則 Commit 完成（少爺 2026-08-20）：子進程回寫最終雙語內容 → 轉發給版控區塊展開檢視；
     // tc 自身不在版控面板（只服務高桌會專案）→ 改用彈跳視窗呈現（少爺 2026-08-20）
     if (msg.type === 'git_autocommit_result') {
