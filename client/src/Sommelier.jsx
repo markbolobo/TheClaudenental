@@ -2,6 +2,8 @@ import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { useModelOptions, EFFORT_OPTIONS } from './modelOptions.js'
 import { confirmIfLiveInteractive, fetchLiveInteractiveIds } from './liveSessionGuard.js'
 import { WorkflowLauncher } from './WorkflowLauncher.jsx'
+import { ScenarioView } from './ScenarioView.jsx'
+import { scenarioKey, SCENARIO_NEW_KEY, scenarioPromptLines, newScenarioPromptLines } from './scenarioPrompt.js'
 
 // ─── Sommelier 侍酒師 — 專案名詞圖鑑(P0:C++ 骨架層 + P1:選件購物車)─────────
 // 室內設計圖式層級瀏覽:模組 → 種類 → 類別 → (pragma region 分節的)成員。
@@ -116,6 +118,8 @@ function composePrompt(draft, items) {
         if (it.symbolRefs?.length) lines.push(`   關聯符號: ${it.symbolRefs.join(', ')}`)
         return
       }
+      if (it.nodeKind === 'scenario') { lines.push(...scenarioPromptLines(idx, it)); return }
+      if (it.nodeKind === 'scenarioNew') { lines.push(...newScenarioPromptLines(idx)); return }
       if (it.nodeKind === 'bp') {
         lines.push(`${idx + 1}. 【藍圖】${it.bpName}（${it.bpClass}）繼承 ${it.parentName ?? '?'}`)
         if (it.deps?.length) lines.push(`   引用資產: ${it.deps.slice(0, 14).map(d => `${d.class}:${d.name}`).join(', ')}`)
@@ -386,7 +390,7 @@ function MemoryView({ memory, projectId, query, jumpName, onJumpToSymbol, onJump
 const intentKey = (pid, intentId) => `${pid}:intent:${intentId}`
 
 // 🧭 設計脈絡視圖 — design_intent/*.md：機制的意圖 / 不變量 / 狀態機 / 清理責任 / 驗收 / 事故史；引用符號 / canvas / 拼圖可跳
-function IntentView({ designIntent, projectId, query, initialId, onJumpToSymbol, onJumpToCanvas, onJumpToMemory, cartKeys, onToggleIntentCart }) {
+function IntentView({ designIntent, projectId, query, initialId, onJumpToSymbol, onJumpToCanvas, onJumpToMemory, cartKeys, onToggleIntentCart, intentScenarioIndex = {}, onJumpToScenario = null }) {
   const intents = designIntent?.intents ?? []
   const [intentId, setIntentId] = useState(initialId ?? null)
   useEffect(() => { if (initialId) setIntentId(initialId) }, [initialId])
@@ -496,6 +500,19 @@ function IntentView({ designIntent, projectId, query, initialId, onJumpToSymbol,
               <div className="space-y-1">
                 <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">意圖</div>
                 <div className="text-[11px] text-[var(--text)] whitespace-pre-wrap border-l-2 border-[var(--gold)]/30 pl-2">{it.intent}</div>
+              </div>
+            )}
+
+            {/* 🎬 情境體驗反查（第六血肉，少爺 2026-09-15）：這個機制出現在哪些情境 */}
+            {(intentScenarioIndex[it.id] ?? []).length > 0 && (
+              <div className="space-y-1">
+                <div className="text-[9px] uppercase tracking-widest text-[var(--gold)]/70">🎬 出現在這些情境</div>
+                <div className="flex flex-wrap gap-1">
+                  {intentScenarioIndex[it.id].map(sc => (
+                    <button key={sc.id} onClick={() => onJumpToScenario?.(sc.id)}
+                      className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--gold)]/30 text-[var(--gold)]/80 hover:border-[var(--gold)]">🎬 {sc.phase}｜{sc.title.replace(/（.*$/, '')}</button>
+                  ))}
+                </div>
               </div>
             )}
 
@@ -819,9 +836,12 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
   const symbolBpIndex = payload?.symbolBpIndex ?? {}
   const designIntent = payload?.designIntent
   const symbolIntentIndex = payload?.symbolIntentIndex ?? {}
+  const scenario = payload?.scenario                       // 🎬 情境體驗層（第六血肉）
+  const intentScenarioIndex = payload?.intentScenarioIndex ?? {}
   const symbols = data?.symbols ?? []
   const [intentJumpId, setIntentJumpId] = useState(null)   // 骨架/拼圖 → 設計脈絡 指定條目
   const [memoryJumpName, setMemoryJumpName] = useState(null) // 設計脈絡 → 拼圖 指定條目
+  const [scenarioJumpId, setScenarioJumpId] = useState(null) // 設計脈絡 → 情境體驗 指定條目
 
   const byName = useMemo(() => {
     const m = new Map()
@@ -964,6 +984,7 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
   // 拼圖 → 選件（帶摘要 + 內文）
   const jumpToIntent = (id) => { setIntentJumpId(id); setMode('intent') }
   const jumpToMemoryNote = (name) => { setMemoryJumpName(name); setMode('memory') }
+  const jumpToScenario = (id) => { setScenarioJumpId(id); setMode('scenario') }
 
   const toggleCartIntent = (it) => {
     const key = intentKey(projectId, it.id)
@@ -976,6 +997,27 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
       symbolRefs: it.symbolRefs.map(r => r.name),
     }])
     flash(`已加入設計脈絡：${it.title}`, 1500)
+  }
+
+  // 🎬 情境 → 選件（帶一句話＋題目對照＋缺口＋待定奪＋涵蓋意圖；結帳＝觸發 z_sub_scenario_experience 工作流）
+  const toggleCartScenario = (sc) => {
+    const key = scenarioKey(projectId, sc.id)
+    if (cartKeys.has(key)) { setCart(c => c.filter(i => i.key !== key)); return }
+    setCart(c => [...c, {
+      key, project: data?.project, nodeKind: 'scenario',
+      scenarioId: sc.id, scenarioTitle: sc.title, phase: sc.phase, flow: sc.flow, status: sc.status, oneLiner: sc.oneLiner,
+      thesis: (sc.thesis ?? []).map(t => ({ dimension: t.dimension, marker: t.marker, answer: t.answer })),
+      gaps: (sc.gaps ?? []).map(g => ({ id: g.id, text: g.text })),
+      openDecisions: (sc.openDecisions ?? []).filter(d => !d.resolved).map(d => ({ id: d.id, title: d.title, options: d.options })),
+      intentLinks: sc.intentLinks ?? [],
+    }])
+    flash(`已加入情境：${sc.title}`, 1500)
+  }
+  const toggleCartNewScenario = () => {
+    const key = SCENARIO_NEW_KEY(projectId)
+    if (cartKeys.has(key)) { setCart(c => c.filter(i => i.key !== key)); return }
+    setCart(c => [...c, { key, project: data?.project, nodeKind: 'scenarioNew' }])
+    flash('已加入「開新情境」——在需求描述寫情境名與階段，結帳後我會建骨架並用九面向訪談你', 4000)
   }
 
   const toggleCartNote = (note) => {
@@ -1108,6 +1150,7 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
           <button onClick={() => setMode('memory')} className={`px-2 py-0.5 text-[10px] ${mode === 'memory' ? 'bg-[var(--gold)]/20 text-[var(--gold)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'}`}>📓 拼圖</button>
           <button onClick={() => setMode('asset')} className={`px-2 py-0.5 text-[10px] ${mode === 'asset' ? 'bg-[var(--gold)]/20 text-[var(--gold)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'}`}>🎨 藍圖資產</button>
           <button onClick={() => setMode('intent')} className={`px-2 py-0.5 text-[10px] ${mode === 'intent' ? 'bg-[var(--gold)]/20 text-[var(--gold)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'}`}>🧭 設計脈絡</button>
+          <button onClick={() => setMode('scenario')} className={`px-2 py-0.5 text-[10px] ${mode === 'scenario' ? 'bg-[var(--gold)]/20 text-[var(--gold)]' : 'text-[var(--text-muted)] hover:text-[var(--text)]'}`}>🎬 情境體驗</button>
         </div>
         <div className="flex-1" />
         {/* 常駐搜尋欄（四視圖共用；placeholder 隨視圖變）*/}
@@ -1117,6 +1160,7 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
             : mode === 'arch' ? '搜尋架構 canvas / 節點 / 引用符號 · 空格＝且'
             : mode === 'memory' ? '搜尋拼圖（名稱 / 摘要 / 內文）· 空格＝且'
             : mode === 'intent' ? '搜尋設計脈絡（機制 / 意圖 / 不變量）· 空格＝且'
+            : mode === 'scenario' ? '搜尋情境（標題 / 一句話 / 內文）· 空格＝且'
             : '搜尋藍圖 / 父類 · 空格＝且'}
           className="w-64 max-w-full bg-transparent border border-[var(--border)] focus:border-[var(--gold)]/60 rounded px-2 py-1 text-[11px] text-[var(--text)] outline-none" />
         <button onClick={() => setCartOpen(o => !o)}
@@ -1139,7 +1183,12 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
         ) : mode === 'intent' ? (
           <IntentView designIntent={designIntent} projectId={projectId} query={query} initialId={intentJumpId}
             onJumpToSymbol={jumpToSymbol} onJumpToCanvas={jumpToCanvas} onJumpToMemory={jumpToMemoryNote}
-            cartKeys={cartKeys} onToggleIntentCart={toggleCartIntent} />
+            cartKeys={cartKeys} onToggleIntentCart={toggleCartIntent}
+            intentScenarioIndex={intentScenarioIndex} onJumpToScenario={jumpToScenario} />
+        ) : mode === 'scenario' ? (
+          <ScenarioView scenario={scenario} designIntent={designIntent} projectId={projectId} query={query} initialId={scenarioJumpId}
+            onJumpToIntent={jumpToIntent} onJumpToMemory={jumpToMemoryNote}
+            cartKeys={cartKeys} onToggleScenarioCart={toggleCartScenario} onToggleNewScenarioCart={toggleCartNewScenario} />
         ) : mode === 'asset' ? (
           <AssetView assetGraph={assetGraph} projectId={projectId} query={query} onJumpToSymbol={jumpToSymbol}
             cartKeys={cartKeys} onToggleBpCart={toggleCartBp} />
@@ -1390,11 +1439,11 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
                   {cart.map(it => (
                     <div key={it.key} className="flex items-start gap-2 px-2 py-1 rounded border border-[var(--border)]">
                       <span className="text-[9px] text-[var(--text-muted)] w-3 text-center shrink-0">
-                        {it.nodeKind === 'archNode' ? '🗺️' : it.nodeKind === 'memoryNote' ? '📓' : it.nodeKind === 'bp' ? '🎨' : it.nodeKind === 'intent' ? '🧭' : it.member ? (MEMBER_ICON[it.kind] ?? '·') : (KIND_META[it.kind]?.icon ?? '◆')}
+                        {it.nodeKind === 'archNode' ? '🗺️' : it.nodeKind === 'memoryNote' ? '📓' : it.nodeKind === 'bp' ? '🎨' : it.nodeKind === 'intent' ? '🧭' : (it.nodeKind === 'scenario' || it.nodeKind === 'scenarioNew') ? '🎬' : it.member ? (MEMBER_ICON[it.kind] ?? '·') : (KIND_META[it.kind]?.icon ?? '◆')}
                       </span>
                       <div className="flex-1 min-w-0">
                         <code className="text-[10px] text-[var(--text)] break-all">
-                          {it.nodeKind === 'archNode' ? it.nodeTitle : it.nodeKind === 'memoryNote' ? it.noteTitle : it.nodeKind === 'bp' ? it.bpName : it.nodeKind === 'intent' ? it.intentTitle : it.member ? `${it.symbol}::${it.member}` : it.symbol}
+                          {it.nodeKind === 'archNode' ? it.nodeTitle : it.nodeKind === 'memoryNote' ? it.noteTitle : it.nodeKind === 'bp' ? it.bpName : it.nodeKind === 'intent' ? it.intentTitle : it.nodeKind === 'scenario' ? it.scenarioTitle : it.nodeKind === 'scenarioNew' ? '新情境（建骨架＋九面向訪談）' : it.member ? `${it.symbol}::${it.member}` : it.symbol}
                         </code>
                         {it.nodeKind === 'archNode'
                           ? <div className="text-[9px] text-[var(--text-muted)] truncate">{it.canvasTitle}</div>
@@ -1404,6 +1453,10 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
                           ? <div className="text-[9px] text-[var(--text-muted)] truncate">{it.bpClass} · 繼承 {it.parentName}</div>
                           : it.nodeKind === 'intent'
                           ? <div className="text-[9px] text-[var(--text-muted)] truncate">{(it.scope ?? []).join('/')} · {it.invariants?.length ?? 0} 不變量</div>
+                          : it.nodeKind === 'scenario'
+                          ? <div className="text-[9px] text-[var(--text-muted)] truncate">{it.phase} · 💡 {it.gaps?.length ?? 0} 缺口 · ⬜ {it.openDecisions?.length ?? 0} 待定奪</div>
+                          : it.nodeKind === 'scenarioNew'
+                          ? <div className="text-[9px] text-[var(--text-muted)] truncate">情境名與階段寫在需求描述裡</div>
                           : it.comment && <div className="text-[9px] text-[var(--text-muted)] truncate">{it.comment.split('\n')[0]}</div>}
                       </div>
                       <button onClick={() => setCart(c => c.filter(x => x.key !== it.key))}
@@ -1432,7 +1485,7 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
               <div className="flex items-center gap-1.5">
                 <select value={sendModel} onChange={e => setSendModel(e.target.value)} title="送入/開新聊天室時使用的 AI 模型"
                   className="shrink-0 bg-transparent border border-[var(--border)] rounded px-1 py-0.5 text-[9px] text-[var(--text-muted)] focus:outline-none focus:border-[var(--gold)]/60">
-                  {MODEL_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  {MODEL_OPTIONS.map(o => <option key={o.value} value={o.value} title={o.title} disabled={o.disabled}>{o.label}</option>)}
                 </select>
                 <select value={sendEffort} onChange={e => setSendEffort(e.target.value)} title="模型強度（claude --effort）"
                   className="shrink-0 bg-transparent border border-[var(--border)] rounded px-1 py-0.5 text-[9px] text-[var(--text-muted)] focus:outline-none focus:border-[var(--gold)]/60">

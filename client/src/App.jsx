@@ -3,6 +3,7 @@ import { useCostEngine, BountyOverlay, BountyToast, ContractModal, fmtCost, comp
 import { TodoBoard } from './TodoBoard.jsx'
 import { MetricsDashboard } from './MetricsDashboard.jsx'
 import { SommelierPanel } from './Sommelier.jsx'
+import { reloginSession } from './relogin.js'
 import { QAMonitorPanel } from './QAMonitor.jsx'
 import BountySettings from './BountySettings.jsx'
 import MarkerPanel from './MarkerPanel.jsx'
@@ -224,6 +225,10 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick,
         <div className="truncate text-[var(--text-h)] text-xs leading-tight mb-0.5">
           {session.origin === 'tc' && <span title="TC 開的聊天室（仕酒師/QA 喚醒）" className="mr-1">🍷</span>}
           {session.displayName}
+          {/* 🔁 重新登入聯動（少爺 2026-09-16）：把無頭出身／已關掉的聊天室在終端 claude --resume 成活分頁並自動掛監看 */}
+          <button onClick={e => { e.stopPropagation(); reloginSession(session.id, session.cwd ?? null, session.displayName) }}
+            title="🔁 重新登入聯動：在終端重新開啟這個聊天室（claude --resume）並自動掛起監看，之後 QA ▶／留言／結案與侍酒師結帳都會原地送進它；已是活分頁時只會提示"
+            className="ml-1 text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)] shrink-0">🔁</button>
         </div>
         {/* Row 2: time */}
         <div className="text-[10px] text-[var(--text-muted)]">
@@ -775,7 +780,7 @@ function PresentStylePanel() {
           <select value={cfg.model ?? ''} onChange={e => save({ model: e.target.value })}
             className="flex-1 bg-[var(--surface)] border border-[var(--border)] rounded px-1.5 py-0.5 text-[10px] text-[var(--text)] focus:outline-none focus:border-[var(--gold-border)]">
             <option value="claude-haiku-4-5-20251001">Haiku（快，預設）</option>
-            {MODEL_OPTIONS.filter(o => o.value).map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            {MODEL_OPTIONS.filter(o => o.value).map(o => <option key={o.value} value={o.value} title={o.title} disabled={o.disabled}>{o.label}</option>)}
           </select>
         </div>
         <div className="text-[8px] text-[var(--text-muted)]/70">

@@ -766,7 +766,7 @@ function ChatPanel({ streamEvents, chatInit, selectedId }) {
         />
         <select value={chatModel} onChange={e => setChatModel(e.target.value)} title="這個聊天室送出時使用的 AI 模型"
           className="shrink-0 bg-[var(--surface-2)] border border-[var(--border)] rounded px-1.5 py-0.5 text-[10px] text-[var(--text)] focus:outline-none focus:border-[var(--gold-border)]">
-          {MODEL_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          {MODEL_OPTIONS.map(o => <option key={o.value} value={o.value} title={o.title} disabled={o.disabled}>{o.label}</option>)}
         </select>
         <select value={chatEffort} onChange={e => setChatEffort(e.target.value)} title="模型強度（claude --effort）"
           className="shrink-0 bg-[var(--surface-2)] border border-[var(--border)] rounded px-1.5 py-0.5 text-[10px] text-[var(--text)] focus:outline-none focus:border-[var(--gold-border)]">

@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "check:models": "node modelCatalog.check.mjs"
   },
   "keywords": [],
   "author": "",

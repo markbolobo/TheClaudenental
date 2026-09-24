@@ -7,15 +7,19 @@ import path from 'path'
 import { spawnSync, spawn } from 'child_process'
 import os from 'os'
 import crypto from 'crypto'
-import { buildCatalog, getCatalog, priceFor } from './modelCatalog.js'
+import { buildCatalog, getCatalog, priceFor, catalogFingerprint } from './modelCatalog.js'
+import { claudeVersionFromPath, compareClaudeVersion } from './modelPushSource.js'
 
 const PORT = 3001
 const CLAUDIA_URL = 'http://localhost:48901'
 
 // 模型定價改由 modelCatalog 供應（少爺 2026-08-15「與時俱進」＋「要能自動更新」）——
 // 原本三個硬編條目已停在 4.6 世代，Opus 5 / Sonnet 5 的花費全部用錯價回算。
-// 目錄＝內建表 ∪ 掃 claude.exe 得到的 alias ∪ 手動覆寫，開機與每日重建一次。
+// 目錄＝內建表 ∪ 官方模型表（Claude Code 內建 claude-api skill）∪ 掃 claude.exe 得到的 alias ∪ 手動覆寫。
+// 開機與每日重建一次；另外每小時比一次指紋（claude.exe 檔案戳記＋skill 版本），
+// 有換版就立刻重建——少爺升級 Claude Code 後最慢一小時內，新模型就會出現在下拉裡（2026-09-24）。
 const MODEL_REFRESH_MS = 24 * 60 * 60 * 1000
+const MODEL_FINGERPRINT_MS = 60 * 60 * 1000
 function priceOf(InModelId) { return priceFor(InModelId, getClaudeExe()) }
 
 const app = Fastify({ logger: false, bodyLimit: 50 * 1024 * 1024 }) // 50MB — supports large image base64 payloads
@@ -28,7 +32,10 @@ function findClaudeExe() {
   // 1. Check VS Code extension (primary on Windows)
   const extDir = path.join(os.homedir(), '.vscode', 'extensions')
   if (fs.existsSync(extDir)) {
-    const dirs = fs.readdirSync(extDir).filter(d => d.startsWith('anthropic.claude-code')).sort().reverse()
+    // 版號要按數字比，不能按字串排——字串排會讓 2.1.99 贏過 2.1.300，升版後反而抓到舊二進位
+    const dirs = fs.readdirSync(extDir).filter(d => d.startsWith('anthropic.claude-code'))
+      .sort((a, b) => compareClaudeVersion(claudeVersionFromPath(a) ?? '0', claudeVersionFromPath(b) ?? '0') ?? a.localeCompare(b))
+      .reverse()
     for (const d of dirs) {
       const candidate = path.join(extDir, d, 'resources', 'native-binary', 'claude.exe')
       if (fs.existsSync(candidate)) return candidate
@@ -68,6 +75,79 @@ function isMonitorAlive(sessionId) {
     try { process.kill(_pid, 0) } catch { monitorHeartbeats.delete(sessionId); return false }
   }
   return true
+}
+
+// ─── 本機 session 註冊表（Claude Code 官方維護，2.1.263+）───────────────────────
+// ~/.claude/sessions/<pid>.json：{ sessionId, pid, cwd, kind:'interactive',
+// entrypoint:'claude-vscode', messagingSocketPath, name, version }。
+// 這是「這個 session 是不是少爺開著的活分頁」的 SSOT——比 sessions Map（靠 hook 註冊、
+// 退場後條目仍在）準：PID 死了就是死了。用途：① 建 QA run 時自動判 wakeMode
+// ② 決定要不要注入「補掛監看」指令 ③ messagingSocketPath 是後續直投管線的入口。
+const CLAUDE_SESSIONS_DIR = path.join(os.homedir(), '.claude', 'sessions')
+const LIVE_SESSIONS_TTL_MS = 2000
+let _liveSessionsCache = { ts: 0, map: new Map() }
+function readLiveSessions() {
+  if (Date.now() - _liveSessionsCache.ts < LIVE_SESSIONS_TTL_MS) return _liveSessionsCache.map
+  const _map = new Map()
+  try {
+    for (const _f of fs.readdirSync(CLAUDE_SESSIONS_DIR)) {
+      if (!_f.endsWith('.json')) continue
+      try {
+        const _o = JSON.parse(fs.readFileSync(path.join(CLAUDE_SESSIONS_DIR, _f), 'utf-8'))
+        if (!_o?.sessionId || !_o?.pid) continue
+        try { process.kill(_o.pid, 0) } catch { continue }   // 進程已死＝分頁關了
+        _map.set(_o.sessionId, _o)
+      } catch {}
+    }
+  } catch {}
+  _liveSessionsCache = { ts: Date.now(), map: _map }
+  return _map
+}
+
+/** 該 session 是不是「少爺開著的活互動分頁」——TC 自己 spawn 的無頭子進程不算 */
+function isLiveInteractiveSession(sessionId) {
+  if (!sessionId || subprocessSids.has(sessionId)) return false
+  const _s = readLiveSessions().get(sessionId)
+  return !!_s && _s.kind === 'interactive'
+}
+
+/** 原地聯動監看的掛載指令（給 Claude 端直接丟進 Monitor 工具，persistent=true） */
+function monitorMountCommand(sessionId) {
+  return `"${getPythonExe()}" -u C:/Project/MasterBrain/.agent/scripts/Watch-QAComments.py --session ${sessionId}`
+}
+
+// wakeMode 由 server 決定（少爺 2026-09-08）：活的 VS Code 分頁只有 monitor 能原地聯動，
+// Claude 端填什麼都不算數——歷史退化的成因就是「指令範本硬寫 spawn」把聯動整條蓋掉
+// （2026-07 之後 40 個 run 全是 spawn，少爺按鈕一律走無頭、分頁不動）。'none' 是唯一放行的明示值。
+function decideWakeMode(sessionId, requested) {
+  if (requested === 'none') return 'none'
+  if (!sessionId) return 'none'
+  if (isLiveInteractiveSession(sessionId)) {
+    if (requested === 'spawn') logEvent('qa.wakemode.autocorrect', { sessionId, requested, applied: 'monitor' })
+    return 'monitor'
+  }
+  return 'spawn'
+}
+
+// ─── Session Inbox：原地聯動的統一投遞口（少爺 2026-09-08「全部都要聯動」）──────
+// 原本只有 QA run 一條線有原地聯動（監看輪詢 /api/qa/runs）；聊天室送訊息／侍酒師走
+// /api/claude/run → spawnClaude 無頭，開著的 VS Code 分頁永遠不動。改成：監看活著時一律
+// 投進 inbox，由該分頁的監看印出 → 分頁原地處理 → 回應寫進同一份 transcript，
+// /api/session/watch 的 tail 照樣把畫面帶回 TC 聊天室面板。
+const sessionInbox = new Map()   // sessionId → [{ id, ts, kind, text }]
+const INBOX_MAX = 50
+const INBOX_TTL_MS = 30 * 60 * 1000
+const _autoMountInjectedAt = new Map()   // sessionId → 上次注入「補掛監看」的時間（節流）
+const AUTO_MOUNT_THROTTLE_MS = 10 * 60 * 1000
+function pushSessionInbox(sessionId, kind, text) {
+  if (!sessionId) return null
+  const _item = { id: `inb${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, ts: Date.now(), kind, text: String(text ?? '') }
+  const _cut = Date.now() - INBOX_TTL_MS
+  const _list = (sessionInbox.get(sessionId) ?? []).filter(x => x.ts >= _cut)
+  _list.push(_item)
+  sessionInbox.set(sessionId, _list.slice(-INBOX_MAX))
+  logEvent('tc.inbox.push', { sessionId, kind, len: _item.text.length })
+  return _item
 }
 
 // 解析真 python.exe 絕對路徑（少爺 2026-07-17：Monitor 非互動 shell 下裸 `python`＝WindowsApps store shim → exit 127；
@@ -529,19 +609,23 @@ app.post('/hook/UserPromptSubmitSync', async (request, reply) => {
   for (const [, _p] of claudeProcs) if (_p.sessionId === _sid && _p.status === 'running') return ''
   // 監看心跳還在＝已原地聯動、不重掛（避免每句注入）；心跳斷才注入（涵蓋兩種：spawn run 首掛 + monitor 死掉重掛）
   if (isMonitorAlive(_sid)) return ''
+  // 少爺 2026-09-08「全部都要聯動」：原本要求「綁著未結案 QA run」才注入 → 沒開 run 的分頁永遠不會
+  // 掛監看，TC 聊天室／侍酒師送進來的訊息就只能走無頭、分頁不動。改成活的互動分頁一律補掛（節流 10 分鐘）。
+  if (!isLiveInteractiveSession(_sid)) return ''
+  if (Date.now() - (_autoMountInjectedAt.get(_sid) ?? 0) < AUTO_MOUNT_THROTTLE_MS) return ''
   const _run = readQaRuns().runs.find(r =>
     r.boundSessionId === _sid && !r.archivedAt && !['closed', 'aborted'].includes(r.status))
-  if (!_run) return ''
-  logEvent('qa.monitor.autoconvert.injected', { sid: _sid, runId: _run.id, wakeMode: _run.wakeMode })
+  _autoMountInjectedAt.set(_sid, Date.now())
+  logEvent('qa.monitor.autoconvert.injected', { sid: _sid, runId: _run?.id ?? null, wakeMode: _run?.wakeMode ?? null })
   return {
     hookSpecificOutput: {
       hookEventName: 'UserPromptSubmit',
       additionalContext:
-        `(TC 自動聯動設定) 本聊天室已被少爺在互動介面開啟，且綁定 QA run「${_run.topic}」(${_run.id})，但原地聯動的監看已中斷（process 重啟或監看死亡）。` +
-        `請在處理少爺訊息前先完成兩步（重掛監看、恢復 VS Code 原地聯動）：` +
-        `(1) 用 Monitor 工具執行 command='"${getPythonExe()}" -u C:/Project/MasterBrain/.agent/scripts/Watch-QAComments.py --session ${_sid}'、persistent=true；` +
-        `(2) PATCH http://127.0.0.1:3001/api/qa/runs/${_run.id} body {"wakeMode":"monitor"}。` +
-        `完成後照常處理少爺的訊息，並簡短告知已完成聯動設定。`,
+        `(TC 自動聯動設定) 本聊天室是少爺開著的 VS Code 分頁，但 TC 原地聯動的監看沒掛上（或已中斷）。` +
+        `在掛上之前，少爺從 TC 聊天室／侍酒師送進來的訊息${_run ? `、以及 QA run「${_run.topic}」(${_run.id}) 的留言／▶／✔ 結案` : ''}都只會走無頭進程，這個分頁不會動。` +
+        `請在處理少爺訊息前先用 Monitor 工具掛上（persistent=true）：command='${monitorMountCommand(_sid)}'` +
+        (_run && _run.wakeMode !== 'monitor' ? `，掛好後 PATCH http://127.0.0.1:3001/api/qa/runs/${_run.id} body {"wakeMode":"monitor"}` : '') +
+        `。完成後照常處理少爺的訊息，並簡短告知已完成聯動設定。`,
     },
   }
 })
@@ -562,6 +646,14 @@ app.get('/api/qa/monitor-status', async (request) => {
   const _beat = _raw ? (typeof _raw === 'object' ? _raw.ts : _raw) : null
   const _pid = _raw && typeof _raw === 'object' ? _raw.pid : null
   return { session: _sid ?? null, alive: isMonitorAlive(_sid), lastBeatMs: _beat, pid: _pid, ageMs: _beat ? (Date.now() - _beat) : null }
+})
+
+// 原地聯動投遞口：監看每輪拉一次（?since=<ts> 只取新的）——聊天室訊息等非 QA 事件走這條
+app.get('/api/session-inbox', async (request) => {
+  const _sid = request.query?.session
+  const _since = Number(request.query?.since ?? 0) || 0
+  const _items = (_sid ? (sessionInbox.get(_sid) ?? []) : []).filter(x => x.ts > _since)
+  return { ok: true, session: _sid ?? null, items: _items, now: Date.now() }
 })
 
 app.post('/hook/UserPromptSubmit', async (request) => {
@@ -645,6 +737,44 @@ function toolSummary(toolName, input = {}) {
 // ─── Task API (Phase B) ───────────────────────────────────────────────────────
 
 app.get('/api/sessions', async () => ({ sessions: [...sessions.values()] }))
+
+// ─── 🔁 重新登入聯動（少爺 2026-09-16「讓以後 TC 觸發的聊天室都具備，提供我可以重新登入聯動聊天室的功能」）──
+// TC 自己 spawn 的聊天室是無頭出身，永遠做不到原地聯動。這裡把它「重新登入」成活的互動 session：
+// 在終端開一個可視視窗跑 claude --resume <sid>，起手 prompt 叫它立刻掛起監看。
+// 實測 2026-09-16：終端啟動的 resume 會登進 ~/.claude/sessions/<pid>.json（kind:'interactive', entrypoint:'cli'）
+// → isLiveInteractiveSession 成立 → wakeMode 判 monitor、/api/claude/run 投 inbox、UserPromptSubmitSync 會補掛。
+// ⚠️ 子進程環境必須清掉 CLAUDE* 變數（巢狀守衛會讓 claude 立刻退出，實測零進程零註冊）。
+// ⚠️ 參數逐項傳給 cmd start，不可自組含引號的字串（Node 會把內層引號轉義成 \"，start 解析不了，實測視窗根本沒開）。
+function reloginTitleOf(sessionId) {
+  return `TC 聯動 ${String(sessions.get(sessionId)?.displayName ?? sessionId.slice(0, 8)).replace(/["\r\n]/g, '')}`
+}
+app.post('/api/session/relogin', async (request, reply) => {
+  const { sessionId, projectPath } = request.body ?? {}
+  if (!/^[0-9a-f-]{36}$/i.test(String(sessionId ?? ''))) { reply.code(400); return { ok: false, error: 'sessionId 格式不對' } }
+  if (isLiveInteractiveSession(sessionId)) {
+    const _s = readLiveSessions().get(sessionId)
+    return { ok: false, alreadyLive: true, error: `這個聊天室已經是活的互動分頁（${_s?.entrypoint === 'cli' ? '終端' : 'VS Code'}，pid ${_s?.pid}）——直接在那裡輸入即可；監看沒掛的話它會自動補掛` }
+  }
+  const _running = [...claudeProcs.values()].find(e => e.sessionId === sessionId && e.status === 'running')
+  if (_running) return { ok: false, error: '這個聊天室正有 TC 的無頭進程在跑，等它結束再重新登入（否則雙寫 transcript）' }
+  const _cwd = path.normalize(String(projectPath || sessions.get(sessionId)?.cwd || 'C:\\Project\\RomanPrototype'))
+  if (!fs.existsSync(_cwd)) { reply.code(400); return { ok: false, error: `專案路徑不存在：${_cwd}` } }
+  const _exe = getClaudeExe()
+  // python 路徑一律正斜線：Monitor 走 Git Bash，反斜線會被吃掉 → exit 127（2026-09-16 首測實錄，該 session 自己改正斜線才掛成）
+  const _mount = `${getPythonExe().replace(/\\/g, '/')} -u C:/Project/MasterBrain/.agent/scripts/Watch-QAComments.py --session ${sessionId}`
+  // 起手 prompt 只用 ASCII（避開 cmd start 的引號與編碼問題）；內容＝立刻掛監看、驗 alive、回一行後等指令
+  const _prompt = `(TC relogin link) This chat was re-opened from TheClaudenental to restore in-place linkage. Step 1: call the Monitor tool with persistent=true and this exact command: ${_mount}. Step 2: GET http://127.0.0.1:3001/api/qa/monitor-status?session=${sessionId} and confirm alive is true. Reply with one short line in Traditional Chinese, then wait for further instructions.`
+  const _env = { ...process.env }
+  for (const k of Object.keys(_env)) if (/^CLAUDE/i.test(k)) delete _env[k]
+  try {
+    const _p = spawn('cmd.exe', ['/c', 'start', reloginTitleOf(sessionId), '/D', _cwd, _exe, '--resume', sessionId, _prompt],
+      { detached: true, stdio: 'ignore', windowsHide: true, env: _env })
+    _p.unref()
+  } catch (e) { reply.code(500); return { ok: false, error: String(e) } }
+  logEvent('session.relogin', { sessionId, cwd: _cwd })
+  broadcast({ type: 'session_relogin', sessionId, cwd: _cwd })
+  return { ok: true, sessionId, cwd: _cwd, hint: '已開啟終端視窗續接該聊天室；它會自動掛起監看，約 10 秒後 🔗 聯動會變成 ·通' }
+})
 
 // Clear all non-active sessions — must be before /:id routes to avoid param capture
 app.post('/api/sessions/clear-inactive', async () => {
@@ -1799,7 +1929,7 @@ function getSessionPrefs(sessionId) {
 }
 
 // 少爺 2026-07-14：仕酒師/Chat 勾選「啟用 QA 流程」→ 需求 prompt 尾端附掛 Mode C 指令（流程 SSOT 在 skill 與 QA/README，不在此重抄）
-const QA_FLOW_DIRECTIVE = '\n\n(TC QA 流程) 少爺勾選了「啟用 QA 流程」——本需求必須走 Mode C 協作驗證收尾：照 theclaudenental_operator skill 的「QA Run 操作 SOP（Mode C）」與專案 QA/README.md §Mode C，從 Step 0 開 QA Run（POST /api/qa/runs，必綁 boundSessionId=本 session id、wakeMode:"spawn"、boundProjectPath、project），列 QAPC 計畫（操作步驟＋預期 LOG 劇本＋LOG 埋點計畫）供少爺在 QA 分頁審查；少爺按 ▶ 之前零編譯零埋 LOG。'
+const QA_FLOW_DIRECTIVE = '\n\n(TC QA 流程) 少爺勾選了「啟用 QA 流程」——本需求必須走 Mode C 協作驗證收尾：照 theclaudenental_operator skill 的「QA Run 操作 SOP（Mode C）」與專案 QA/README.md §Mode C，從 Step 0 開 QA Run（POST /api/qa/runs，必綁 boundSessionId=本 session id、boundProjectPath、project；⚠️ wakeMode 不要自己填——server 會依本 session 是不是少爺開著的 VS Code 分頁自動決定），列 QAPC 計畫（操作步驟＋預期 LOG 劇本＋LOG 埋點計畫）供少爺在 QA 分頁審查；少爺按 ▶ 之前零編譯零埋 LOG。\n⭐ POST 回應若帶 mountCommand（＝wakeMode 判為 monitor），**必須在同一個 response 內**用 Monitor 工具把它掛起（persistent=true），再 GET http://127.0.0.1:3001/api/qa/monitor-status?session=<本 session id> 驗 alive:true 才算數——這是 VS Code 原地聯動唯一成立的方式，缺這步少爺按 ▶／留言／✔ 結案都只會走無頭，分頁不動。'
 
 function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort = null, onInit = null, retryCount = 0) {
   // ⚠️ 不再 kill existing（會中斷使用者進行中的 thinking）
@@ -1951,19 +2081,36 @@ app.post('/api/claude/run', async (request) => {
   // 少爺 2026-07-14：勾選啟用 QA 流程 → 需求尾端附掛 Mode C 指令
   if (qaFlow === true) fullPrompt += QA_FLOW_DIRECTIVE
 
+  // ⭐ 原地聯動優先（少爺 2026-09-08「全部都要聯動」）：目標聊天室掛著活監看 → 投進 inbox 讓那個
+  // VS Code 分頁原地處理，不 spawn 無頭（無頭恆不會讓已開的分頁動，且與分頁進程雙寫 transcript）。
+  // 分頁的回應照樣寫進同一份 transcript，/api/session/watch 的 tail 會把畫面帶回 TC 聊天室面板。
+  if (newSession !== true && sessionId && isMonitorAlive(sessionId)) {
+    pushSessionInbox(sessionId, 'chat', fullPrompt)
+    emitLog(sessionId, '[TC] 訊息已投遞到 VS Code 分頁原地處理（監看聯動）', 'hook')
+    logEvent('tc.chat.delivered_inplace', { sessionId, projectPath: normalizePath(projectPath) })
+    // 附件路徑已寫進 prompt，交給分頁自行讀取；沒有 proc close 可掛，改用延遲清理
+    if (tempFiles.length) setTimeout(() => { for (const f of tempFiles) try { fs.unlinkSync(f) } catch {} }, INBOX_TTL_MS)
+    return { ok: true, projectPath: normalizePath(projectPath), sessionId, delivered: 'monitor' }
+  }
+
   // 思考中（同 projectPath 已有 running process）→ push 到 queue，不 kill 上一個
   // 少爺 2026-08-06：newSession=true（仕酒師「開新聊天室」）＝明示開全新聊天室——排隊時不得 fallback 沿用
   // running 進程的 sessionId（否則新需求被併進忙碌中的既有聊天室；sessionId=null 的 fallback 只服務
   // 「同聊天室接續但 client 尚未拿到 session id」的 ChatPanel 情境）
+  // 少爺 2026-09-11：newSession=true 完全跳過佇列，直接 spawn 獨立進程——每個侍酒師「開新聊天室」
+  // 都是獨立 session，不必等前一個結束。舊進程繼續跑、各自 broadcast stream event（sessionId 區分）。
   const _newSession = newSession === true
   const existing = claudeProcs.get(projectPath)
-  if (existing?.status === 'running') {
+  if (existing?.status === 'running' && !_newSession) {
     let q = claudeRunQueue.get(projectPath)
     if (!q) { q = []; claudeRunQueue.set(projectPath, q) }
     q.push({ prompt: fullPrompt, sessionId: _newSession ? null : (sessionId ?? existing.sessionId ?? null), newSession: _newSession, model: _model, effort: _effort })
     broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath),
       event: { type: 'system', subtype: 'queue_enqueue', queuePos: q.length, newSession: _newSession } })
     return { ok: true, queued: true, queuePos: q.length }
+  }
+  if (_newSession && existing?.status === 'running') {
+    logEvent('tc.chat.concurrent_spawn', { projectPath: normalizePath(projectPath), existingSession: existing.sessionId ?? null })
   }
   const entry = spawnClaude(projectPath, fullPrompt, _newSession ? null : (sessionId ?? null), _model, _effort)
 
@@ -2097,17 +2244,33 @@ app.post('/api/debug/client', async (request) => {
 // ─── 模型目錄 ─────────────────────────────────────────────────────────────────
 // client 的模型下拉與成本演出都吃這支，不再各自硬編一份（少爺 2026-08-15）
 
-app.get('/api/models', async () => getCatalog(getClaudeExe()))
-
-app.post('/api/models/refresh', async () => {
+/**
+ * 重建模型目錄並推播給所有前端。開機／每日／換版／手動四條路都走這支，
+ * 日誌與推播只有一份，不會有哪條路漏報。
+ */
+function refreshModelCatalog(InReason) {
   const _cat = buildCatalog(getClaudeExe())
   broadcast({ type: 'model_catalog', catalog: _cat })
+  console.log(`[models] ${_cat.models.length} 筆（官方表 ${_cat.officialSource}／掃描 ${_cat.source}／${InReason}）`
+    + (_cat.newlyDiscovered.length ? ` · 新模型 ${_cat.newlyDiscovered.join(', ')}` : '')
+    + (_cat.excludedRetired.length ? ` · 已退役擋下 ${_cat.excludedRetired.join(', ')}` : '')
+    + (_cat.excludedUnlisted.length ? ` · 官方未收錄擋下 ${_cat.excludedUnlisted.join(', ')}` : ''))
   logEvent('models.refresh', {
-    source: _cat.source, count: _cat.models.length,
+    reason: InReason, source: _cat.source, official: _cat.officialSource, count: _cat.models.length,
     newlyDiscovered: _cat.newlyDiscovered, estimated: _cat.estimated,
+    excludedRetired: _cat.excludedRetired, excludedUnlisted: _cat.excludedUnlisted,
   })
+  if (_cat.newlyDiscovered.length) {
+    console.log(`[models] 新模型 ${_cat.newlyDiscovered.join(', ')} 官方表還沒收錄 —— 價暫沿用同 tier 並標 ⚠，`
+      + `要先校正就改 ${'~/.claude/tc_model_catalog.json'} 的 overrides`)
+    logEvent('models.discovered', { ids: _cat.newlyDiscovered })
+  }
   return _cat
-})
+}
+
+app.get('/api/models', async () => getCatalog(getClaudeExe()))
+
+app.post('/api/models/refresh', async () => refreshModelCatalog('manual'))
 
 // ─── JSONL directory scanner (fallback session discovery) ────────────────────
 // Runs every 8s. Discovers sessions whose hooks may have been missed (e.g. after
@@ -4229,6 +4392,19 @@ const CELLAR_TOOLS = [
     desc: '啟動動畫工具包服務面板（選資產＋勾服務執行；需 UE Editor 開啟）',
     exec: ['cmd.exe', ['/c', 'C:\\Project\\UE_AnimToolkit\\AnimToolkit.bat']],
   },
+  {
+    id: 'mixamo-root-motion', name: 'Mixamo → UE Root Motion 加工器', kind: 'execute',
+    desc: 'Mixamo 下載的 FBX 轉成 UE Root Motion 動畫（拖放批量；走 Blender，不需 UE Editor）',
+    // 與 anim-toolkit 同模式：cmd.exe /c 中介，.bat 內再 start pythonw 開 GUI
+    exec: ['cmd.exe', ['/c', 'C:\\Project\\UE_AnimToolkit\\MixamoRootMotion.bat']],
+  },
+  {
+    id: 'ue-ref-viewer', name: 'UE Reference Viewer（裝進 VS Code）', kind: 'execute',
+    desc: 'VS Code 擴充：選取符號按 Alt+R 開三欄引用圖；點此確保裝的是最新版',
+    // 擴充沒有獨立視窗可開，「啟動」＝把 repo 裡最新的 .vsix 裝進 VS Code（已是最新就跳過）
+    // 必經 cmd.exe 中介：酒窖 spawn 是 detached + stdio ignore，powershell 直跑會拿不到標準 handle 而以 exit 0 空跑；同理沒有主控台，腳本結果走彈窗
+    exec: ['cmd.exe', ['/c', 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\\Project\\vscode-ue-reference-viewer\\Install-Extension.ps1']],
+  },
 ]
 app.get('/api/tools', async () => ({ ok: true, tools: CELLAR_TOOLS.map(t => ({ id: t.id, name: t.name, kind: t.kind, desc: t.desc })) }))
 app.post('/api/tools/run/:id', async (request) => {
@@ -4691,7 +4867,17 @@ app.get('/api/sommelier/data/:projectId', async (request, reply) => {
           (symbolIntentIndex[ref.name] ??= []).push({ id: it.id, title: it.title, scope: it.scope, invariants: (it.invariants ?? []).length })
         }
     } catch { /* design_intent.json 不存在 → 前四層照回,前端優雅降級 */ }
-    return { ok: true, data, arch, symbolCanvasIndex, memory, symbolMemoryIndex, assetGraph, symbolBpIndex, designIntent, symbolIntentIndex, extractCommand: proj.extractCommand ?? null }
+    // 情境體驗層（第六血肉，選配，少爺 2026-09-15 立）：scenario/S##_*.md 由 extract_scenario_experience.mjs 萃取；建 intent→scenario 反查索引（意圖細節頁「出現在這些情境」）
+    let scenario = null
+    const intentScenarioIndex = {}
+    try {
+      scenario = JSON.parse(fs.readFileSync(path.join(proj.dataDir, 'generated', 'scenario_experience.json'), 'utf8'))
+      for (const sc of scenario.scenarios ?? [])
+        for (const iid of sc.intentLinks ?? []) {
+          (intentScenarioIndex[iid] ??= []).push({ id: sc.id, title: sc.title, phase: sc.phase, status: sc.status })
+        }
+    } catch { /* scenario_experience.json 不存在 → 前五層照回,前端優雅降級 */ }
+    return { ok: true, data, arch, symbolCanvasIndex, memory, symbolMemoryIndex, assetGraph, symbolBpIndex, designIntent, symbolIntentIndex, scenario, intentScenarioIndex, extractCommand: proj.extractCommand ?? null }
   } catch (e) {
     reply.code(404)
     return { ok: false, error: `尚無萃取資料:${e.message}`, hint: proj.extractCommand ?? null }
@@ -4787,12 +4973,15 @@ app.post('/api/qa/runs', async (request) => {
     boundProjectPath: body.boundProjectPath ?? null,  // M-6b：spawn 喚醒需要的 cwd
     project: typeof body.project === 'string' ? body.project : null,  // 跨專案：sommelier.json projects[].id；null=早期 run 前端視為 roman
     // M-6b 喚醒模式：spawn=server 主動 resume 該聊天室 / monitor=該 session 自掛監看（避免雙重喚醒）/ none
-    wakeMode: ['spawn', 'monitor', 'none'].includes(body.wakeMode) ? body.wakeMode : (body.boundSessionId ? 'spawn' : 'none'),
+    wakeMode: decideWakeMode(body.boundSessionId ?? null, body.wakeMode),
     archivedAt: null,
     requirement: body.requirement ?? '',
     qapPath: body.qapPath ?? '',
     sessionDir: body.sessionDir ?? '',   // 絕對路徑；artifact 路由以此為根
     criteria: Array.isArray(body.criteria) ? body.criteria : [],
+    // C 區塊（少爺 2026-09-09）：設計說明。每筆 = 一顆可展開的按鈕，內容用結構化 blocks 排版
+    // { id, title, tag, summary, blocks:[{type:'text'|'table'|'tree'|'steps'|'note'|'kv', ...}] }
+    designs: Array.isArray(body.designs) ? body.designs : [],
     items: (Array.isArray(body.items) ? body.items : []).map((it, i) => ({
       id: it.id ?? i + 1, text: it.text ?? '', criteriaRef: it.criteriaRef ?? null,
       scenario: it.scenario ?? '', status: 'pending', evidenceRefs: [], resultNote: '',
@@ -4813,9 +5002,10 @@ app.post('/api/qa/runs', async (request) => {
   data.runs.push(run)
   writeQaRuns(data)
   if (run.status === 'countdown') qaArmCountdown(run)
-  logEvent('qa.run.create', { id: run.id, topic: run.topic, status: run.status })
+  logEvent('qa.run.create', { id: run.id, topic: run.topic, status: run.status, wakeMode: run.wakeMode })
   qaBroadcast(run)
-  return { ok: true, run }
+  // monitor 模式＝「建 run」與「掛監看」是同一個 response 的兩步、缺一則聯動失效——把指令直接回給 Claude 端
+  return { ok: true, run, ...(run.wakeMode === 'monitor' ? { mountCommand: monitorMountCommand(run.boundSessionId) } : {}) }
 })
 
 // 歷史列表（新到舊；?limit=N 預設 50；封存的預設隱藏 ?includeArchived=1 全看）
@@ -4878,6 +5068,16 @@ app.patch('/api/qa/runs/:id', async (request, reply) => {
   }
   if (Array.isArray(body.criteria)) run.criteria = body.criteria // A 區塊 criteria 整批重設(補字串→物件用；PATCH 入口，2026-07-15)
   if (Array.isArray(body.addCriteria)) for (const c of body.addCriteria) run.criteria.push(c)
+  // C 區塊設計說明（少爺 2026-09-09）：designs 整批重設 / addDesigns 逐筆 upsert（同 id 覆蓋，改稿不長出重複按鈕）
+  if (Array.isArray(body.designs)) run.designs = body.designs
+  if (Array.isArray(body.addDesigns)) {
+    if (!Array.isArray(run.designs)) run.designs = []
+    for (const d of body.addDesigns) {
+      const _i = run.designs.findIndex(x => x && x.id === d.id)
+      if (_i >= 0) run.designs[_i] = d
+      else run.designs.push(d)
+    }
+  }
   // 少爺 2026-07-14 環境戳記標準欄位：announce 舊路徑建的 run 可事後 PATCH 補填
   for (const _k of ['env', 'commit', 'branch', 'map', 'buildConfig'])
     if (typeof body[_k] === 'string') run[_k] = body[_k]
@@ -4991,15 +5191,16 @@ function markWakeUndelivered(sessionId) {
   } catch (e) { logEvent('qa.wake.undelivered.error', { sessionId, error: String(e?.message ?? e) }) }
 }
 
-const QA_WAKE_ACTIONS = { 'start-now': '按了「▶ 立即開跑」→ 請進入階段二（埋 LOG + 雙編譯 + 重啟 Editor）', pause: '要求暫停', resume: '要求繼續', abort: '要求中止', comment: '留言', close: '按了「✔ 結案」→ 階段五（清 QAC LOG + 雙編譯 + 重啟 Editor；無頭啟動 Editor 用 Start-Process detached）＋維護侍酒師閉環：把本 run 需求「實作驗證後的收斂」沉澱回四種血肉（C++ code / 架構 canvas / 拼圖 memory；藍圖 md 暫跳過），Editor 開著時跑 extract_asset_graph.py 更新藍圖資產層，最後 POST /api/sommelier/refresh/roman 重萃取讓侍酒師吃到最新拼圖＋設計思路模板維護（增量）：分析本 run「需求原話→設計決策/取捨→驗證結果」軌跡，萃取少爺這輪怎麼設計體驗，增量併入 .agent/knowledge/Roman_DesignThinking_Templates.md（基線 2026-07-31 全量、此後僅以 run 為單位增量），有更新列入 knowledgeUpdated 回寫' }
-function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, effort = null, wakeVisible = false) {
+const QA_WAKE_ACTIONS = { 'start-now': '按了「▶ 立即開跑」→ 請進入階段二（埋 LOG + 雙編譯 + 重啟 Editor）', pause: '要求暫停', resume: '要求繼續', abort: '要求中止', comment: '留言', close: '按了「✔ 結案」→ 階段五（清 QAC LOG + 雙編譯 + 重啟 Editor；無頭啟動 Editor 用 Start-Process detached）＋維護侍酒師閉環：把本 run 需求「實作驗證後的收斂」沉澱回四種血肉（C++ code / 架構 canvas / 拼圖 memory；藍圖 md 暫跳過），Editor 開著時跑 extract_asset_graph.py 更新藍圖資產層，最後 POST /api/sommelier/refresh/roman 重萃取讓侍酒師吃到最新拼圖＋設計思路模板維護（增量）：分析本 run「需求原話→設計決策/取捨→驗證結果」軌跡，萃取少爺這輪怎麼設計體驗，增量併入 .agent/knowledge/Roman_DesignThinking_Templates.md（基線 2026-07-31 全量、此後僅以 run 為單位增量），有更新列入 knowledgeUpdated 回寫＋情境體驗層維護（少爺 2026-09-15 立）：本 run 動到的意圖檔所涵蓋的情境檔 scenario/S##_*.md 推進狀態標記（💡→📐→🔬→✅）、補討論紀錄與素材清單（qa_finalize_check.py B8 機檢；SOP .agent/workflows/z_sub_scenario_experience.md §6）' }
+function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, effort = null, inPlaceLink = true) {
   try {
     // monitor 模式＝該 session 自掛監看，不可 spawn（雙寫 transcript）；其餘一律喚醒。
     // ⭐ 心跳活著也走本分支（少爺 2026-07-17）：run 還掛 spawn 但監看確實在跑時，喚醒本就靠監看輪詢 run 資料原地聯動，
     //    再 spawn 無頭＝雙重觸發。以 VERIFIED 心跳為準，活著一律交給原地聯動、不 spawn。
     // 看門狗（少爺 2026-07-15「確保機制能運作」）：分頁被關掉＝監看已死——心跳斷即刻無頭補送；心跳在但 transcript
     //    150 秒沒新回應（監看活著但卡住）才退回無頭喚醒＋run 轉回 spawn 模式（喚醒永不聾）。
-    if (run.wakeMode === 'monitor' || isMonitorAlive(run.boundSessionId)) {
+    // inPlaceLink=false＝少爺在留言列關掉「🔗 聯動」→ 本次強制走無頭，不佔用分頁
+    if (inPlaceLink !== false && (run.wakeMode === 'monitor' || isMonitorAlive(run.boundSessionId))) {
       const _mFp = findJsonlPath(run.boundSessionId)
       const _mBefore = lastAssistantActivityMs(_mFp)
       const _mPrompt = `(TC QA 聯動通知) 少爺在 QA Monitor 對 run「${run.topic}」(${run.id}) ${QA_WAKE_ACTIONS[action] ?? action}${text ? `：「${text}」` : ''}。原 monitor 監看已無回應（分頁可能已關閉），本喚醒為無頭補送，run 已轉回 spawn 模式。請照 Mode C 流程繼續（QA/README.md §Mode C），先 GET /api/qa/runs/${run.id}?ackComments=1 讀留言。`
@@ -5065,43 +5266,9 @@ function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, e
       qaBroadcast(_r)
       logEvent('qa.wake.autobind', { id: run.id, sessionId: sid })
     } : null
-    // wakeMode 'cli'（少爺 2026-07-06）：開「可視的互動式 Claude CLI 視窗」resume 該聊天室 —
-    // 同一顆 claude 執行檔，非 -p 無頭管線 → 少爺能直接看到處理過程（黑視窗問題的解）
-    // 少爺 2026-07-14：留言可勾「開視窗」→ 本次喚醒改開可視互動 CLI（僅限已綁定且該專案沒有進行中的無頭進程——避免同 session 雙寫）
-    const _busy = claudeProcs.get(projectPath)?.status === 'running'
-    // 做法A（2026-07-17 少爺選）：CLI 可視視窗路徑在 pm2 服務脈絡下 Start-Process 會「無聲失敗」（無進程/無寫入）
-    //   → 卡 90 秒 watchdog 才 cli_fallback 補送，體感「VS Code 沒跟著、拖很久」。而 spawn-resume 本就會回到
-    //   已開的 VS Code 分頁即時聯動 → QA 喚醒一律走 spawn-resume、停用 CLI 視窗轉向（原條件以 false && 保留備查、可逆）
-    const _useCli = false && (run.wakeMode === 'cli' || wakeVisible === true) && run.boundSessionId && !_busy
-    if (_useCli) {
-      const _exe = getClaudeExe().replace(/'/g, "''")
-      const _path = projectPath.replace(/'/g, "''")
-      const _prompt = prompt.replace(/'/g, "''")
-      const _modelArgs = _model ? `'--model','${String(_model).replace(/'/g, "''")}',` : ''
-      const _effortArgs = _effort ? `'--effort','${String(_effort).replace(/'/g, "''")}',` : ''
-      const _ps = `Start-Process -FilePath '${_exe}' -WorkingDirectory '${_path}' -ArgumentList ${_modelArgs}${_effortArgs}'--resume','${run.boundSessionId}','${_prompt}'`
-      const p = spawn('powershell.exe', ['-NoProfile', '-Command', _ps], { detached: true, stdio: 'ignore' })
-      p.unref()
-      logEvent('qa.wake.cli', { id: run.id, action, sessionId: run.boundSessionId })
-      // cli 視窗看門狗（少爺 2026-07-15「確保機制能運作」）：pm2 服務脈絡下 Start-Process 可能無聲失敗
-      // （03:39 實錄：無進程、無寫入）——90 秒內 transcript 沒有新寫入就自動退回無頭喚醒，保底送達
-      {
-        const _watchFp = findJsonlPath(run.boundSessionId)
-        const _before = lastAssistantActivityMs(_watchFp)
-        armAckEarlyFlip(run.id, _watchFp, _before)
-        setTimeout(() => {
-          try {
-            const _after = lastAssistantActivityMs(_watchFp)
-            if (_after > _before) return   // 視窗有在跑（有真回應）
-            const _existing = claudeProcs.get(projectPath)
-            if (_existing?.status === 'running') return   // 已有其他進程接手
-            logEvent('qa.wake.cli_fallback', { id: run.id, action, sessionId: run.boundSessionId })
-            spawnClaude(projectPath, prompt, run.boundSessionId, _model, _effort, _onInit)
-          } catch {}
-        }, 90 * 1000)
-      }
-      return
-    }
+    // 少爺 2026-07-06 的「開可視 CLI 視窗」路徑已於 2026-09-08 移除：條件早在 2026-07-17 就被
+    // false && 停用（pm2 服務脈絡下 Start-Process 無聲失敗 → 卡 90 秒看門狗），留著只是死設計；
+    // 「看得到處理過程」的正解是原地聯動（monitor），不是另開一個視窗。
     // 提早「處理中」訊號（spawn/queue 皆適用；未綁定新開的 run 等 Claude 首次 PATCH 才翻）
     if (run.boundSessionId) {
       const _aFp = findJsonlPath(run.boundSessionId)
@@ -5133,7 +5300,7 @@ app.post('/api/qa/runs/:id/control', async (request, reply) => {
   const data = readQaRuns()
   const run = data.runs.find(r => r.id === request.params.id)
   if (!run) { reply.code(404); return { ok: false, error: 'not found' } }
-  const { action, text, itemId, attachments, model, effort, wakeVisible } = request.body ?? {}
+  const { action, text, itemId, attachments, model, effort, inPlaceLink } = request.body ?? {}
   // 少爺 2026-07-14：QA 留言可指定喚醒子進程的 AI 模型＋強度（只在 comment 動作使用）
   const _wakeModel = (typeof model === 'string' && model.trim()) ? model.trim() : null
   const _wakeEffort = EFFORT_LEVELS.includes(effort) ? effort : null
@@ -5175,7 +5342,7 @@ app.post('/api/qa/runs/:id/control', async (request, reply) => {
   writeQaRuns(data)
   logEvent('qa.run.control', { id: run.id, action })
   qaBroadcast(run)
-  qaWakeBoundSession(run, action, action === 'comment' ? String(text ?? '') : '', _attachPaths, action === 'comment' ? _wakeModel : null, action === 'comment' ? _wakeEffort : null, wakeVisible === true)
+  qaWakeBoundSession(run, action, action === 'comment' ? String(text ?? '') : '', _attachPaths, action === 'comment' ? _wakeModel : null, action === 'comment' ? _wakeEffort : null, inPlaceLink !== false)
   return { ok: true, run }
 })
 
@@ -5215,18 +5382,17 @@ for (const [, s] of sessions) {
 scanJsonlSessions()
 setInterval(scanJsonlSessions, SCAN_INTERVAL_MS)
 
-// 模型目錄：開機建一次、每日重建一次。Claude Code 升版帶進新模型 alias 時自動被掃到，
+// 模型目錄：開機建一次、每日重建一次。Claude Code 升版帶進新模型 alias 與新版官方模型表時自動被吃到，
 // 不必有人記得去改三份硬編清單（少爺 2026-08-15「要能自動更新這個功能」）
-{
-  const _cat = buildCatalog(getClaudeExe())
-  console.log(`[models] ${_cat.models.length} models (${_cat.source})`
-    + (_cat.newlyDiscovered.length ? ` · 新發現 ${_cat.newlyDiscovered.join(', ')}` : ''))
-}
+refreshModelCatalog('boot')
+setInterval(() => refreshModelCatalog('daily'), MODEL_REFRESH_MS)
+
+// 換版偵測：每小時只比指紋（stat claude.exe ＋ 讀 skill 目錄名），有變才做完整重建，
+// 讓少爺升級 Claude Code 後不必等到隔天、也不必自己按重整（2026-09-24）
+let modelFingerprint = catalogFingerprint(getClaudeExe())
 setInterval(() => {
-  const _cat = buildCatalog(getClaudeExe())
-  if (_cat.newlyDiscovered.length) {
-    console.log(`[models] 新發現 ${_cat.newlyDiscovered.join(', ')} — 價格暫沿用同 tier，請到 ${'~/.claude/tc_model_catalog.json'} overrides 校正`)
-    logEvent('models.discovered', { ids: _cat.newlyDiscovered })
-  }
-  broadcast({ type: 'model_catalog', catalog: _cat })
-}, MODEL_REFRESH_MS)
+  const _fp = catalogFingerprint(getClaudeExe())
+  if (_fp === modelFingerprint) return
+  modelFingerprint = _fp
+  refreshModelCatalog('claude-code 換版')
+}, MODEL_FINGERPRINT_MS)

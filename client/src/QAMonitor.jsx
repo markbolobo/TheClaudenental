@@ -1,10 +1,11 @@
 // AutoQA Monitor — 少爺的 QA 可視化介面
 // 對應 RomanPrototype/.agent/knowledge/UE5.8_QAToolsets_Plan.md §5.7（Phase M-2）
-// A 計畫區（目的+方法）/ B 即時區（進度+截圖+異常）/ C 歷史區 + 留言雙向
+// A 計畫區（目的+方法）/ B 即時區（進度+截圖+異常）/ C 設計說明區（按鈕展開、逐型別排版）+ 留言雙向
 // ws 更新走 window 'tc-qa-run-update' 自訂事件（App.jsx handleServerMessage 一行轉發，不侵入既有結構）
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useModelOptions, EFFORT_OPTIONS } from './modelOptions.js'
 import { confirmIfLiveInteractive } from './liveSessionGuard.js'
+import { reloginSession } from './relogin.js'
 import { WorkflowLauncher } from './WorkflowLauncher.jsx'
 
 const STATUS_META = {
@@ -18,6 +19,101 @@ const STATUS_META = {
 }
 const ITEM_ICON = { pending: '○', running: '▶', pass: '✅', fail: '❌', blocked: '🚧', skipped: '⏭' }
 const OUTCOME_LABEL = { pass: '✅ 達標', fail: '❌ 未達標', blocked: '🚧 受阻' }
+
+// C 區塊（少爺 2026-09-09）：設計說明的排版渲染器。
+// 「那些設計仰賴排版才能完整表達」⇒ 不用純文字，逐型別給版面：
+//   text 段落／table 表格／tree 等寬樹狀骨架／steps 編號步驟／kv 參數對照／note 警語
+function DesignBlock({ block: b }) {
+  if (!b || !b.type) return null
+
+  if (b.type === 'text') {
+    return <p className="text-[11px] leading-relaxed text-[var(--text)]/90 whitespace-pre-wrap">{b.text}</p>
+  }
+
+  if (b.type === 'table') {
+    return (
+      <div className="overflow-x-auto">
+        <table className="w-full text-[10px] border-collapse">
+          <thead>
+            <tr className="text-[var(--text-muted)] uppercase tracking-wider">
+              {(b.headers ?? []).map((h, i) => (
+                <th key={i} className="text-left py-1 pr-3 border-b border-[var(--border)]">{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {(b.rows ?? []).map((r, i) => (
+              <tr key={i} className="border-b border-[var(--border)]/30 align-top">
+                {r.map((c, j) => (
+                  <td key={j} className={`py-1 pr-3 ${j === 0 ? 'font-mono text-[var(--gold)] whitespace-nowrap' : 'text-[var(--text)]/90'}`}>{c}</td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )
+  }
+
+  if (b.type === 'tree') {
+    return (
+      <pre className="text-[10px] font-mono leading-snug bg-black/30 border border-[var(--border)] rounded p-2 overflow-x-auto text-[var(--text)]/85">
+        {(b.lines ?? []).join('\n')}
+      </pre>
+    )
+  }
+
+  if (b.type === 'steps') {
+    return (
+      <ol className="space-y-1 list-none">
+        {(b.items ?? []).map((s, i) => (
+          <li key={i} className="text-[11px] flex gap-2">
+            <span className="shrink-0 text-[var(--gold)] font-mono">{String(i + 1).padStart(2, '0')}</span>
+            <span className="text-[var(--text)]/90 whitespace-pre-wrap">{s}</span>
+          </li>
+        ))}
+      </ol>
+    )
+  }
+
+  if (b.type === 'kv') {
+    return (
+      <div className="space-y-1">
+        {(b.pairs ?? []).map(([k, v], i) => (
+          <div key={i} className="flex gap-3 items-start">
+            <div className="text-[10px] font-mono text-[var(--gold)] whitespace-nowrap min-w-[130px]">{k}</div>
+            <div className="text-[10px] text-[var(--text)]/90 whitespace-pre-wrap flex-1">{v}</div>
+          </div>
+        ))}
+      </div>
+    )
+  }
+
+  if (b.type === 'note') {
+    const _tone = b.tone === 'danger' ? 'border-red-500/50 text-red-300 bg-red-500/5'
+      : b.tone === 'warn' ? 'border-amber-500/50 text-amber-300 bg-amber-500/5'
+      : 'border-[var(--border)] text-[var(--text-muted)] bg-black/20'
+    return (
+      <div className={`text-[10px] border-l-2 pl-2 py-1 rounded-r whitespace-pre-wrap ${_tone}`}>{b.text}</div>
+    )
+  }
+
+  return null
+}
+
+function DesignSection({ design: d }) {
+  return (
+    <div className="mt-2 border border-[var(--border)]/60 rounded bg-black/20 p-2.5 space-y-2">
+      {d.summary && <div className="text-[10px] text-[var(--text-muted)] italic">{d.summary}</div>}
+      {(d.blocks ?? []).map((b, i) => (
+        <div key={i} className="space-y-1">
+          {b.heading && <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)]">{b.heading}</div>}
+          <DesignBlock block={b} />
+        </div>
+      ))}
+    </div>
+  )
+}
 
 function fmtTime(ts) {
   if (!ts) return '—'
@@ -51,13 +147,20 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
   useEffect(() => { try { localStorage.setItem('tc_qa_model', qaModel) } catch {} }, [qaModel])
   const [qaEffort, setQaEffort] = useState(() => localStorage.getItem('tc_qa_effort') ?? '')
   useEffect(() => { try { localStorage.setItem('tc_qa_effort', qaEffort) } catch {} }, [qaEffort])
-  // 少爺 2026-07-14：喚醒改開「可視互動 CLI 視窗」盯進度（VS Code 已開分頁不會跟外部無頭進程同步——這是看得到的替代）
-  const [qaWakeVisible, setQaWakeVisible] = useState(() => localStorage.getItem('tc_qa_wake_visible') === '1')
-  useEffect(() => { try { localStorage.setItem('tc_qa_wake_visible', qaWakeVisible ? '1' : '0') } catch {} }, [qaWakeVisible])
+  // 少爺 2026-09-08「全部都要聯動」＋「預設聯動選項要是啟動的」：
+  // 原本這格是「👁 視窗」（開可視 CLI 視窗），server 端條件早在 2026-07-17 就被停用＝死選項。
+  // 改成「🔗 聯動」＝把少爺的動作送進他開著的 VS Code 分頁原地處理，**預設開啟**；
+  // 關掉才強制走無頭進程（不佔用分頁）。localStorage 用新 key，舊值不誤沿用。
+  const [qaInPlaceLink, setQaInPlaceLink] = useState(() => localStorage.getItem('tc_qa_inplace_link') !== '0')
+  useEffect(() => { try { localStorage.setItem('tc_qa_inplace_link', qaInPlaceLink ? '1' : '0') } catch {} }, [qaInPlaceLink])
+  // 監看到底掛上了沒——聯動壞掉最久的原因是「沒有人看得出來它壞了」，這裡把它變成看得見的燈
+  const [monitorAlive, setMonitorAlive] = useState(null)   // null=未知 / true=原地聯動中 / false=會走無頭
   const [commentItemId, setCommentItemId] = useState('')
   const [qaAttach, setQaAttach] = useState([])   // [{name,dataUrl,type}]：feedback 附檔，一併傳給 Claude 分析
   const qaAttachRef = useRef(null)
   const [lightbox, setLightbox] = useState(null)   // artifact url 放大檢視
+  // C 區塊：目前展開哪一份設計說明（null = 全部收合）
+  const [openDesignId, setOpenDesignId] = useState(null)
   const selectedRunIdRef = useRef(null)
   useEffect(() => { selectedRunIdRef.current = selectedRunId }, [selectedRunId])
 
@@ -327,6 +430,20 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
 
   useEffect(() => { reload() }, [reload])
 
+  // 監看存活燈（少爺 2026-09-08）：聯動壞得最久的原因是「壞了看不出來」——把它變成留言列上看得見的狀態。
+  // alive=true → 少爺的動作會送進那個 VS Code 分頁原地處理；false → 只會走無頭進程，分頁不動。
+  const _boundSid = runs.find(r => r.id === selectedRunId)?.boundSessionId ?? null
+  useEffect(() => {
+    if (!_boundSid) { setMonitorAlive(null); return }
+    let _stop = false
+    const _poll = () => fetch(`/api/qa/monitor-status?session=${_boundSid}`)
+      .then(r => r.json()).then(d => { if (!_stop) setMonitorAlive(!!d.alive) })
+      .catch(() => { if (!_stop) setMonitorAlive(null) })
+    _poll()
+    const _t = setInterval(_poll, 10_000)
+    return () => { _stop = true; clearInterval(_t) }
+  }, [_boundSid])
+
   // 切專案：選中 run 不屬於新專案 → 清空選擇（少爺 2026-08-07：不自動改選最新，等少爺自己點）
   useEffect(() => {
     const cur = runs.find(r => r.id === selectedRunIdRef.current)
@@ -407,7 +524,7 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
     // 少爺 2026-07-14「警示＋照送」：spawn 模式卻綁著 VS Code 活 session（錯配——活 session 應走 monitor）→ 確認後才喚醒
     if (run?.wakeMode === 'spawn' && run?.boundSessionId)
       if (!(await confirmIfLiveInteractive(run.boundSessionId, '無頭喚醒'))) return
-    const _res = await control('comment', { text, itemId: commentItemId ? Number(commentItemId) : null, attachments: qaAttach, model: qaModel || null, effort: qaEffort || null, wakeVisible: qaWakeVisible })
+    const _res = await control('comment', { text, itemId: commentItemId ? Number(commentItemId) : null, attachments: qaAttach, model: qaModel || null, effort: qaEffort || null, inPlaceLink: qaInPlaceLink })
     setCommentText('')
     setQaAttach([])
     // 少爺 2026-07-08：送出 Feedback＝QA 手動階段完成 → 無縫切到 Chat 看 Claude 處理（同 History Continue / 仕酒師送入聊天室）
@@ -995,6 +1112,11 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
               {run.claudeAck?.state === 'undelivered' && (
                 <div className="text-center py-2 text-[12px] text-red-400 border border-red-400/40 rounded bg-red-400/5 my-1">
                   ⚠️ 喚醒未送達（{run.claudeAck.action}）——聊天室可能被開啟中的分頁佔用，請在該 VS Code 聊天室輸入「請繼續」接手
+                  {run.boundSessionId && (
+                    <button onClick={() => reloginSession(run.boundSessionId, run.boundProjectPath ?? null, '綁定聊天室')}
+                      title="或直接在終端重新登入這個聊天室並掛起監看"
+                      className="ml-2 text-[11px] px-1.5 py-0.5 rounded border border-red-400/50 text-red-300 hover:bg-red-400/10">🔁 重新登入聯動</button>
+                  )}
                 </div>
               )}
               {/* 最新動態 ticker：Claude 的 mark 事件即進度資訊 */}
@@ -1171,6 +1293,35 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
               )}
             </div>
 
+            {/* C 設計區（少爺 2026-09-09）：每份設計一顆按鈕，點開才展開排版內容 */}
+            {run.designs?.length > 0 && (
+              <div className="border border-[var(--border)] rounded bg-[var(--surface)] p-3">
+                <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] mb-2">
+                  C · 設計說明（{run.designs.length} 份 — 點按鈕展開）
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {run.designs.map(d => {
+                    const _on = openDesignId === d.id
+                    return (
+                      <button key={d.id}
+                        onClick={() => setOpenDesignId(_on ? null : d.id)}
+                        title={d.summary || d.title}
+                        className={`text-[10px] px-2 py-1 rounded border transition-colors text-left ${
+                          _on ? 'border-[var(--gold)] bg-[var(--gold)]/15 text-[var(--gold)]'
+                              : 'border-[var(--border)] text-[var(--text)]/80 hover:border-[var(--gold)]/60 hover:text-[var(--gold)]'}`}>
+                        {d.tag && <span className="text-[9px] opacity-70 mr-1">[{d.tag}]</span>}
+                        {d.title}
+                        <span className="ml-1 opacity-60">{_on ? '▾' : '▸'}</span>
+                      </button>
+                    )
+                  })}
+                </div>
+                {run.designs.filter(d => d.id === openDesignId).map(d => (
+                  <DesignSection key={d.id} design={d} />
+                ))}
+              </div>
+            )}
+
             {/* 留言（雙向 — 不浪費對專案的理解） */}
             <div className="border border-[var(--border)] rounded bg-[var(--surface)] p-3">
               <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] mb-2">
@@ -1212,17 +1363,27 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
                   className={`shrink-0 text-[11px] px-2 py-1 rounded border ${qaWfOpen ? 'bg-[var(--gold)]/20 border-[var(--gold)] text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)]'} hover:text-[var(--gold)] hover:border-[var(--gold)]/50`}>⚡</button>
                 <select value={qaModel} onChange={e => setQaModel(e.target.value)} title="留言喚醒 Claude 時使用的 AI 模型"
                   className="shrink-0 bg-black/30 border border-[var(--border)] rounded px-1 py-1 text-[10px] text-[var(--text-muted)] focus:outline-none focus:border-[var(--gold)]/50">
-                  {MODEL_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  {MODEL_OPTIONS.map(o => <option key={o.value} value={o.value} title={o.title} disabled={o.disabled}>{o.label}</option>)}
                 </select>
                 <select value={qaEffort} onChange={e => setQaEffort(e.target.value)} title="模型強度（claude --effort）"
                   className="shrink-0 bg-black/30 border border-[var(--border)] rounded px-1 py-1 text-[10px] text-[var(--text-muted)] focus:outline-none focus:border-[var(--gold)]/50">
                   {EFFORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                 </select>
-                <label title="喚醒改開可視的互動 Claude CLI 視窗盯進度（同專案已有無頭進程在跑時自動退回無頭排隊，避免同 session 雙寫）"
-                  className={`shrink-0 flex items-center gap-1 text-[10px] cursor-pointer select-none px-1.5 rounded border ${qaWakeVisible ? 'border-[var(--gold)]/60 text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)]'}`}>
-                  <input type="checkbox" checked={qaWakeVisible} onChange={e => setQaWakeVisible(e.target.checked)} className="accent-[var(--gold)] w-3 h-3" />
-                  👁 視窗
+                <label title={qaInPlaceLink
+                  ? (monitorAlive === true ? '原地聯動中：送出後由該 VS Code 分頁當場處理，回應即時出現在分頁與 CHAT'
+                    : monitorAlive === false ? '⚠️ 已開啟聯動，但該聊天室的監看沒掛上 → 本次仍會走無頭進程、分頁不動。在該分頁隨便輸入一句，它會自動補掛監看'
+                    : '原地聯動：優先送進少爺開著的 VS Code 分頁處理（未綁定聊天室時無作用）')
+                  : '已關閉聯動：本次強制走無頭進程，不佔用 VS Code 分頁'}
+                  className={`shrink-0 flex items-center gap-1 text-[10px] cursor-pointer select-none px-1.5 rounded border ${qaInPlaceLink ? 'border-[var(--gold)]/60 text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)]'}`}>
+                  <input type="checkbox" checked={qaInPlaceLink} onChange={e => setQaInPlaceLink(e.target.checked)} className="accent-[var(--gold)] w-3 h-3" />
+                  🔗 聯動{qaInPlaceLink && monitorAlive !== null && (monitorAlive ? '·通' : '·斷')}
                 </label>
+                {/* 🔁 重新登入聯動（少爺 2026-09-16）：監看沒掛＝綁定聊天室不是活分頁 → 一鍵在終端 claude --resume 起活分頁並自動掛監看 */}
+                {qaInPlaceLink && monitorAlive === false && _boundSid && (
+                  <button onClick={() => reloginSession(_boundSid, runs.find(r => r.id === selectedRunId)?.boundProjectPath ?? null, '綁定聊天室')}
+                    title="重新登入聯動：在終端重新開啟綁定的聊天室（claude --resume）並自動掛起監看，約 10 秒後這裡會變成 ·通"
+                    className="shrink-0 text-[10px] px-1.5 py-1 rounded border border-amber-400/50 text-amber-300 hover:bg-amber-400/10">🔁 重新登入聯動</button>
+                )}
                 <input value={commentItemId} onChange={e => setCommentItemId(e.target.value)}
                   placeholder="項目#" className="w-14 bg-black/30 border border-[var(--border)] rounded px-2 py-1 text-[11px]" />
                 <input value={commentText} onChange={e => setCommentText(e.target.value)}
