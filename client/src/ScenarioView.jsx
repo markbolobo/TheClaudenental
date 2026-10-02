@@ -1,5 +1,7 @@
 import { useMemo, useState } from 'react'
 import { scenarioKey, SCENARIO_NEW_KEY, stripSource } from './scenarioPrompt.js'
+import { DecisionDeck, DecisionViewToggle, DerivedReview, SudokuSolveButton } from './DecisionDeck.jsx'
+import { scenarioDeckItems, scenarioDerivedItems, loadDecisionView, saveDecisionView } from './decisionSupport.js'
 
 // 🎬 情境體驗視圖（Sommelier 第六血肉，少爺 2026-09-15 立）— scenario/S##_*.md：
 // 一個情境一張：體驗一句話 / 題目對照（九面向）/ 進入與離開 / 看到聽到 / 能做什麼 / 運作機制 / 節奏 / 故事 / 素材 / 缺口 / 待定奪 / 驗收 / 脈絡 / 討論。
@@ -34,8 +36,8 @@ function Section({ title, hint, children }) {
     </div>
   )
 }
-// 內文裡的 [[連結]] 變成可點的 chip（S##＝情境、CamelCase＝意圖、其他＝拼圖）；反引號＝code
-function RichText({ text, onJumpToScenario, onJumpToIntent, onJumpToMemory, intentTitle }) {
+// 內文裡的 [[連結]] 變成可點的 chip（S##＝情境、CamelCase＝意圖、其他＝拼圖）；反引號＝code（設計脈絡視圖的待定奪面板也共用）
+export function RichText({ text, onJumpToScenario, onJumpToIntent, onJumpToMemory, intentTitle }) {
   const parts = useMemo(() => {
     const out = []
     const re = /\[\[([^\]]+)\]\]|`([^`]+)`/g
@@ -98,10 +100,16 @@ function SimpleTable({ header, rows, rich, statusCol }) {
   )
 }
 
-export function ScenarioView({ scenario, designIntent, projectId, query, initialId, onJumpToIntent, onJumpToMemory, cartKeys, onToggleScenarioCart, onToggleNewScenarioCart }) {
+export function ScenarioView({ scenario, designIntent, projectId, query, initialId, onJumpToIntent, onJumpToMemory, cartKeys, onToggleScenarioCart, onToggleNewScenarioCart, onGoToChat = null, onReload = null }) {
   const scenarios = useMemo(() => scenario?.scenarios ?? [], [scenario])
   const phases = useMemo(() => scenario?.phases ?? [], [scenario])
   const [sid, setSid] = useState(initialId ?? null)
+  const [decisionView, setDecisionView] = useState(loadDecisionView)
+  const changeDecisionView = (v) => { setDecisionView(v); saveDecisionView(v) }
+  const allDeckItems = useMemo(() => scenarioDeckItems(projectId, scenario?.scenarios), [projectId, scenario])
+  const allDerivedItems = useMemo(() => scenarioDerivedItems(projectId, scenario?.scenarios), [projectId, scenario])
+  // 連動題可能在另一層：情境就地切換、意圖跳設計脈絡
+  const jumpToDecisionSource = (x) => { if (x.layer === 'scenario') setSid(x.sourceId); else onJumpToIntent?.(x.sourceId) }
   // 外部指定條目（設計脈絡頁點「出現在這些情境」）：prop 變了才同步，不用 effect（避免級聯 render）
   const [seenInitialId, setSeenInitialId] = useState(initialId)
   if (initialId !== seenInitialId) {
@@ -128,6 +136,8 @@ export function ScenarioView({ scenario, designIntent, projectId, query, initial
   }, [scenarios, tokens, phases])
 
   const s = sid ? byId.get(sid) : null
+  const detailDeckItems = useMemo(() => allDeckItems.filter(x => x.sourceId === sid), [allDeckItems, sid])
+  const detailDerivedItems = useMemo(() => allDerivedItems.filter(x => x.sourceId === sid), [allDerivedItems, sid])
   const rich = (t) => <RichText text={t} onJumpToScenario={setSid} onJumpToIntent={onJumpToIntent} onJumpToMemory={onJumpToMemory} intentTitle={intentTitle} />
 
   if (!scenarios.length) return (
@@ -186,9 +196,16 @@ export function ScenarioView({ scenario, designIntent, projectId, query, initial
       <div className="flex-1 overflow-y-auto p-3 min-w-0">
         {sid === '__ALL_OPEN__' ? (
           <div className="max-w-4xl space-y-3">
-            <div className="text-[var(--gold)] text-sm">⬜ 待定奪總覽 — 情境層需要你決策的開放問題</div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <div className="text-[var(--gold)] text-sm flex-1">⬜ 待定奪總覽 — 情境層需要你決策的開放問題</div>
+              <SudokuSolveButton projectId={projectId} onGoToChat={onGoToChat} />
+              <DecisionViewToggle view={decisionView} onChange={changeDecisionView} />
+            </div>
             <p className="text-[10px] text-[var(--text-muted)] leading-relaxed">只放<b>我不能自行決定</b>的設計取捨；可自行查證的留在各情境的 🔬 條目，那是我的工作。討論到某個情境時，它的待定奪會在自己頁面出現，順帶答掉就好。</p>
-            {scenarios.flatMap(x => (x.openDecisions ?? []).filter(d => !d.resolved).map(d => ({ ...d, _s: x }))).map((d, i) => (
+            <DerivedReview items={allDerivedItems} projectId={projectId} rich={rich} onJumpToSource={jumpToDecisionSource} />
+            {decisionView === 'deck' ? (
+              <DecisionDeck items={allDeckItems} projectId={projectId} rich={rich} onJumpToSource={jumpToDecisionSource} onGoToChat={onGoToChat} onReload={onReload} />
+            ) : scenarios.flatMap(x => (x.openDecisions ?? []).filter(d => !d.resolved).map(d => ({ ...d, _s: x }))).map((d, i) => (
               <div key={i} className="border border-amber-400/30 rounded p-2 space-y-1">
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-400/20 text-amber-300">{d.id}</span>
@@ -261,8 +278,12 @@ export function ScenarioView({ scenario, designIntent, projectId, query, initial
             </Section>
 
             {(s.openDecisions ?? []).length > 0 && (
-              <Section title="⬜ 待定奪（需要你決策）">
-                {s.openDecisions.map(d => (
+              <Section title="⬜ 待定奪（需要你決策）" hint={<DecisionViewToggle view={decisionView} onChange={changeDecisionView} />}>
+                <DerivedReview items={detailDerivedItems} projectId={projectId} rich={rich} onJumpToSource={jumpToDecisionSource} />
+                {decisionView === 'deck' && detailDeckItems.length > 0 && (
+                  <DecisionDeck items={detailDeckItems} projectId={projectId} rich={rich} showSource={false} onJumpToSource={jumpToDecisionSource} onGoToChat={onGoToChat} onReload={onReload} />
+                )}
+                {s.openDecisions.filter(d => decisionView === 'list' || (d.resolved && d.resolvedBy !== 'derived')).map(d => (
                   <div key={d.id} className={`border rounded p-2 space-y-1 ${d.resolved ? 'border-[var(--border)] opacity-60' : 'border-amber-400/30'}`}>
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className={`text-[9px] px-1.5 py-0.5 rounded ${d.resolved ? 'bg-emerald-500/20 text-emerald-300' : 'bg-amber-400/20 text-amber-300'}`}>{d.resolved ? '✓ 已定' : d.id}</span>

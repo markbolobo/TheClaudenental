@@ -23,8 +23,23 @@ const OUTCOME_LABEL = { pass: '✅ 達標', fail: '❌ 未達標', blocked: '�
 // C 區塊（少爺 2026-09-09）：設計說明的排版渲染器。
 // 「那些設計仰賴排版才能完整表達」⇒ 不用純文字，逐型別給版面：
 //   text 段落／table 表格／tree 等寬樹狀骨架／steps 編號步驟／kv 參數對照／note 警語
-function DesignBlock({ block: b }) {
+//   image 圖（少爺 2026-09-28「在 TC 的設計說明看到實作參數的圖文說明」：path 相對 run.sessionDir，點圖放大）
+function DesignBlock({ block: b, imgUrl, onZoom }) {
   if (!b || !b.type) return null
+
+  if (b.type === 'image') {
+    const _src = imgUrl ? imgUrl(b.path) : null
+    return (
+      <figure className="space-y-1">
+        {_src && (
+          <img src={_src} alt={b.caption ?? b.path}
+            className="w-full max-h-[360px] object-contain rounded border border-[var(--border)] bg-black/40 cursor-zoom-in"
+            onClick={() => onZoom?.(_src)} />
+        )}
+        {b.caption && <figcaption className="text-[10px] text-[var(--text)]/80 whitespace-pre-wrap">{b.caption}</figcaption>}
+      </figure>
+    )
+  }
 
   if (b.type === 'text') {
     return <p className="text-[11px] leading-relaxed text-[var(--text)]/90 whitespace-pre-wrap">{b.text}</p>
@@ -101,14 +116,14 @@ function DesignBlock({ block: b }) {
   return null
 }
 
-function DesignSection({ design: d }) {
+function DesignSection({ design: d, imgUrl, onZoom }) {
   return (
     <div className="mt-2 border border-[var(--border)]/60 rounded bg-black/20 p-2.5 space-y-2">
       {d.summary && <div className="text-[10px] text-[var(--text-muted)] italic">{d.summary}</div>}
       {(d.blocks ?? []).map((b, i) => (
         <div key={i} className="space-y-1">
           {b.heading && <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)]">{b.heading}</div>}
-          <DesignBlock block={b} />
+          <DesignBlock block={b} imgUrl={imgUrl} onZoom={onZoom} />
         </div>
       ))}
     </div>
@@ -236,7 +251,7 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
       body: JSON.stringify({ projectId: activeProjectId ?? 'roman', target }),
     }).then(r => r.json()).catch(e => ({ ok: false, error: e.message }))
     if (!_res.ok) setPkgHint(`⚠️ ${_res.error ?? '開啟失敗'}`)
-    else setPkgHint(`📂 已開啟：${_res.opened}`)
+    else setPkgHint(`📂 已開啟：${_res.opened}${_res.hint ? `｜${_res.hint}` : ''}`)
   }, [activeProjectId])
 
   const cancelPackage = useCallback(async () => {
@@ -638,7 +653,7 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
           {!openProjCollapsed && (
             <div className="flex items-center gap-2 flex-wrap mt-1.5">
               <div className="flex rounded overflow-hidden border border-[var(--border)]">
-                {[['uproject', '🎮 UE 專案'], ['workspace', '📘 VS Code'], ['explorer', '📁 資料夾']].map(([_t, _label], _i) => (
+                {[['uproject', '🎮 UE 專案'], ['workspace', '📘 VS Code'], ['explorer', '📁 資料夾'], ['fmod', '🎵 FMOD']].map(([_t, _label], _i) => (
                   <button key={_t} onClick={() => openProject(_t)} title={`開啟目前專案的 ${_label}`}
                     className={`text-[11px] px-2.5 py-1 text-[var(--text)] hover:bg-[var(--gold)]/15 hover:text-[var(--gold)] ${_i > 0 ? 'border-l border-[var(--border)]' : ''}`}>
                     {_label}
@@ -1317,7 +1332,7 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
                   })}
                 </div>
                 {run.designs.filter(d => d.id === openDesignId).map(d => (
-                  <DesignSection key={d.id} design={d} />
+                  <DesignSection key={d.id} design={d} imgUrl={artifactUrl} onZoom={setLightbox} />
                 ))}
               </div>
             )}

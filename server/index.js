@@ -1047,7 +1047,18 @@ function twNormalizeTags(p) {
 // 少爺 2026-07-16 定案：標籤器改「每晚 23:30 定時批次增量」——不再追活 session、不在開 History 即時觸發。
 // 只處理「有新對話」的室（cleanCount > 上次標記時 userCount）、增量室只看新留言、併批 spawn 攤提系統開銷。
 const TAGGER_CWD = path.join(os.tmpdir(), 'tc-tagger')
-const TAG_NIGHTLY_HOUR = 23, TAG_NIGHTLY_MIN = 30   // 每天定時時刻（與話題筆記同為晚上）
+// 每日行程預設時刻（TC 總設定 marker.defaultDailyTime；未設＝23:30，與話題筆記、知識訂閱對齊）
+const MARKER_DEFAULT_DAILY_TIME = '23:30'
+function parseHHMM(InText) {
+  const _m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(String(InText ?? '').trim())
+  return _m ? [Number(_m[1]), Number(_m[2])] : null
+}
+function formatHHMM(InH, InM) { return `${String(InH).padStart(2, '0')}:${String(InM).padStart(2, '0')}` }
+// 每日行程顯示字：晚上時段（18:00–04:59）＝「每晚」，其餘＝「每天」；一律 24 小時制
+function dailyLabel(InH, InM) { return `${(InH >= 18 || InH < 5) ? '每晚' : '每天'} ${formatHHMM(InH, InM)}` }
+function getMarkerDefaultDailyTime() { return parseHHMM(getTcSetting('marker.defaultDailyTime', MARKER_DEFAULT_DAILY_TIME)) ? getTcSetting('marker.defaultDailyTime', MARKER_DEFAULT_DAILY_TIME) : MARKER_DEFAULT_DAILY_TIME }
+// 夜間標籤時刻：個別覆寫 marker.time.nightly-tagging → 每日行程預設時刻
+function getNightlyHM() { return parseHHMM(getTcSetting('marker.time.nightly-tagging', null)) ?? parseHHMM(getMarkerDefaultDailyTime()) }
 const TAG_BATCH_SIZE = 5                            // 每批 spawn 處理的室數（攤提 ~15-20k 系統 prompt 開銷）
 const TAG_NIGHTLY_STATE_FILE = path.join(os.homedir(), '.claude', 'tc_tag_nightly.json')
 const llmTagCache = new Map()   // sessionId → { tags, summary, knowledge, userCount, ts }
@@ -1429,14 +1440,17 @@ function runNightlyTagging(reason = 'scheduled') {
   return _cands.length
 }
 
+let nightlyTimer = null
 function scheduleNextNightly() {
+  if (nightlyTimer) clearTimeout(nightlyTimer)
   const _now = new Date()
   const _next = new Date(_now)
-  _next.setHours(TAG_NIGHTLY_HOUR, TAG_NIGHTLY_MIN, 0, 0)
+  const [_h, _m] = getNightlyHM()
+  _next.setHours(_h, _m, 0, 0)
   if (_next <= _now) _next.setDate(_next.getDate() + 1)
   const _delay = _next.getTime() - _now.getTime()
   logEvent('tags.nightly.scheduled', { at: _next.toISOString(), inMinutes: Math.round(_delay / 60000) })
-  setTimeout(() => {
+  nightlyTimer = setTimeout(() => {
     try { runNightlyTagging('scheduled') } catch (e) { console.error('[nightly tag]', e) }
     scheduleNextNightly()
   }, _delay)
@@ -1479,10 +1493,14 @@ registerMarker({
   name: '夜間語意標籤',
   desc: 'LLM 增量標 History／侍酒師的 tags＋summary',
   source: 'TC 內建',
-  schedule: `每晚 ${String(TAG_NIGHTLY_HOUR).padStart(2, '0')}:${String(TAG_NIGHTLY_MIN).padStart(2, '0')}`,
+  getTime: () => formatHHMM(...getNightlyHM()),
+  setTime: (InTime) => {
+    writeTcSettings({ 'marker.time.nightly-tagging': InTime })
+    scheduleNextNightly()
+  },
   getLast: () => { try { return JSON.parse(fs.readFileSync(TAG_NIGHTLY_STATE_FILE, 'utf8')).lastRun ?? null } catch { return null } },
   getNext: () => {
-    const _n = new Date(); _n.setHours(TAG_NIGHTLY_HOUR, TAG_NIGHTLY_MIN, 0, 0)
+    const _n = new Date(); _n.setHours(...getNightlyHM(), 0, 0)
     if (_n <= new Date()) _n.setDate(_n.getDate() + 1)
     return _n.getTime()
   },
@@ -1499,14 +1517,24 @@ function readMarkerPatterns() {
   return ['Claude', 'Roman']
 }
 
+// Windows 排程觸發類型 → 顯示字
+const MARKER_TRIGGER_LABEL = {
+  MSFT_TaskDailyTrigger: '每天', MSFT_TaskWeeklyTrigger: '每週', MSFT_TaskTimeTrigger: '單次',
+  MSFT_TaskLogonTrigger: '登入時', MSFT_TaskBootTrigger: '開機時',
+}
+// 排程系統狀態碼：尚未執行（0x41303）／執行中（0x41301）不是失敗
+const SCHED_S_TASK_HAS_NOT_RUN = 267011
+const SCHED_S_TASK_RUNNING = 267009
+
 // 撈少爺／Claude 相關的 Windows 排程（名稱 like 任一 pattern）→ 統一 marker 格式
 function listWindowsMarkers() {
   return new Promise((resolve) => {
     const _pats = readMarkerPatterns().map(p => '"' + String(p).replace(/"/g, '') + '"').join(',')
     const _script = '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $pats=@(' + _pats +
       '); Get-ScheduledTask | Where-Object { $t=$_.TaskName; ($pats | Where-Object { $t -like "*$_*" }).Count -gt 0 } | ' +
-      'ForEach-Object { $i=$_ | Get-ScheduledTaskInfo; [PSCustomObject]@{ name=$_.TaskName; state="$($_.State)"; ' +
-      'trigger=($_.Triggers | Select-Object -First 1).StartBoundary; ' +
+      'ForEach-Object { $i=$_ | Get-ScheduledTaskInfo; $tr=$_.Triggers | Select-Object -First 1; [PSCustomObject]@{ name=$_.TaskName; state="$($_.State)"; ' +
+      'desc=$_.Description; ' +
+      'trigger=$tr.StartBoundary; ttype=$(if($tr){$tr.CimClass.CimClassName}else{$null}); ' +
       'lastRun=$(if($i.LastRunTime){$i.LastRunTime.ToString("o")}else{$null}); ' +
       'lastResult=$i.LastTaskResult; ' +
       'nextRun=$(if($i.NextRunTime){$i.NextRunTime.ToString("o")}else{$null}) } } | ConvertTo-Json -Depth 3 -Compress'
@@ -1520,13 +1548,23 @@ function listWindowsMarkers() {
         try {
           const _j = JSON.parse(_out.trim() || 'null')
           const _arr = Array.isArray(_j) ? _j : _j ? [_j] : []
-          resolve(_arr.map(w => ({
-            name: w.name, source: 'Windows 排程', state: w.state ?? '—',
-            schedule: w.trigger ? `每次 ${new Date(w.trigger).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' })}` : '—',
-            lastRun: w.lastRun ? Date.parse(w.lastRun) : null,
-            lastResult: w.lastResult ?? null,
-            nextRun: w.nextRun ? Date.parse(w.nextRun) : null,
-          })))
+          resolve(_arr.map(w => {
+            const _notRun = w.lastResult === SCHED_S_TASK_HAS_NOT_RUN
+            const _label = MARKER_TRIGGER_LABEL[w.ttype] ?? '每次'
+            const _dt = w.trigger ? new Date(w.trigger) : null
+            const _time = _dt ? formatHHMM(_dt.getHours(), _dt.getMinutes()) : null
+            const _eventTrigger = w.ttype === 'MSFT_TaskLogonTrigger' || w.ttype === 'MSFT_TaskBootTrigger'
+            const _d = w.trigger ? new Date(w.trigger) : null
+            return {
+              id: `win:${w.name}`, name: w.name, desc: w.desc ?? '', source: 'Windows 排程', state: w.state ?? '—',
+              time: _d ? formatHHMM(_d.getHours(), _d.getMinutes()) : null,
+              editable: w.ttype === 'MSFT_TaskDailyTrigger' || w.ttype === 'MSFT_TaskWeeklyTrigger',
+              schedule: _eventTrigger ? _label : (!_time ? '—' : w.ttype === 'MSFT_TaskDailyTrigger' ? dailyLabel(_dt.getHours(), _dt.getMinutes()) : `${_label} ${_time}`),
+              lastRun: (!_notRun && w.lastRun) ? Date.parse(w.lastRun) : null,
+              lastResult: (_notRun || w.lastResult === SCHED_S_TASK_RUNNING) ? null : (w.lastResult ?? null),
+              nextRun: w.nextRun ? Date.parse(w.nextRun) : null,
+            }
+          }))
         } catch { resolve([]) }
       })
       _ps.on('error', () => resolve([]))
@@ -1538,10 +1576,67 @@ function listWindowsMarkers() {
 app.get('/api/markers', async () => {
   const _win = await listWindowsMarkers()
   const _tc = MARKER_REGISTRY.map(_m => ({
-    name: _m.name, desc: _m.desc ?? '', source: _m.source, schedule: _m.schedule, state: 'Ready',
+    id: `tc:${_m.id}`, name: _m.name, desc: _m.desc ?? '', source: _m.source, state: 'Ready',
+    schedule: _m.getTime ? dailyLabel(...parseHHMM(_m.getTime())) : _m.schedule, time: _m.getTime?.() ?? null, editable: !!_m.setTime,
     lastRun: _m.getLast?.() ?? null, lastResult: 0, nextRun: _m.getNext?.() ?? null,
   }))
-  return { ok: true, markers: [..._tc, ..._win] }
+  return { ok: true, markers: [..._tc, ..._win], defaultDailyTime: getMarkerDefaultDailyTime() }
+})
+
+// 知識訂閱來源登錄（排程時刻 SSOT）與註冊腳本
+const KNOWLEDGE_SUB_SOURCES = 'C:\\Project\\MasterBrain\\.agent\\data\\knowledge_subscriptions\\sources.json'
+const KNOWLEDGE_SUB_REGISTER = 'C:\\Project\\MasterBrain\\.agent\\scripts\\Register-KnowledgeSubscriptionTask.ps1'
+
+// 跑一段 PowerShell（UTF-8、不閃窗）→ { code, out }
+function runPowerShell(InScript, InEnv = {}) {
+  return new Promise((resolve) => {
+    let _out = ''
+    const _ps = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; ' + InScript],
+      { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env: { ...process.env, ...InEnv } })
+    _ps.stdout.setEncoding('utf-8'); _ps.stderr.setEncoding('utf-8')
+    _ps.stdout.on('data', d => { _out += d }); _ps.stderr.on('data', d => { _out += d })
+    _ps.on('close', (c) => resolve({ code: c, out: _out.trim() }))
+    _ps.on('error', (e) => resolve({ code: -1, out: String(e) }))
+  })
+}
+
+// 設定誓約時刻：TC 內建走 setTime；知識訂閱先改 sources.json 再重註冊；其他 Windows 排程直接改觸發時刻（保留每天／每週）
+app.post('/api/markers/time', async (request, reply) => {
+  const { id, time } = request.body ?? {}
+  const _hm = parseHHMM(time)
+  if (!_hm || typeof id !== 'string') { reply.code(400); return { ok: false, error: '時間格式需為 HH:MM' } }
+  const _time = formatHHMM(..._hm)
+  if (id.startsWith('tc:')) {
+    const _m = MARKER_REGISTRY.find(x => `tc:${x.id}` === id)
+    if (!_m?.setTime) { reply.code(404); return { ok: false, error: '此誓約不可設定時刻' } }
+    _m.setTime(_time)
+    logEvent('marker.time.set', { id, time: _time })
+    return { ok: true, time: _time }
+  }
+  if (!id.startsWith('win:')) { reply.code(400); return { ok: false, error: '未知誓約' } }
+  const _name = id.slice(4)
+  const _listed = (await listWindowsMarkers()).find(w => w.name === _name)
+  if (!_listed) { reply.code(404); return { ok: false, error: `找不到排程 ${_name}` } }
+  if (!_listed.editable) { reply.code(400); return { ok: false, error: '只有每天／每週的排程可設定時刻' } }
+  let _sources = null
+  try { _sources = JSON.parse(fs.readFileSync(KNOWLEDGE_SUB_SOURCES, 'utf-8')) } catch {}
+  const _sub = _sources?.sources?.find(s => s.schedule?.taskName === _name)
+  let _r
+  if (_sub) {
+    _sub.schedule.time = _time
+    atomicWriteJson(KNOWLEDGE_SUB_SOURCES, _sources)
+    _r = await runPowerShell(`& '${KNOWLEDGE_SUB_REGISTER}' -Source '${_sub.id}'`)
+  } else {
+    _r = await runPowerShell('$t = Get-ScheduledTask -TaskName $env:MARKER_TASK_NAME; $tr = $t.Triggers[0]; '
+      + '$d = [datetime]$tr.StartBoundary; $tr.StartBoundary = $d.Date.AddHours($env:MARKER_H).AddMinutes($env:MARKER_M).ToString("yyyy-MM-ddTHH:mm:ss"); '
+      + 'Set-ScheduledTask -TaskName $env:MARKER_TASK_NAME -Trigger $t.Triggers | Out-Null',
+      { MARKER_TASK_NAME: _name, MARKER_H: String(_hm[0]), MARKER_M: String(_hm[1]) })
+  }
+  const _after = (await listWindowsMarkers()).find(w => w.name === _name)
+  const _ok = _r.code === 0 && _after?.time === _time
+  logEvent('marker.time.set', { id, time: _time, knowledgeSource: _sub?.id ?? null, ok: _ok })
+  if (!_ok) { reply.code(500); return { ok: false, error: `設定失敗：${_r.out.slice(0, 300) || '排程時刻未改變'}` } }
+  return { ok: true, time: _time, knowledgeSource: _sub?.id ?? null }
 })
 
 // Get messages from a specific session JSONL
@@ -1824,13 +1919,20 @@ function getTcSetting(key, fallback) {
   return v === undefined ? fallback : v
 }
 
-app.get('/api/settings', async () => readTcSettings())
-
-app.patch('/api/settings', async (request) => {
-  const next = { ...readTcSettings(), ...(request.body ?? {}) }
+// 寫入偏好（merge；值 null＝清除鍵）並廣播
+function writeTcSettings(InPatch) {
+  const next = { ...readTcSettings(), ...(InPatch ?? {}) }
   for (const k of Object.keys(next)) if (next[k] === null) delete next[k]
   atomicWriteJson(TC_SETTINGS_FILE, next)
   broadcast({ type: 'tc_settings_update', settings: next })
+  return next
+}
+
+app.get('/api/settings', async () => readTcSettings())
+
+app.patch('/api/settings', async (request) => {
+  const next = writeTcSettings(request.body)
+  if ('marker.defaultDailyTime' in (request.body ?? {}) || 'marker.time.nightly-tagging' in (request.body ?? {})) scheduleNextNightly()
   logEvent('tc.settings.update', { keys: Object.keys(request.body ?? {}) })
   return { ok: true, settings: next }
 })
@@ -3954,11 +4056,37 @@ app.post('/api/project/open', async (request) => {
       else spawn('cmd', ['/c', 'start', '', _full], { detached: true, stdio: 'ignore' }).unref()
       return { ok: true, opened: _full }
     }
+    // FMOD Studio 專案（少爺 2026-10-01）：開起來後 PIE 中 File › Connect to Game → 127.0.0.1:9264 看事件／聲部／參數
+    if (target === 'fmod') {
+      const _fspro = findFmodProject(_proj, _root)
+      if (!_fspro) return { ok: false, error: `找不到 FMOD Studio 專案（*.fspro）：請在 sommelier.json 的 projects[].fmodProject 指定，或放在專案根目錄下三層內` }
+      spawn('cmd', ['/c', 'start', '', _fspro], { detached: true, stdio: 'ignore' }).unref()
+      return { ok: true, opened: _fspro, hint: 'PIE 中 File › Connect to Game → 127.0.0.1:9264' }
+    }
     return { ok: false, error: `未知 target：${target}` }
   } catch (e) {
     return { ok: false, error: e.message }
   }
 })
+
+// FMOD Studio 專案路徑：sommelier.json 的 fmodProject 優先；否則從根目錄往下找三層 *.fspro（略過建置產物與資產目錄）
+const FMOD_SEARCH_SKIP = new Set(['node_modules', '.git', 'Intermediate', 'Saved', 'Binaries', 'DerivedDataCache', 'Content', 'Plugins', 'Build'])
+function findFmodProject(InProject, InRoot) {
+  if (InProject?.fmodProject && fs.existsSync(InProject.fmodProject)) return InProject.fmodProject
+  let _level = [InRoot]
+  for (let _depth = 0; _depth <= 3 && _level.length; _depth++) {
+    const _next = []
+    for (const _dir of _level) {
+      let _entries = []
+      try { _entries = fs.readdirSync(_dir, { withFileTypes: true }) } catch { continue }
+      const _hit = _entries.find(e => e.isFile() && e.name.toLowerCase().endsWith('.fspro'))
+      if (_hit) return path.join(_dir, _hit.name)
+      for (const _e of _entries) if (_e.isDirectory() && !FMOD_SEARCH_SKIP.has(_e.name) && !_e.name.startsWith('.')) _next.push(path.join(_dir, _e.name))
+    }
+    _level = _next
+  }
+  return null
+}
 
 // ─── 專案路徑健康檢查（少爺 2026-08-06）：高桌會切專案時驗 projectRoot／打包腳本／uproject／
 // workspace 是否存在（失聯偵測）→ 前端據此禁用失效按鈕、避免對不存在的路徑動作而系統出錯。
@@ -3983,6 +4111,7 @@ app.get('/api/project/health/:projectId', async (request) => {
       packageScript: { path: _proj.packageScript ?? null, exists: !!_proj.packageScript && fs.existsSync(_proj.packageScript) },
       uproject: { name: _uproject, exists: !!_uproject },
       workspace: { name: _workspace, exists: !!_workspace },
+      fmodProject: (() => { const _f = _rootExists ? findFmodProject(_proj, _root) : null; return { path: _f, exists: !!_f } })(),
     },
   }
 })
@@ -4399,11 +4528,35 @@ const CELLAR_TOOLS = [
     exec: ['cmd.exe', ['/c', 'C:\\Project\\UE_AnimToolkit\\MixamoRootMotion.bat']],
   },
   {
+    id: 'footwork-synth', name: '米字步步法生成器', kind: 'execute',
+    desc: '以一支架式待機生成維持架式的八方向步法動畫＋曲線加工＋BlendSpace＋機檢（需 UE Editor 開著）',
+    // 與 anim-toolkit 同模式：cmd.exe /c 中介，.bat 內再 start pythonw 開 GUI
+    exec: ['cmd.exe', ['/c', 'C:\\Project\\UE_AnimToolkit\\FootworkSynth.bat']],
+  },
+  {
+    id: 'mesh-fracture', name: '網格切碎塊 / 階段破損', kind: 'execute',
+    desc: '把模型切成碎塊並產生階段破損版（可破壞建築用；走 Blender，不需 UE Editor）',
+    // 與 anim-toolkit 同模式：cmd.exe /c 中介，.bat 無參數時 start pythonw 開 GUI（detached 無主控台，結果走彈窗）
+    exec: ['cmd.exe', ['/c', 'C:\\Project\\UE_MeshToolkit\\MeshFracture.bat']],
+  },
+  {
+    id: 'music-forge', name: 'Music Forge 程序化配樂', kind: 'execute',
+    desc: '依分數腳本渲染互動配樂分軌＋QA 報告、只重寫音樂庫、互動試聽（純 Python，不需 UE Editor）',
+    // 同 mesh-fracture 模式：.bat 無參數時 start pythonw 開 GUI（detached 無主控台，結果走彈窗）
+    exec: ['cmd.exe', ['/c', 'C:\\Project\\UE_AudioToolkit\\MusicForge.bat']],
+  },
+  {
     id: 'ue-ref-viewer', name: 'UE Reference Viewer（裝進 VS Code）', kind: 'execute',
     desc: 'VS Code 擴充：選取符號按 Alt+R 開三欄引用圖；點此確保裝的是最新版',
     // 擴充沒有獨立視窗可開，「啟動」＝把 repo 裡最新的 .vsix 裝進 VS Code（已是最新就跳過）
     // 必經 cmd.exe 中介：酒窖 spawn 是 detached + stdio ignore，powershell 直跑會拿不到標準 handle 而以 exit 0 空跑；同理沒有主控台，腳本結果走彈窗
     exec: ['cmd.exe', ['/c', 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\\Project\\vscode-ue-reference-viewer\\Install-Extension.ps1']],
+  },
+  {
+    id: 'knowledge-sub-theorangeduck', name: '知識訂閱：The Orange Duck（立即檢查）', kind: 'execute',
+    desc: '立刻跑一輪誓約 Claude_知識訂閱_TheOrangeDuck：偵測新文章／文章修改／微部落格，有新內容就自動吸收；結果看 Marker 與自動建立的 TC 卡',
+    // 觸發同一個 Windows 排程，Marker 的上次執行與成敗同步更新
+    exec: ['cmd.exe', ['/c', 'schtasks', '/run', '/tn', 'Claude_知識訂閱_TheOrangeDuck']],
   },
 ]
 app.get('/api/tools', async () => ({ ok: true, tools: CELLAR_TOOLS.map(t => ({ id: t.id, name: t.name, kind: t.kind, desc: t.desc })) }))
@@ -4618,18 +4771,20 @@ function parsePresentResult(text) {
   } catch { return null }
 }
 
-function spawnPresentLLM(text, model) {
+/** 一次性無頭 Claude（不留聊天室）：TAGGER_CWD 起、max-turns 1、回傳 result 文字（失敗回 null）、結束即刪 transcript。
+ *  互動簡報轉譯與待定奪「進一步說明」共用 */
+function runOneShotClaude(prompt, { model = null, timeoutMs = 120_000 } = {}) {
   return new Promise((resolve) => {
     const _cwdNorm = TAGGER_CWD.replace(/\\/g, '/').toLowerCase()
     try { fs.mkdirSync(TAGGER_CWD, { recursive: true }) } catch {}
     pendingSpawnCwds.add(_cwdNorm)
     const args = ['--model', model || TAG_LLM_MODEL, '--output-format', 'stream-json', '--verbose',
-      '--dangerously-skip-permissions', '--max-turns', '1', '-p', buildPresentPrompt(text)]
+      '--dangerously-skip-permissions', '--max-turns', '1', '-p', prompt]
     let _proc
     try { _proc = spawn(getClaudeExe(), args, { cwd: TAGGER_CWD, stdio: ['ignore', 'pipe', 'pipe'] }) }
     catch { pendingSpawnCwds.delete(_cwdNorm); resolve(null); return }
     let _sid = null, _text = '', _buf = ''
-    const _timeout = setTimeout(() => { try { _proc.kill() } catch {} }, 120_000)
+    const _timeout = setTimeout(() => { try { _proc.kill() } catch {} }, timeoutMs)
     _proc.stdout.setEncoding('utf-8')   // 同上：避免跨 chunk 的中文字被切壞
     _proc.stdout.on('data', c => {
       _buf += c
@@ -4645,11 +4800,15 @@ function spawnPresentLLM(text, model) {
     _proc.on('close', () => {
       clearTimeout(_timeout)
       pendingSpawnCwds.delete(_cwdNorm)
-      // 轉譯器自己的 transcript 不留（否則 History 長出轉譯器聊天室）
+      // 自己的 transcript 不留（否則 History 長出轉譯器聊天室）
       if (_sid) { try { const _fp = findJsonlPath(_sid); if (_fp) fs.unlinkSync(_fp) } catch {} }
-      resolve(parsePresentResult(_text))
+      resolve(_text)
     })
   })
+}
+
+function spawnPresentLLM(text, model) {
+  return runOneShotClaude(buildPresentPrompt(text), { model }).then(parsePresentResult)
 }
 
 /** 讀 jsonl 快取：同 msgHash 最後一行（ver 不符視同 miss → 自動重譯） */
@@ -4895,8 +5054,632 @@ app.post('/api/sommelier/refresh/:projectId', async (request, reply) => {
     const r = spawnSync(proj.extractCommand, { shell: true, encoding: 'utf8', timeout: 180000 })
     const ok = r.status === 0
     logEvent('sommelier.refresh', { projectId: proj.id, ok, code: r.status })
+    // 開著的侍酒師就地重抓（待定奪面板看得到子任務剛寫進 md 的定案／Claude 回覆）
+    broadcast({ type: 'sommelier_refreshed', projectId: proj.id, ok })
     return { ok, code: r.status, stdout: (r.stdout || '').slice(-2000), stderr: (r.stderr || '').slice(-800) }
   } catch (e) { reply.code(500); return { ok: false, error: e.message } }
+})
+
+// ─── 待定奪面板（少爺 2026-09-29「待我定奪的項目都照 VS Code 這樣（原生的方式）」）────────────
+// 侍酒師「設計脈絡／情境體驗」的 OPEN-n 改成原生提問面板：直接選選項／其他＝自由回覆想法／進一步說明。
+// 送出＝兩段：① TC 把「決定」寫回原 md（決定性程序放 harness 層）：選項 → `- [x] OPEN-n …（日期 少爺定：…）`，
+// 回覆 → 該條目下的 `**少爺回覆**（日期 時刻）：…` 子項，情境檔另記進「討論紀錄」；② 派子任務（Claude 聊天室）做判斷類後續：
+// 落成不變量／情境標記、牽動檔同步、機檢刷新、後續實作（實作走 QA 閘門），並建待辦卡綁定該子任務。
+// 條目格式與解析 SSOT：MasterBrain/.agent/scripts/open_decisions.mjs（design_intent／scenario 兩支萃取器共用）。
+
+const DECISION_EXPLAIN_FILE = path.join(os.homedir(), '.claude', 'tc_decision_explain.json')     // 進一步說明快取（內容變了才重算）
+const DECISION_DISPATCH_FILE = path.join(os.homedir(), '.claude', 'tc_decision_dispatch.json')   // 定奪 → 子任務（卡片／聊天室）紀錄
+const DECISION_EXPLAIN_VER = 1
+const DECISION_EXPLAIN_DEFAULT_MODEL = 'sonnet'
+const DECISION_EXPLAIN_TIMEOUT_MS = 180_000
+const DECISION_DISPATCH_MAX = 300
+const DECISION_HEAD_RE = /^(\s*-\s*\[)([ xX])(\]\s*\**)(OPEN-\d+)(\**\s*)(.*)$/
+const decisionExplainInflight = new Map()   // 說明 key → 進行中的 Promise（同一題重複按只跑一次）
+const sommelierRefreshState = new Map()     // projectId → { running, pending }（非同步重萃取合併）
+
+function findSommelierProject(InProjectId) {
+  return (readSommelierConfig().projects ?? []).find(p => p.id === InProjectId) ?? null
+}
+
+/** 待定奪來源檔的絕對路徑：檔名白名單＋必須落在該層目錄內（intent＝designIntentDir、scenario＝scenarioDir） */
+function decisionSourcePath(InProj, InLayer, InFile) {
+  const _dir = InLayer === 'intent' ? InProj?.designIntentDir : InLayer === 'scenario' ? InProj?.scenarioDir : null
+  if (!_dir || !/^[\w.-]+\.md$/.test(String(InFile ?? ''))) return null
+  const _root = path.resolve(_dir)
+  const _fp = path.resolve(_root, InFile)
+  return _fp.startsWith(_root + path.sep) && fs.existsSync(_fp) ? _fp : null
+}
+
+/** 讀 md 並記住原本的行尾與 BOM，寫回時原樣保留 */
+function readMdKeepFormat(InPath) {
+  let _text = fs.readFileSync(InPath, 'utf8')
+  const _bom = _text.charCodeAt(0) === 0xFEFF
+  if (_bom) _text = _text.slice(1)
+  return { lines: _text.split(/\r?\n/), eol: _text.includes('\r\n') ? '\r\n' : '\n', bom: _bom }
+}
+function writeMdKeepFormat(InPath, InDoc) {
+  const _tmp = `${InPath}.${crypto.randomUUID()}.tmp`
+  fs.writeFileSync(_tmp, (InDoc.bom ? '\uFEFF' : '') + InDoc.lines.join(InDoc.eol), 'utf8')
+  fs.renameSync(_tmp, InPath)
+}
+
+/** `## …` 段落的 [起, 迄)（起＝標題下一行）；找不到回 null */
+function mdSectionRange(InLines, InTitleRe) {
+  const _start = InLines.findIndex(l => /^##\s+/.test(l) && InTitleRe.test(l))
+  if (_start < 0) return null
+  let _end = InLines.length
+  for (let i = _start + 1; i < InLines.length; i++) if (/^##\s+/.test(InLines[i])) { _end = i; break }
+  return [_start + 1, _end]
+}
+function mdSectionText(InLines, InTitleRe, InMax = 2000) {
+  const _r = mdSectionRange(InLines, InTitleRe)
+  if (!_r) return ''
+  const _t = InLines.slice(_r[0], _r[1]).join('\n').trim()
+  return _t.length > InMax ? `${_t.slice(0, InMax)}…` : _t
+}
+function mdFrontmatter(InLines) {
+  const _fm = {}
+  if (InLines[0]?.trim() !== '---') return _fm
+  for (let i = 1; i < InLines.length && InLines[i].trim() !== '---'; i++) {
+    const _kv = InLines[i].match(/^([\w.]+):\s*(.*)$/)
+    if (_kv) _fm[_kv[1]] = _kv[2].trim()
+  }
+  return _fm
+}
+
+/** 待定奪段內的某個 OPEN 條目：標題行＋子項範圍（子項＝緊接著、有縮排、不是下一個條目的行） */
+function findOpenBlock(InLines, InOpenId) {
+  const _sec = mdSectionRange(InLines, /待定奪/)
+  if (!_sec) return null
+  for (let i = _sec[0]; i < _sec[1]; i++) {
+    const _m = InLines[i].match(DECISION_HEAD_RE)
+    if (!_m || _m[4] !== InOpenId) continue
+    let _end = i + 1
+    while (_end < _sec[1] && /^\s+\S/.test(InLines[_end]) && !DECISION_HEAD_RE.test(InLines[_end])) _end++
+    return { head: i, end: _end, match: _m, raw: InLines.slice(i, _end).join('\n') }
+  }
+  return null
+}
+
+const decisionOneLine = (InText) => String(InText ?? '').replace(/\r?\n+/g, ' ／ ').replace(/[ \t]+/g, ' ').trim()
+// 定案括號的解析以全形「）」收尾（`[^）]*`），內文的全形括號一律換半形
+const decisionResolutionSafe = (InText) => decisionOneLine(InText).replace(/（/g, '(').replace(/）/g, ')')
+function nowHHMM() {
+  const _d = new Date()
+  return `${String(_d.getHours()).padStart(2, '0')}:${String(_d.getMinutes()).padStart(2, '0')}`
+}
+const decisionHash = (InRaw) => crypto.createHash('sha1').update(String(InRaw ?? ''), 'utf8').digest('hex').slice(0, 16)
+
+/** 一筆回答寫進 doc（記憶體中）；回傳寫入結果與送子任務要用的快照 */
+function applyDecisionAnswer(InDoc, InLayer, InAnswer, InStamp) {
+  const _blk = findOpenBlock(InDoc.lines, InAnswer.openId)
+  if (!_blk) return { ok: false, error: `找不到 ${InAnswer.openId}（檔案可能剛被改過）`, stale: true }
+  const _m = _blk.match
+  if (_m[2] !== ' ') return { ok: false, error: `${InAnswer.openId} 已經定案`, stale: true }
+  const _title = _m[6].trim()
+  if (InAnswer.title && String(InAnswer.title).trim() !== _title) return { ok: false, error: `${InAnswer.openId} 題目已變更，請重新整理後再答`, stale: true }
+  const _question = _title.replace(/\*\*/g, '')
+  const _indent = InDoc.lines[_blk.head + 1]?.match(/^(\s+)-/)?.[1] ?? '  '
+  let _decision = '', _reply = ''
+  if (InAnswer.kind === 'choose') {
+    _decision = decisionResolutionSafe(`${InAnswer.choiceKey}) ${InAnswer.choiceText}${InAnswer.note?.trim() ? `；補充：${InAnswer.note}` : ''}`)
+    InDoc.lines[_blk.head] = `${_m[1]}x${_m[3]}${_m[4]}${_m[5]}${_title}（${InStamp.date} 少爺定：${_decision}）`
+  } else {
+    _reply = decisionOneLine(InAnswer.text)
+    InDoc.lines.splice(_blk.end, 0, `${_indent}- **少爺回覆**（${InStamp.date} ${InStamp.time}）：${_reply}`)
+  }
+  // 情境檔：原話逐字進「討論紀錄」（z_sub_scenario_experience §2）
+  if (InLayer === 'scenario') {
+    const _sec = mdSectionRange(InDoc.lines, /討論紀錄/)
+    if (_sec) {
+      const _body = InDoc.lines.slice(_sec[0], _sec[1]).map((l, i) => ({ l, i: _sec[0] + i })).filter(x => x.l.trim())
+      if (_body.length === 1 && /^[-\s]*[（(]尚無/.test(_body[0].l)) InDoc.lines.splice(_body[0].i, 1)
+      const _sec2 = mdSectionRange(InDoc.lines, /討論紀錄/)
+      let _at = _sec2[1]
+      while (_at > _sec2[0] && !InDoc.lines[_at - 1].trim()) _at--
+      const _q = _question.length > 60 ? `${_question.slice(0, 60)}…` : _question
+      InDoc.lines.splice(_at, 0, InAnswer.kind === 'choose'
+        ? `- ${InStamp.date} 〔TC 待定奪〕${InAnswer.openId}〈${_q}〉少爺定：${_decision}`
+        : `- ${InStamp.date} 〔TC 待定奪〕${InAnswer.openId}〈${_q}〉少爺回覆：「${_reply}」`)
+    }
+  }
+  return { ok: true, raw: _blk.raw, question: _question, decision: _decision, reply: _reply }
+}
+
+function bumpFrontmatterUpdated(InLines, InDate) {
+  if (InLines[0]?.trim() !== '---') return
+  for (let i = 1; i < InLines.length && InLines[i].trim() !== '---'; i++)
+    if (/^updated:\s*/.test(InLines[i])) { InLines[i] = `updated: ${InDate}`; return }
+}
+
+/** 侍酒師重萃取（非同步、同專案合併成一次）：完成後廣播 sommelier_refreshed，開著的面板就地重抓 */
+function scheduleSommelierRefresh(InProj) {
+  if (!InProj?.extractCommand) return false
+  const _st = sommelierRefreshState.get(InProj.id) ?? { running: false, pending: false }
+  sommelierRefreshState.set(InProj.id, _st)
+  if (_st.running) { _st.pending = true; return true }
+  _st.running = true
+  const _t0 = Date.now()
+  const _done = (InCode) => {
+    _st.running = false
+    logEvent('sommelier.refresh.async', { projectId: InProj.id, ok: InCode === 0, code: InCode, ms: Date.now() - _t0 })
+    broadcast({ type: 'sommelier_refreshed', projectId: InProj.id, ok: InCode === 0 })
+    if (_st.pending) { _st.pending = false; scheduleSommelierRefresh(InProj) }
+  }
+  try {
+    const _p = spawn(InProj.extractCommand, { shell: true, stdio: 'ignore', windowsHide: true })
+    _p.on('error', () => _done(-1))
+    _p.on('close', _done)
+  } catch { _done(-1) }
+  return true
+}
+
+function readDecisionExplainCache() { try { return JSON.parse(fs.readFileSync(DECISION_EXPLAIN_FILE, 'utf8')) } catch { return { items: {} } } }
+function readDecisionDispatch() { try { return JSON.parse(fs.readFileSync(DECISION_DISPATCH_FILE, 'utf8')) } catch { return { items: [] } } }
+function updateDecisionDispatch(InId, InPatch) {
+  const _d = readDecisionDispatch()
+  const _rec = _d.items.find(x => x.id === InId)
+  if (!_rec) return
+  Object.assign(_rec, InPatch)
+  atomicWriteJson(DECISION_DISPATCH_FILE, _d)
+  broadcast({ type: 'decision_dispatch_update', projectId: _rec.projectId })
+}
+
+/** 送子任務的 prompt：無頭出身的聊天室不知道本面板的任何脈絡，所以條目原文、檔案絕對路徑、流程指針全寫進來 */
+function composeDecisionPrompt(InProj, InDone, InOpts) {
+  const _root = InProj.projectRoot ?? InProj.projectPath ?? ''
+  const _l = []
+  _l.push(`(TC 待定奪) 少爺在 TC 侍酒師的待定奪面板送出 ${InDone.length} 筆定奪／回覆（${InOpts.stamp.date} ${InOpts.stamp.time}，專案 ${InProj.name}${_root ? `，${_root}` : ''}）。`)
+  _l.push('TC 已經把「決定」本身寫回原檔（harness 層，不必重寫）：選項定奪＝`- [x] OPEN-n …（日期 少爺定：…）`；回覆＝該 OPEN 條目下的 `**少爺回覆**` 子項；情境檔另記進「討論紀錄」。你負責之後的判斷與落實。')
+  _l.push('', '【定奪清單】')
+  InDone.forEach((d, i) => {
+    _l.push(`${i + 1}. ${d.layer === 'intent' ? '🧭 設計脈絡' : '🎬 情境體驗'}｜${d.sourceTitle || d.sourceId}（${d.fp.replace(/\\/g, '/')}）${d.openId} ${d.question}`)
+    for (const _sub of d.raw.split('\n').slice(1)) if (_sub.trim()) _l.push(`   ${_sub.trim()}`)
+    _l.push(d.kind === 'choose' ? `   ✅ 少爺定：${d.decision}` : `   💬 少爺回覆（尚未定案）：「${d.reply}」`)
+  })
+  _l.push('', '【請依序處理】', 'A. 資料維護（每一筆都要做）')
+  _l.push('  1. 動工前先跑 task_kickoff_check：讀原檔全文，以及「牽動」列出的意圖檔／情境檔（§B 首列與「情境」列）。')
+  _l.push('  2. 選項定奪 → 把決定落成事實：意圖檔寫成不變量 `INV-n`（寫前查該檔最大編號、寫後查重複），情境檔把被採用的提案 💡→📐、被否決的標 ❌ 並留原話；再到該 OPEN 行尾的定案括號內補「→ 落為 INV-n」「→ 無需實作」或「→ 待實作」。「牽動」列到的其他檔一併同步。')
+  _l.push('  3. 回覆（尚未定案）→ 先判斷少爺的回覆夠不夠定案：夠 → 由你把該條改成 `- [x]`（定案括號寫你整理出的決定；原話已在 `**少爺回覆**`），再照 2. 落實；不夠、或少爺是在發問 → 在該 OPEN 條目最後加一行 `  - **Claude 回覆**（YYYY-MM-DD HH:mm）：…` 說明或追問（必要時改寫「選項」讓他能直接點選），保持 `- [ ]`——TC 面板會把一問一答顯示成對話串。')
+  // 約束傳播（少爺 2026-09-30「遊戲是環環相扣的，就像解數獨的技巧一樣」）：每筆定奪都順著連動題往下推
+  const _nbBlocks = InOpts.graph ? InDone.map((d, i) => ({ i, lines: decisionNeighborLines(InOpts.graph, d.key) })).filter(x => x.lines.length) : []
+  _l.push('  3.5 約束傳播（數獨）：定了一題就順著連動往下推——連動題已被這個決定（加上品味／現況）**完全決定** → 改成 `- [x] OPEN-n …（YYYY-MM-DD 推導定：<決定>；依據：由 [[X]] OPEN-n 少爺定推導…）`；只被縮小 → 加 `  - **推導**：<選項> 已排除（依據）`；互相衝突 → 在該題寫 `**Claude 回覆**` 指出衝突請少爺裁決。定的若是 🔑 關鍵意圖（有「解鎖」），它解鎖的每一題都要處理。除了下列明示的連動，也要想「還有哪些題因此被回答」（同一機制、同一情境、同一個玩家體驗）。推導只寫真的被決定的，傾向寫成 `**建議**`。')
+  if (_nbBlocks.length) {
+    _l.push('  【連動題】（程式從 md 的引用／取決於／解鎖建出）')
+    for (const b of _nbBlocks) { _l.push(`   第 ${b.i + 1} 筆：`); for (const x of b.lines) _l.push(`   - ${x}`) }
+  }
+  _l.push(`  4. 機檢：\`python C:/Project/MasterBrain/.agent/scripts/Check-DesignIntent.py\` 與 \`Check-ScenarioExperience.py\`（後者只報不擋）；最後 POST http://127.0.0.1:3001/api/sommelier/refresh/${InProj.id} 讓侍酒師吃到最新。`)
+  _l.push('B. 後續實作（有需要才做）')
+  _l.push('  - 定案要改程式／資產／設定時，照 task_kickoff_check 與 `.agent/workflows/z_sub_scenario_experience.md` §5 落實表走既有流程（新機制 `z_sub_add_new_mechanism.md`、新 UI、文案 StringTable…）；不需要實作的明寫「無需實作」。')
+  _l.push(InOpts.qaForImpl
+    ? '  - 有實作的項目走 Mode C QA：照 theclaudenental_operator skill「QA Run 操作 SOP」開 QA Run（必綁 boundSessionId＝本 session id、boundProjectPath、project；wakeMode 由 server 決定，回應帶 mountCommand 就在同一個 response 掛起），列計畫等少爺確認後才編譯；純資料維護不開 QA Run。'
+    : '  - 少爺這次沒勾「實作走 QA」：動 C++／資產之前先把實作計畫回報在聊天室，等少爺確認再做。')
+  if (InOpts.cardId) _l.push(`C. 進度：TC 待辦卡 ${InOpts.cardId} 已建立（欄位 doing）。每完成一個階段就 PATCH http://127.0.0.1:3001/api/todos/${InOpts.cardId}（noteAppend 寫進度；全部完成推 done，需要少爺回答推 discussing）。`)
+  _l.push('完成時回報：每一筆的落點（檔案＋INV 編號或情境標記）、連帶推導了哪些題（推導定／縮小）、需不需要實作、還有哪些題要少爺再回答。')
+  return _l.join('\n')
+}
+
+/** 進一步說明的 prompt：題目原文＋來源檔脈絡＋牽動的意圖檔／情境（全部內嵌，不讓模型自己翻檔） */
+function buildDecisionExplainPrompt(InProj, InLayer, InDoc, InBlock, InFile, InGraph = null, InKey = null) {
+  const _fm = mdFrontmatter(InDoc.lines)
+  const _title = _fm.title ?? InFile
+  let _thesis = ''
+  try { _thesis = JSON.parse(fs.readFileSync(path.join(InProj.dataDir, 'generated', 'scenario_experience.json'), 'utf8')).thesis ?? '' } catch {}
+  const _readIntent = (InId) => {
+    const _fp = decisionSourcePath(InProj, 'intent', `${InId}.md`)
+    if (!_fp) return null
+    const _d = readMdKeepFormat(_fp)
+    return { title: mdFrontmatter(_d.lines).title ?? InId, intent: mdSectionText(_d.lines, /意圖/, 700), invariants: mdSectionText(_d.lines, /不變量/, 900) }
+  }
+  const _links = [...new Set([...InBlock.raw.matchAll(/\[\[([^\]]+)\]\]/g)].map(m => m[1].trim()))]
+  const _parts = []
+  if (InLayer === 'intent') {
+    _parts.push(`【來源檔：設計脈絡「${_title}」】`,
+      `意圖：\n${mdSectionText(InDoc.lines, /意圖/, 1800)}`,
+      `不變量：\n${mdSectionText(InDoc.lines, /不變量/, 2200)}`,
+      `相關脈絡：\n${mdSectionText(InDoc.lines, /相關脈絡/, 700)}`)
+    const _scenDir = InProj.scenarioDir
+    const _hits = []
+    try {
+      for (const _f of fs.readdirSync(_scenDir).filter(f => /^S\d{2}_.+\.md$/.test(f)).sort()) {
+        const _d = readMdKeepFormat(path.join(_scenDir, _f))
+        const _sfm = mdFrontmatter(_d.lines)
+        const _ids = String(_sfm.intents ?? '').split(',').map(s => s.trim())
+        if (!_ids.includes(_fm.id) && !_d.lines.some(l => l.includes(`[[${_fm.id}]]`))) continue
+        _hits.push(`- ${_sfm.title ?? _f}：${mdSectionText(_d.lines, /體驗一句話/, 240).replace(/\s+/g, ' ')}`)
+        if (_hits.length >= 5) break
+      }
+    } catch {}
+    if (_hits.length) _parts.push(`【這個機制出現在這些情境（玩家體驗）】\n${_hits.join('\n')}`)
+  } else {
+    const _gapIds = [...new Set([...InBlock.raw.matchAll(/\bG-\d+\b/g)].map(m => m[0]))]
+    const _gaps = mdSectionText(InDoc.lines, /缺口/, 20000)
+    const _gapText = _gapIds.length
+      ? _gapIds.map(g => (_gaps.split(/\n(?=- )/).find(b => b.includes(g)) ?? '').slice(0, 700)).filter(Boolean).join('\n')
+      : _gaps.slice(0, 1500)
+    _parts.push(`【來源檔：情境體驗「${_title}」（階段 ${_fm.phase ?? '?'}）】`,
+      `體驗一句話：\n${mdSectionText(InDoc.lines, /體驗一句話/, 500)}`,
+      `題目對照：\n${mdSectionText(InDoc.lines, /題目對照/, 1600)}`,
+      `進入與離開：\n${mdSectionText(InDoc.lines, /進入與離開/, 700)}`,
+      `運作中的機制：\n${mdSectionText(InDoc.lines, /運作中的機制/, 1600)}`,
+      `題目提到的缺口與提案：\n${_gapText}`)
+    for (const l of String(_fm.intents ?? '').split(',').map(s => s.trim()).filter(Boolean)) if (!_links.includes(l)) _links.push(l)
+  }
+  const _intentIds = _links.filter(l => /^[A-Z][A-Za-z0-9]+$/.test(l) && l !== _fm.id).slice(0, 4)
+  const _intentText = _intentIds.map(id => {
+    const _it = _readIntent(id)
+    return _it ? `- 「${_it.title}」（${id}）\n  意圖：${_it.intent.replace(/\s+/g, ' ')}\n  不變量摘錄：${_it.invariants.replace(/\s+/g, ' ').slice(0, 600)}` : null
+  }).filter(Boolean)
+  if (_intentText.length) _parts.push(`【牽動的意圖檔】\n${_intentText.join('\n')}`)
+  const _scenIds = _links.filter(l => /^S\d{2}_/.test(l)).slice(0, 3)
+  const _scenText = _scenIds.map(id => {
+    const _fp = decisionSourcePath(InProj, 'scenario', `${id}.md`)
+    if (!_fp) return null
+    const _d = readMdKeepFormat(_fp)
+    return `- ${mdFrontmatter(_d.lines).title ?? id}：${mdSectionText(_d.lines, /體驗一句話/, 240).replace(/\s+/g, ' ')}`
+  }).filter(Boolean)
+  if (_scenText.length) _parts.push(`【題目提到的其他情境】\n${_scenText.join('\n')}`)
+  // 連動題（數獨盤面上的鄰居）：上游關鍵題／本題解鎖／明示引用，附目前狀態——讓說明能指出「這題其實已被回答／取決於哪題」
+  const _nb = InGraph && InKey ? decisionNeighborLines(InGraph, InKey) : []
+  if (_nb.length) _parts.push(`【連動題】\n${_nb.map(x => `- ${x}`).join('\n')}`)
+
+  return `你是這個遊戲專案的設計顧問。少爺（遊戲製作人）在待定奪面板上看不懂下面這一題，按了「進一步說明」。請用白話把完整的情境與脈絡講清楚，讓他能自己做決定。只輸出一個 JSON 物件，不要任何其他文字，也不要呼叫任何工具（需要的內容都在下方）。
+
+JSON 格式：
+{"scene":"玩家此刻的情境：遊戲的哪一段、看到／聽到／能做什麼（2~4 句）","question":"這題白話在問什麼（1~2 句，不用術語）","whyNow":"為什麼需要少爺決定、不決定會卡住什麼（1~2 句）","options":[{"key":"A","label":"短標題（12 字內）","experience":"選了之後玩家會感受到什麼","cost":"開發成本與要動到哪些機制","risk":"代價或風險"}],"recommend":{"key":"A","reason":"一句話理由（只是建議，決定權在少爺）"},"context":["相關機制、不變量或情境的短句"],"glossary":[{"term":"術語","meaning":"白話解釋"}]}
+
+規則：
+- 全部繁體中文（台灣用語）；程式識別字（類別、函式、檔名、資產名）保留原文。
+- 只根據下方資料，資料沒提到的寫「資料未提及」，不要編造。
+- options：題目有列選項就逐一對應同樣的 key；題目沒列選項就整理 2~4 個可行方案（key 用 A、B、C…）。
+- 以玩家體驗為主軸說明後果${_thesis ? `（這個專案的題目是：「${_thesis}」）` : ''}。
+- glossary 收 2~6 個少爺可能不熟的術語，沒有就給空陣列；recommend 沒把握就給 null。
+- 遊戲是環環相扣的：若這題其實已被【連動題】的定案、品味或現況回答，或只要先答某個上游關鍵題就能推出來，whyNow 第一句就明說（例「這題可能已有答案：…」「先答 X，這題就能推出來」）。
+
+【這一題】（${InLayer === 'intent' ? '設計脈絡' : '情境體驗'}「${_title}」，檔案 ${InFile}）
+${InBlock.raw}
+
+${_parts.filter(Boolean).join('\n\n')}`
+}
+
+function parseDecisionExplain(InText) {
+  try {
+    const _m = String(InText ?? '').match(/\{[\s\S]*\}/)
+    if (!_m) return null
+    const _p = JSON.parse(_m[0])
+    const _tw = (s) => { try { return s == null ? '' : s2tw(String(s)) } catch { return String(s ?? '') } }
+    const _key = (k) => { const _k = String(k ?? '').trim().toUpperCase(); return /^[A-H]$/.test(_k) ? _k : null }
+    const options = (Array.isArray(_p.options) ? _p.options : []).slice(0, 6)
+      .map(o => ({ key: _key(o?.key), label: _tw(o?.label), experience: _tw(o?.experience), cost: _tw(o?.cost), risk: _tw(o?.risk) }))
+      .filter(o => o.key)
+    if (!_p.scene && !_p.question && !options.length) return null
+    const _rk = _key(_p.recommend?.key)
+    return {
+      scene: _tw(_p.scene), question: _tw(_p.question), whyNow: _tw(_p.whyNow), options,
+      recommend: _rk ? { key: _rk, reason: _tw(_p.recommend?.reason) } : null,
+      context: (Array.isArray(_p.context) ? _p.context : []).slice(0, 8).map(_tw).filter(Boolean),
+      glossary: (Array.isArray(_p.glossary) ? _p.glossary : []).slice(0, 8)
+        .map(g => ({ term: _tw(g?.term), meaning: _tw(g?.meaning) })).filter(g => g.term),
+    }
+  } catch { return null }
+}
+
+// 非同步重萃取（面板的 ↻）：立即回應，完成時廣播 sommelier_refreshed；舊的 /refresh 是同步（跑完才回、期間卡住 server）
+app.post('/api/sommelier/refresh-async/:projectId', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const _proj = findSommelierProject(request.params.projectId)
+  if (!_proj?.extractCommand) { reply.code(404); return { ok: false, error: 'no extractCommand for project' } }
+  return { ok: true, scheduled: scheduleSommelierRefresh(_proj) }
+})
+
+// 面板狀態：已快取的說明（附 stale＝題目內容已變）＋每題最近一次派出的子任務
+app.get('/api/decisions/state/:projectId', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const _pid = request.params.projectId
+  const _proj = findSommelierProject(_pid)
+  if (!_proj) { reply.code(404); return { ok: false, error: 'unknown project' } }
+  const _docs = new Map()
+  const _currentHash = (InLayer, InFile, InOpenId) => {
+    const _fp = decisionSourcePath(_proj, InLayer, InFile)
+    if (!_fp) return null
+    if (!_docs.has(_fp)) { try { _docs.set(_fp, readMdKeepFormat(_fp)) } catch { _docs.set(_fp, null) } }
+    const _blk = _docs.get(_fp) ? findOpenBlock(_docs.get(_fp).lines, InOpenId) : null
+    return _blk ? decisionHash(_blk.raw) : null
+  }
+  const explanations = {}
+  for (const [k, v] of Object.entries(readDecisionExplainCache().items ?? {})) {
+    if (!k.startsWith(`${_pid}|`)) continue
+    const [, _layer, , _openId] = k.split('|')
+    explanations[k] = { ...v, stale: v.ver !== DECISION_EXPLAIN_VER || (v.file ? _currentHash(_layer, v.file, _openId) !== v.hash : false) }
+  }
+  const dispatches = {}
+  for (const _rec of readDecisionDispatch().items) {
+    if (_rec.projectId !== _pid) continue
+    const _running = !!_rec.sessionId && [...claudeProcs.values()].some(e => e.sessionId === _rec.sessionId && e.status === 'running')
+    for (const k of _rec.keys ?? []) dispatches[k] = { id: _rec.id, ts: _rec.ts, cardId: _rec.cardId ?? null, sessionId: _rec.sessionId ?? null, target: _rec.target, kind: _rec.kinds?.[k] ?? null, running: _running }
+  }
+  return { ok: true, explanations, dispatches, explainModel: getTcSetting('decision.explainModel', DECISION_EXPLAIN_DEFAULT_MODEL), graph: buildDecisionGraph(_proj, _pid) }
+})
+
+// 進一步說明：讀原檔＋牽動檔，一次性無頭 Claude 產白話說明（快取；題目內容變了才重算，force＝強制重算）
+app.post('/api/decisions/explain', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const { projectId, layer, sourceId, file, openId, force } = request.body ?? {}
+  const _proj = findSommelierProject(projectId)
+  if (!_proj) { reply.code(404); return { ok: false, error: 'unknown project' } }
+  const _fp = decisionSourcePath(_proj, layer, file)
+  if (!_fp || !/^OPEN-\d+$/.test(String(openId ?? ''))) { reply.code(400); return { ok: false, error: '找不到來源檔或題號不對' } }
+  const _doc = readMdKeepFormat(_fp)
+  const _blk = findOpenBlock(_doc.lines, openId)
+  if (!_blk) { reply.code(404); return { ok: false, error: `${file} 裡找不到 ${openId}` } }
+  const _key = `${projectId}|${layer}|${sourceId}|${openId}`
+  const _hash = decisionHash(_blk.raw)
+  const _hit = readDecisionExplainCache().items?.[_key]
+  if (!force && _hit && _hit.hash === _hash && _hit.ver === DECISION_EXPLAIN_VER) return { ok: true, cached: true, key: _key, explanation: { ..._hit, stale: false } }
+  if (decisionExplainInflight.has(_key)) return await decisionExplainInflight.get(_key)
+  const _job = (async () => {
+    const _model = getTcSetting('decision.explainModel', DECISION_EXPLAIN_DEFAULT_MODEL)
+    const _t0 = Date.now()
+    const _text = await runOneShotClaude(buildDecisionExplainPrompt(_proj, layer, _doc, _blk, file, buildDecisionGraph(_proj, projectId), _key), { model: _model, timeoutMs: DECISION_EXPLAIN_TIMEOUT_MS })
+    const _parsed = parseDecisionExplain(_text)
+    logEvent('decision.explain', { key: _key, model: _model, ok: !!_parsed, ms: Date.now() - _t0 })
+    if (!_parsed) return { ok: false, error: '說明產生失敗（模型沒有回傳可解析的內容），可以再按一次' }
+    const _entry = { ..._parsed, file, hash: _hash, ver: DECISION_EXPLAIN_VER, model: _model, generatedAt: Date.now(), ms: Date.now() - _t0 }
+    const _cache = readDecisionExplainCache()
+    _cache.items ??= {}
+    _cache.items[_key] = _entry
+    atomicWriteJson(DECISION_EXPLAIN_FILE, _cache)
+    return { ok: true, cached: false, key: _key, explanation: { ..._entry, stale: false } }
+  })().finally(() => decisionExplainInflight.delete(_key))
+  decisionExplainInflight.set(_key, _job)
+  return await _job
+})
+
+// 送出定奪：寫回原檔（harness）→ 非同步重萃取 → 建待辦卡＋派子任務。dryRun＝只回報會寫什麼與子任務 prompt，不動檔不派工
+app.post('/api/decisions/submit', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const { projectId, answers, dispatch = {}, dryRun = false } = request.body ?? {}
+  const _proj = findSommelierProject(projectId)
+  if (!_proj) { reply.code(404); return { ok: false, error: 'unknown project' } }
+  const _answers = (Array.isArray(answers) ? answers : []).filter(a => a
+    && ['intent', 'scenario'].includes(a.layer) && /^OPEN-\d+$/.test(String(a.openId ?? '')) && a.file
+    && ((a.kind === 'choose' && /^[A-H]$/.test(String(a.choiceKey ?? '')) && String(a.choiceText ?? '').trim())
+      || (a.kind === 'reply' && String(a.text ?? '').trim())))
+  if (!_answers.length) { reply.code(400); return { ok: false, error: '沒有可送出的定奪（選一個選項，或在「其他」寫下想法）' } }
+  const _stamp = { date: todayStamp(), time: nowHHMM() }
+  const _groups = new Map()
+  for (const a of _answers) {
+    const _k = `${a.layer}|${a.file}`
+    if (!_groups.has(_k)) _groups.set(_k, [])
+    _groups.get(_k).push(a)
+  }
+  const results = []
+  const _done = []
+  const preview = []
+  for (const [_k, _arr] of _groups) {
+    const [_layer, _file] = _k.split('|')
+    const _fp = decisionSourcePath(_proj, _layer, _file)
+    if (!_fp) { for (const a of _arr) results.push({ key: a.key ?? null, openId: a.openId, file: _file, ok: false, error: `找不到來源檔 ${_file}` }); continue }
+    const _doc = readMdKeepFormat(_fp)
+    const _before = _doc.lines.slice()
+    let _changed = false
+    for (const a of _arr) {
+      const _r = applyDecisionAnswer(_doc, _layer, a, _stamp)
+      results.push({ key: a.key ?? null, openId: a.openId, file: _file, ok: _r.ok, error: _r.error ?? null, stale: !!_r.stale })
+      if (_r.ok) { _changed = true; _done.push({ ...a, fp: _fp, raw: _r.raw, question: _r.question, decision: _r.decision, reply: _r.reply }) }
+    }
+    if (!_changed) continue
+    bumpFrontmatterUpdated(_doc.lines, _stamp.date)
+    if (dryRun) preview.push({ file: _file, added: _doc.lines.filter(l => !_before.includes(l)) })
+    else writeMdKeepFormat(_fp, _doc)
+  }
+  if (!_done.length) return { ok: false, error: results.find(r => r.error)?.error ?? '沒有寫入任何定奪', results }
+  const _qaForImpl = dispatch.qaForImpl !== false
+  if (dryRun) return { ok: true, dryRun: true, results, preview, prompt: composeDecisionPrompt(_proj, _done, { stamp: _stamp, qaForImpl: _qaForImpl, cardId: '(卡片 id)' }) }
+
+  for (const d of _done) logEvent('decision.submit', { projectId, layer: d.layer, file: d.file, openId: d.openId, kind: d.kind, choiceKey: d.choiceKey ?? null })
+  const refresh = scheduleSommelierRefresh(_proj)
+  if (dispatch.enabled === false) return { ok: true, results, written: _done.length, refresh, dispatched: false }
+  const _graph = buildDecisionGraph(_proj, projectId)
+  const _short = (s) => { const _t = String(s ?? '').replace(/（.*$/, '').trim(); return _t.length > 18 ? `${_t.slice(0, 18)}…` : _t }
+  const _first = _done[0]
+  const _sent = await dispatchDecisionTask(_proj, projectId, {
+    title: `定奪落實：${_short(_first.sourceTitle || _first.sourceId)} ${_first.openId}${_done.length > 1 ? ` 等 ${_done.length} 筆` : ''}`,
+    note: `TC 待定奪面板 ${_stamp.date} ${_stamp.time} 送出（已寫回原檔，子任務處理後續＋連動題約束傳播）\n\n${_done.map(d => `- ${d.layer === 'intent' ? '🧭' : '🎬'} ${_short(d.sourceTitle || d.sourceId)} ${d.openId}：${d.kind === 'choose' ? `✅ ${d.decision}` : `💬 回覆「${d.reply.slice(0, 80)}」`}`).join('\n')}`,
+    promptOf: (InCardId) => composeDecisionPrompt(_proj, _done, { stamp: _stamp, qaForImpl: _qaForImpl, cardId: InCardId, graph: _graph }),
+    keys: _done.map(d => d.key).filter(Boolean),
+    kinds: Object.fromEntries(_done.filter(d => d.key).map(d => [d.key, d.kind])),
+    dispatch,
+  })
+  return { ok: true, results, written: _done.length, refresh, ..._sent }
+})
+
+/** 派子任務（定奪落實／數獨推導共用）：建待辦卡 → 以卡片 id 組 prompt → 聊天室
+ *  開新＝直接 spawnClaude（init 後把 session id 綁回卡片與派工紀錄）；送入既有＝走 /api/claude/run（原地聯動／排隊照舊） */
+async function dispatchDecisionTask(InProj, InProjectId, { title, note, promptOf, keys, kinds, dispatch = {} }) {
+  const _projectRoot = String(InProj.projectRoot ?? InProj.projectPath ?? '')
+  const _projectPath = _projectRoot.replace(/\//g, path.sep)
+  if (!isSafeCwd(_projectPath)) return { dispatched: false, dispatchError: `專案路徑無效：${_projectPath || '(未設定 projectRoot)'}` }
+  const _card = (await app.inject({ method: 'POST', url: '/api/todos', payload: { title, column: 'doing', note } })).json()?.card ?? null
+  const _model = (typeof dispatch.model === 'string' && dispatch.model.trim()) ? dispatch.model.trim() : null
+  const _effort = EFFORT_LEVELS.includes(dispatch.effort) ? dispatch.effort : null
+  const _prompt = promptOf(_card?.id ?? null)
+  const _target = dispatch.target === 'session' && /^[0-9a-f-]{36}$/i.test(String(dispatch.sessionId ?? '')) ? 'session' : 'new'
+  const _recId = `dd${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+  const _store = readDecisionDispatch()
+  _store.items = [..._store.items, { id: _recId, ts: Date.now(), projectId: InProjectId, keys, kinds, cardId: _card?.id ?? null, sessionId: _target === 'session' ? dispatch.sessionId : null, target: _target, model: _model, effort: _effort }].slice(-DECISION_DISPATCH_MAX)
+  atomicWriteJson(DECISION_DISPATCH_FILE, _store)
+  const _bindCard = (InSid) => { if (_card?.id && InSid) app.inject({ method: 'PATCH', url: `/api/todos/${_card.id}`, payload: { sessionId: InSid } }).catch(() => {}) }
+  let run
+  if (_target === 'new') {
+    spawnClaude(_projectPath, _prompt, null, _model, _effort, (InSid) => { updateDecisionDispatch(_recId, { sessionId: InSid }); _bindCard(InSid) })
+    run = { target: 'new', projectPath: normalizePath(_projectPath) }
+  } else {
+    const _runRes = await app.inject({ method: 'POST', url: '/api/claude/run', payload: { projectPath: _projectPath, prompt: _prompt, sessionId: dispatch.sessionId, model: _model, effort: _effort } })
+    run = { target: 'session', sessionId: dispatch.sessionId, ...(_runRes.json() ?? {}) }
+    _bindCard(dispatch.sessionId)
+  }
+  logEvent('decision.dispatch', { projectId: InProjectId, recId: _recId, target: _target, cardId: _card?.id ?? null, count: keys.length })
+  broadcast({ type: 'decision_dispatch_update', projectId: InProjectId })
+  return { dispatched: true, card: _card ? { id: _card.id, title: _card.title } : null, run, dispatchId: _recId, projectRoot: _projectRoot }
+}
+
+// ── 數獨推導（少爺 2026-09-30「遊戲是環環相扣的，就像解數獨的技巧一樣」「有時候問題只是缺少數幾的關鍵意圖，對齊後就能完善後續的實作與推理」）──
+// 盤面＝兩層萃取資料的每一題；邊＝明示引用（ref）／取決於（depends）／解鎖（unlocks）。
+// 決定性的部分（誰連到誰）由程式從 md 建；判斷性的部分（能不能推、推成什麼）交給子任務，結果一律寫成可推翻的「推導定」。
+
+/** 待定奪連動圖：nodes＝每一題（未定＋已定），edges＝key → [{ key, kind:'ref'|'depends'|'unlocks', dir:'out'|'in' }] */
+function buildDecisionGraph(InProj, InProjectId) {
+  const _read = (InFile) => { try { return JSON.parse(fs.readFileSync(path.join(InProj.dataDir, 'generated', InFile), 'utf8')) } catch { return null } }
+  const nodes = {}
+  const _full = {}
+  const _add = (InLayer, InSrc, InD) => {
+    const key = `${InProjectId}|${InLayer}|${InSrc.id}|${InD.id}`
+    _full[key] = InD
+    nodes[key] = {
+      key, layer: InLayer, sourceId: InSrc.id, sourceTitle: InSrc.title, file: InSrc.file, openId: InD.id,
+      question: InD.question ?? InD.title, resolved: !!InD.resolved, resolvedBy: InD.resolvedBy ?? (InD.resolved ? 'owner' : null),
+      resolution: InD.resolution ?? '', basis: InD.basis ?? '',
+    }
+  }
+  for (const it of _read('design_intent.json')?.intents ?? []) for (const d of it.openDecisions ?? []) _add('intent', it, d)
+  for (const s of _read('scenario_experience.json')?.scenarios ?? []) for (const d of s.openDecisions ?? []) _add('scenario', s, d)
+  const _keyOf = (InFrom, InRef) => {
+    const _target = InRef.target ?? InFrom.sourceId
+    const _k = `${InProjectId}|${/^S\d{2}_/.test(_target) ? 'scenario' : 'intent'}|${_target}|${InRef.openId}`
+    return nodes[_k] ? _k : null
+  }
+  const edges = {}
+  const _seen = new Set()
+  const _link = (InA, InB, InKind) => {
+    if (!InA || !InB || InA === InB) return
+    for (const [a, b, dir] of [[InA, InB, 'out'], [InB, InA, 'in']]) {
+      const _s = `${a}|${b}|${InKind}|${dir}`
+      if (_seen.has(_s)) continue
+      _seen.add(_s)
+      ;(edges[a] ??= []).push({ key: b, kind: InKind, dir })
+    }
+  }
+  for (const n of Object.values(nodes)) {
+    const d = _full[n.key]
+    for (const r of d.refs ?? []) _link(n.key, _keyOf(n, r), 'ref')
+    for (const r of d.dependsOn ?? []) _link(n.key, _keyOf(n, r), 'depends')
+    for (const r of d.unlocks ?? []) _link(n.key, _keyOf(n, r), 'unlocks')
+  }
+  return { nodes, edges }
+}
+
+/** 一題的連動題（人讀的清單行）：上游關鍵題、下游被解鎖題、明示引用 */
+function decisionNeighborLines(InGraph, InKey) {
+  const _state = (n) => n.resolved ? `${n.resolvedBy === 'derived' ? '推導定' : '已定'}：${String(n.resolution || '').slice(0, 60)}` : '未定'
+  return (InGraph.edges[InKey] ?? []).map(e => {
+    const n = InGraph.nodes[e.key]
+    if (!n) return null
+    const _rel = e.kind === 'unlocks' ? (e.dir === 'out' ? '本題解鎖' : '上游關鍵題')
+      : e.kind === 'depends' ? (e.dir === 'out' ? '上游關鍵題' : '本題解鎖') : '明示引用'
+    return `【${_rel}】${n.layer === 'intent' ? '🧭' : '🎬'} ${n.sourceId} ${n.openId} ${String(n.question).slice(0, 70)}（${_state(n)}；檔案 ${n.file}）`
+  }).filter(Boolean)
+}
+
+/** 數獨推導的 prompt：整張盤面（未定＋已定）＋解法步驟；子任務不知道面板脈絡，所以全寫進來 */
+function composeDecisionSolvePrompt(InProj, InGraph, InOpts) {
+  const _root = InProj.projectRoot ?? InProj.projectPath ?? ''
+  const _all = Object.values(InGraph.nodes)
+  const _open = _all.filter(n => !n.resolved)
+  const _l = []
+  _l.push(`(TC 待定奪・數獨推導) 少爺按了「🧩 數獨推導」（${InOpts.stamp.date} ${InOpts.stamp.time}，專案 ${InProj.name}${_root ? `，${_root}` : ''}）。`)
+  _l.push('把目前的待定奪當數獨解：遊戲環環相扣，定一題會連帶回答、縮小或消去其他題；有時只缺少數幾個關鍵意圖，對齊後就能推完一整群（少爺 2026-09-30 品味，memory `feedback_decision_sudoku_propagation.md`）。')
+  _l.push(`意圖檔目錄：${String(InProj.designIntentDir ?? '').replace(/\\/g, '/')}；情境檔目錄：${String(InProj.scenarioDir ?? '').replace(/\\/g, '/')}`)
+  _l.push('', `【盤面：未定 ${_open.length} 題】（🔑＝關鍵意圖、⛓＝取決於上游）`)
+  for (const n of _open) {
+    const _nb = decisionNeighborLines(InGraph, n.key)
+    const _mark = _nb.some(x => x.startsWith('【本題解鎖】')) ? '🔑' : _nb.some(x => x.startsWith('【上游關鍵題】')) ? '⛓' : '・'
+    _l.push(`${_mark} ${n.layer}|${n.sourceId}|${n.openId}（${n.file}）${n.question}`)
+    for (const x of _nb) _l.push(`   ${x}`)
+  }
+  _l.push('', '【線索：已定】')
+  for (const n of _all.filter(x => x.resolved)) _l.push(`- ${n.layer}|${n.sourceId}|${n.openId} ${String(n.question).slice(0, 60)} ⇒ ${n.resolvedBy === 'derived' ? '推導定' : '少爺定'}：${String(n.resolution || '').slice(0, 90)}`)
+  _l.push('', '【解法】依序做，每一步都寫進原檔（格式見 memory `feedback_design_intent_layer.md` §待定奪；少爺可在 TC 逐筆推翻，所以要可追溯）')
+  _l.push('0. 先跑 task_kickoff_check；讀每題原檔的整個待定奪段，以及 MEMORY.md 索引裡的品味類 feedback。')
+  _l.push('1. 消去已有答案的題：對照（a）其他已定案（b）品味類 memory（例：手感參數工具化、互動視覺寫實風、打擊感鬼武者／隻狼、中介軟體照業界慣例、玩家＝陣型整體…）（c）現況（程式碼、設定檔、意圖檔不變量、最近的實作）。**真的被決定**才改成 `- [x] OPEN-n …（YYYY-MM-DD 推導定：<決定>；依據：<檔案:行／memory 名／[[X]] OPEN-n>）`；只是傾向的寫成 `**建議**`，不推導。')
+  _l.push('2. 合併重複題：同一題出現在兩處 → 保留資訊較完整的一題，另一題 `推導定：併入 [[X]] OPEN-n`，並把它獨有的現況／選項補進保留那題。')
+  _l.push('3. 縮小：選項已被品味／現況／其他定案排除 → 加 `  - **推導**：<選項> 已排除（依據）`；兩個選項其實描述同一個現狀也寫明。題目一部分已被回答、只剩一部分時，把已回答的部分推導定，剩下的部分另開新題（寫前查該檔最大 OPEN 編號）。')
+  _l.push('4. 分清誰的球：選項是「我去查／我去確認」的是 Claude 的工作——查完寫成事實（能定就推導定，不能定就改寫題目，只留真正的設計取捨）。')
+  _l.push('5. 找關鍵意圖：把剩下的題分群，每群問「是不是缺一個上游意圖，少爺一句話就能推完這群」。有就在 `design_intent/DesignPillars.md` 的待定奪新增關鍵題（選項＝幾種方向、每個選項寫它會把下游題推成什麼），加 `**解鎖**：[[X]] OPEN-n、…`，並在每個下游題加 `**取決於**：[[DesignPillars]] OPEN-n`。某題本身就是上游（例如一場遊戲的結構題）就直接在它身上加 `**解鎖**`，不重複發問。')
+  _l.push(`6. 機檢：\`python C:/Project/MasterBrain/.agent/scripts/Check-DesignIntent.py\` 與 \`Check-ScenarioExperience.py\`；最後 POST http://127.0.0.1:3001/api/sommelier/refresh/${InProj.id}。`)
+  _l.push('7. 回報：消去 N 題（每題一行：題目 ⇒ 推導定＋依據）、合併 N 組、縮小 N 題、關鍵意圖 N 題（各解鎖哪些）、剩下真正要少爺定的 N 題。')
+  _l.push('禁止：替少爺做真正的設計取捨；把傾向寫成推導定；刪掉任何題（一律用 [x]＋依據保留可追溯）；動程式碼（本任務只整理待定奪）。')
+  if (InOpts.cardId) _l.push(`進度：TC 待辦卡 ${InOpts.cardId} 已建立。每完成一步就 PATCH http://127.0.0.1:3001/api/todos/${InOpts.cardId}（noteAppend 寫進度；完成推 discussing 請少爺確認推導）。`)
+  return _l.join('\n')
+}
+
+// 🧩 數獨推導：整張盤面交給子任務解（消去／合併／縮小／關鍵意圖），結果寫成推導定供少爺確認。dryRun＝只回 prompt
+app.post('/api/decisions/solve', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const { projectId, dispatch = {}, dryRun = false } = request.body ?? {}
+  const _proj = findSommelierProject(projectId)
+  if (!_proj) { reply.code(404); return { ok: false, error: 'unknown project' } }
+  const _stamp = { date: todayStamp(), time: nowHHMM() }
+  const _graph = buildDecisionGraph(_proj, projectId)
+  const _open = Object.values(_graph.nodes).filter(n => !n.resolved)
+  if (!_open.length) return { ok: false, error: '目前沒有未定的待定奪' }
+  if (dryRun) return { ok: true, dryRun: true, open: _open.length, prompt: composeDecisionSolvePrompt(_proj, _graph, { stamp: _stamp, cardId: '(卡片 id)' }) }
+  const _sent = await dispatchDecisionTask(_proj, projectId, {
+    title: `數獨推導：${_proj.name} 待定奪 ${_open.length} 題`,
+    note: `TC 待定奪面板 ${_stamp.date} ${_stamp.time} 按「🧩 數獨推導」：消去已有答案的題、合併重複題、縮小選項、找關鍵意圖；結果寫成可推翻的推導定`,
+    promptOf: (InCardId) => composeDecisionSolvePrompt(_proj, _graph, { stamp: _stamp, cardId: InCardId }),
+    keys: [], kinds: {}, dispatch,
+  })
+  logEvent('decision.solve', { projectId, open: _open.length })
+  return { ok: true, open: _open.length, ..._sent }
+})
+
+// 推導定的確認／推翻（少爺在面板上按）：確認＝改成少爺定並保留依據；推翻＝回到未定、在題下記「推翻推導」讓他重新作答
+app.post('/api/decisions/review', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const { projectId, items } = request.body ?? {}
+  const _proj = findSommelierProject(projectId)
+  if (!_proj) { reply.code(404); return { ok: false, error: 'unknown project' } }
+  const _stamp = { date: todayStamp(), time: nowHHMM() }
+  const _derivedRe = /（(\d{4}-\d{2}-\d{2})\s*推導定[：:]\s*([^）]*)）/
+  const results = []
+  const _groups = new Map()
+  for (const it of Array.isArray(items) ? items : []) {
+    if (!['intent', 'scenario'].includes(it?.layer) || !['confirm', 'reject'].includes(it?.action) || !/^OPEN-\d+$/.test(String(it?.openId ?? ''))) continue
+    const _k = `${it.layer}|${it.file}`
+    if (!_groups.has(_k)) _groups.set(_k, [])
+    _groups.get(_k).push(it)
+  }
+  for (const [_k, _arr] of _groups) {
+    const [_layer, _file] = _k.split('|')
+    const _fp = decisionSourcePath(_proj, _layer, _file)
+    if (!_fp) { for (const it of _arr) results.push({ key: it.key ?? null, ok: false, error: `找不到來源檔 ${_file}` }); continue }
+    const _doc = readMdKeepFormat(_fp)
+    let _changed = false
+    for (const it of _arr) {
+      const _blk = findOpenBlock(_doc.lines, it.openId)
+      const _m = _blk ? _doc.lines[_blk.head].match(_derivedRe) : null
+      if (!_blk || !_m) { results.push({ key: it.key ?? null, ok: false, error: `${it.openId} 不是推導定（可能已被確認或改過）`, stale: true }); continue }
+      const [_decision, ..._basis] = _m[2].split(/[；;]\s*依據[：:]\s*/)
+      if (it.action === 'confirm') {
+        _doc.lines[_blk.head] = _doc.lines[_blk.head].replace(_derivedRe, `（${_stamp.date} 少爺定：${_decision.trim()}；依據：${_basis.join('；').trim() || '依脈絡推導'}；確認推導 ${_m[1]}）`)
+      } else {
+        const _hm = _doc.lines[_blk.head].replace(_derivedRe, '').match(DECISION_HEAD_RE)
+        _doc.lines[_blk.head] = `${_hm[1]} ${_hm[3]}${_hm[4]}${_hm[5]}${_hm[6].trimEnd()}`
+        const _indent = _doc.lines[_blk.head + 1]?.match(/^(\s+)-/)?.[1] ?? '  '
+        const _why = decisionOneLine(it.text)
+        _doc.lines.splice(_blk.end, 0, `${_indent}- **少爺回覆**（${_stamp.date} ${_stamp.time}）：推翻推導「${decisionOneLine(_decision)}」${_why ? `——${_why}` : ''}`)
+      }
+      _changed = true
+      results.push({ key: it.key ?? null, openId: it.openId, file: _file, ok: true, action: it.action })
+      logEvent('decision.review', { projectId, file: _file, openId: it.openId, action: it.action })
+    }
+    if (!_changed) continue
+    bumpFrontmatterUpdated(_doc.lines, _stamp.date)
+    writeMdKeepFormat(_fp, _doc)
+  }
+  const refresh = results.some(r => r.ok) ? scheduleSommelierRefresh(_proj) : false
+  return { ok: results.some(r => r.ok), results, refresh }
 })
 
 // ─── AutoQA Monitor（QA runs — 少爺可視化 QA 介面）───────────────────────────

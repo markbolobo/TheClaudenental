@@ -1480,6 +1480,26 @@ const TC_SETTINGS_SCHEMA = [
     ],
     hint: '強制態：設定後蓋過 Claude 建 run 時帶的模式；「跟隨」= 交回 Claude 依 run 性質決定',
   },
+  {
+    group: 'Marker',
+    key: 'marker.defaultDailyTime',
+    label: '每日行程預設時刻',
+    type: 'time',
+    placeholder: '23:30',
+    hint: '預設（未設＝23:30）：夜間語意標籤與新建的每日誓約（如知識訂閱）都對齊這個時刻；個別誓約可在 Marker 面板各自改',
+  },
+  {
+    group: '侍酒師',
+    key: 'decision.explainModel',
+    label: '待定奪「進一步說明」使用的模型',
+    type: 'select',
+    options: [
+      { value: null,     label: 'Sonnet（預設：說明完整、約 30–60 秒）' },
+      { value: 'opus',   label: 'Opus（最深入、較慢較貴）' },
+      { value: 'haiku',  label: 'Haiku（最快最便宜、說明較淺）' },
+    ],
+    hint: '只影響之後產生的說明；已快取的說明不會重算，題目內容改過或按「↻ 重新說明」才會用新模型',
+  },
 ]
 
 function TcSettingsModal({ onClose }) {
@@ -1530,6 +1550,17 @@ function TcSettingsModal({ onClose }) {
                       <option key={String(o.value)} value={o.value === null ? '__unset__' : String(o.value)}>{o.label}</option>
                     ))}
                   </select>
+                )}
+                {s.type === 'time' && (
+                  <div className="flex items-center gap-2">
+                    <input type="time"
+                      value={settings[s.key] ?? s.placeholder ?? ''}
+                      onChange={e => e.target.value && patch(s.key, e.target.value)}
+                      className="text-[11px] bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-[var(--text)]" />
+                    {settings[s.key] !== undefined && (
+                      <button onClick={() => patch(s.key, null)} className="text-[9px] text-[var(--text-muted)] hover:text-[var(--gold)]">回預設</button>
+                    )}
+                  </div>
                 )}
                 {s.hint && <div className="text-[9px] text-[var(--text-muted)] mt-1">{s.hint}</div>}
               </div>
@@ -2343,6 +2374,13 @@ export default function App() {
     if (msg.type === 'git_autocommit_result') {
       try { window.dispatchEvent(new CustomEvent('tc-git-autocommit', { detail: msg })) } catch {}
       if (msg.projectId === 'tc' && msg.result) setTcCommitPopup(msg.result)
+    }
+    // 侍酒師重萃取完成／待定奪子任務綁定（少爺 2026-09-29 待定奪面板）：轉發給 Sommelier 就地重抓
+    if (msg.type === 'sommelier_refreshed') {
+      try { window.dispatchEvent(new CustomEvent('tc-sommelier-refreshed', { detail: { projectId: msg.projectId, ok: msg.ok } })) } catch { /* 舊瀏覽器 */ }
+    }
+    if (msg.type === 'decision_dispatch_update') {
+      try { window.dispatchEvent(new CustomEvent('tc-decision-dispatch-update', { detail: { projectId: msg.projectId } })) } catch { /* 舊瀏覽器 */ }
     }
     // 模型目錄更新（少爺 2026-08-15）：server 每日重掃或手動 refresh 後推來，選單與價目就地換新
     if (msg.type === 'model_catalog') {

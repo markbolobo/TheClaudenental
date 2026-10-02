@@ -2,8 +2,10 @@ import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { useModelOptions, EFFORT_OPTIONS } from './modelOptions.js'
 import { confirmIfLiveInteractive, fetchLiveInteractiveIds } from './liveSessionGuard.js'
 import { WorkflowLauncher } from './WorkflowLauncher.jsx'
-import { ScenarioView } from './ScenarioView.jsx'
+import { ScenarioView, RichText } from './ScenarioView.jsx'
 import { scenarioKey, SCENARIO_NEW_KEY, scenarioPromptLines, newScenarioPromptLines } from './scenarioPrompt.js'
+import { DecisionDeck, DecisionViewToggle, DerivedReview, SudokuSolveButton } from './DecisionDeck.jsx'
+import { intentDeckItems, intentDerivedItems, loadDecisionView, saveDecisionView } from './decisionSupport.js'
 
 // ─── Sommelier 侍酒師 — 專案名詞圖鑑(P0:C++ 骨架層 + P1:選件購物車)─────────
 // 室內設計圖式層級瀏覽:模組 → 種類 → 類別 → (pragma region 分節的)成員。
@@ -390,7 +392,7 @@ function MemoryView({ memory, projectId, query, jumpName, onJumpToSymbol, onJump
 const intentKey = (pid, intentId) => `${pid}:intent:${intentId}`
 
 // 🧭 設計脈絡視圖 — design_intent/*.md：機制的意圖 / 不變量 / 狀態機 / 清理責任 / 驗收 / 事故史；引用符號 / canvas / 拼圖可跳
-function IntentView({ designIntent, projectId, query, initialId, onJumpToSymbol, onJumpToCanvas, onJumpToMemory, cartKeys, onToggleIntentCart, intentScenarioIndex = {}, onJumpToScenario = null }) {
+function IntentView({ designIntent, projectId, query, initialId, onJumpToSymbol, onJumpToCanvas, onJumpToMemory, cartKeys, onToggleIntentCart, intentScenarioIndex = {}, onJumpToScenario = null, onGoToChat = null, onReload = null }) {
   const intents = designIntent?.intents ?? []
   const [intentId, setIntentId] = useState(initialId ?? null)
   useEffect(() => { if (initialId) setIntentId(initialId) }, [initialId])
@@ -407,6 +409,17 @@ function IntentView({ designIntent, projectId, query, initialId, onJumpToSymbol,
     }
     return g
   }, [intents, query])
+
+  // ⬜ 待定奪面板（少爺 2026-09-29）：預設面板、舊清單可切；總覽＝全部未定案，細節頁＝本機制的
+  const [decisionView, setDecisionView] = useState(loadDecisionView)
+  const changeDecisionView = (v) => { setDecisionView(v); saveDecisionView(v) }
+  const allDeckItems = useMemo(() => intentDeckItems(projectId, designIntent?.intents), [projectId, designIntent])
+  const detailDeckItems = useMemo(() => allDeckItems.filter(x => x.sourceId === intentId), [allDeckItems, intentId])
+  const allDerivedItems = useMemo(() => intentDerivedItems(projectId, designIntent?.intents), [projectId, designIntent])
+  const detailDerivedItems = useMemo(() => allDerivedItems.filter(x => x.sourceId === intentId), [allDerivedItems, intentId])
+  // 連動題可能在另一層：意圖就地切換、情境跳情境體驗
+  const jumpToDecisionSource = (x) => { if (x.layer === 'intent') setIntentId(x.sourceId); else onJumpToScenario?.(x.sourceId) }
+  const rich = (t) => <RichText text={t} onJumpToIntent={setIntentId} onJumpToScenario={onJumpToScenario} onJumpToMemory={onJumpToMemory} intentTitle={(id) => byId.get(id)?.title ?? id} />
 
   const it = intentId ? byId.get(intentId) : null
 
@@ -455,12 +468,19 @@ function IntentView({ designIntent, projectId, query, initialId, onJumpToSymbol,
       <div className="flex-1 overflow-y-auto p-3 min-w-0">
         {intentId === '__ALL_OPEN__' ? (
           <div className="max-w-4xl space-y-3">
-            <div className="text-[var(--gold)] text-sm">⬜ 待定奪總覽 — 需要你決策的開放問題</div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <div className="text-[var(--gold)] text-sm flex-1">⬜ 待定奪總覽 — 需要你決策的開放問題</div>
+              <SudokuSolveButton projectId={projectId} onGoToChat={onGoToChat} />
+              <DecisionViewToggle view={decisionView} onChange={changeDecisionView} />
+            </div>
             <p className="text-[10px] text-[var(--text-muted)] leading-relaxed">
               這裡只放<b>我不能自行決定</b>的事（設計取捨／要不要做／哪個方案）。可以自己驗證的項目留在各機制的不變量未勾處，那是我的工作。
               做到某個機制時，該機制的待定奪會在它自己的頁面一併出現，順帶問掉就好。
             </p>
-            {intents.flatMap(x => (x.openDecisions ?? []).filter(d => !d.resolved).map(d => ({ ...d, _intent: x })))
+            <DerivedReview items={allDerivedItems} projectId={projectId} rich={rich} onJumpToSource={jumpToDecisionSource} />
+            {decisionView === 'deck' ? (
+              <DecisionDeck items={allDeckItems} projectId={projectId} rich={rich} onJumpToSource={jumpToDecisionSource} onGoToChat={onGoToChat} onReload={onReload} />
+            ) : intents.flatMap(x => (x.openDecisions ?? []).filter(d => !d.resolved).map(d => ({ ...d, _intent: x })))
               .map((d, i) => (
                 <div key={i} className="border border-amber-400/30 rounded p-2 space-y-1">
                   <div className="flex items-center gap-2 flex-wrap">
@@ -518,8 +538,15 @@ function IntentView({ designIntent, projectId, query, initialId, onJumpToSymbol,
 
             {(it.openDecisions ?? []).length > 0 && (
               <div className="space-y-1">
-                <div className="text-[9px] uppercase tracking-widest text-amber-400/80">⬜ 待定奪（需要你決策）</div>
-                {it.openDecisions.map(d => (
+                <div className="flex items-center gap-2">
+                  <div className="text-[9px] uppercase tracking-widest text-amber-400/80">⬜ 待定奪（需要你決策）</div>
+                  <DecisionViewToggle view={decisionView} onChange={changeDecisionView} />
+                </div>
+                <DerivedReview items={detailDerivedItems} projectId={projectId} rich={rich} onJumpToSource={jumpToDecisionSource} />
+                {decisionView === 'deck' && detailDeckItems.length > 0 && (
+                  <DecisionDeck items={detailDeckItems} projectId={projectId} rich={rich} showSource={false} onJumpToSource={jumpToDecisionSource} onGoToChat={onGoToChat} onReload={onReload} />
+                )}
+                {it.openDecisions.filter(d => decisionView === 'list' || (d.resolved && d.resolvedBy !== 'derived')).map(d => (
                   <div key={d.id} className={`border rounded p-2 space-y-1 ${d.resolved ? 'border-[var(--border)] opacity-60' : 'border-amber-400/30'}`}>
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className={`text-[9px] px-1.5 py-0.5 rounded ${d.resolved ? 'bg-emerald-500/20 text-emerald-300' : 'bg-amber-400/20 text-amber-300'}`}>{d.resolved ? '✓ 已定' : d.id}</span>
@@ -810,6 +837,24 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
       })
       .catch(e => { setLoading(false); setError(String(e)) })
   }, [projectId])
+
+  // 靜默重抓（不閃「讀取名詞圖鑑…」）：server 重萃取完成會廣播 sommelier_refreshed（待定奪送出、子任務刷新、面板 ↻）
+  const reloadData = useCallback(() => {
+    if (!projectId) return
+    fetch(`/api/sommelier/data/${projectId}`).then(r => r.json()).then(d => { if (d.ok) setPayload(d) }).catch(() => {})
+  }, [projectId])
+  useEffect(() => {
+    const onRefreshed = (e) => { if (e.detail?.projectId === projectId) reloadData() }
+    window.addEventListener('tc-sommelier-refreshed', onRefreshed)
+    return () => window.removeEventListener('tc-sommelier-refreshed', onRefreshed)
+  }, [projectId, reloadData])
+  // 待定奪面板的 ↻：md 被別的聊天室改過而萃取資料還舊 → 請 server 非同步重萃取，完成後自動重抓
+  const refreshDecisionData = useCallback(() => {
+    if (!projectId) return
+    fetch(`/api/sommelier/refresh-async/${projectId}`, { method: 'POST' }).then(r => r.json())
+      .then(d => flash(d.ok ? '⟳ 侍酒師重新萃取中——完成後題目自動更新' : `重新萃取失敗：${d.error ?? ''}`, 4000))
+      .catch(() => flash('重新萃取失敗', 4000))
+  }, [projectId, flash])
 
   // ── 鍵盤動線:Esc 關條目/購物車回到查詢、/ 聚焦搜尋框 ──
   useEffect(() => {
@@ -1184,11 +1229,13 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
           <IntentView designIntent={designIntent} projectId={projectId} query={query} initialId={intentJumpId}
             onJumpToSymbol={jumpToSymbol} onJumpToCanvas={jumpToCanvas} onJumpToMemory={jumpToMemoryNote}
             cartKeys={cartKeys} onToggleIntentCart={toggleCartIntent}
-            intentScenarioIndex={intentScenarioIndex} onJumpToScenario={jumpToScenario} />
+            intentScenarioIndex={intentScenarioIndex} onJumpToScenario={jumpToScenario}
+            onGoToChat={onGoToChat} onReload={refreshDecisionData} />
         ) : mode === 'scenario' ? (
           <ScenarioView scenario={scenario} designIntent={designIntent} projectId={projectId} query={query} initialId={scenarioJumpId}
             onJumpToIntent={jumpToIntent} onJumpToMemory={jumpToMemoryNote}
-            cartKeys={cartKeys} onToggleScenarioCart={toggleCartScenario} onToggleNewScenarioCart={toggleCartNewScenario} />
+            cartKeys={cartKeys} onToggleScenarioCart={toggleCartScenario} onToggleNewScenarioCart={toggleCartNewScenario}
+            onGoToChat={onGoToChat} onReload={refreshDecisionData} />
         ) : mode === 'asset' ? (
           <AssetView assetGraph={assetGraph} projectId={projectId} query={query} onJumpToSymbol={jumpToSymbol}
             cartKeys={cartKeys} onToggleBpCart={toggleCartBp} />
