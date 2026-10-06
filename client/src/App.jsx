@@ -1500,6 +1500,54 @@ const TC_SETTINGS_SCHEMA = [
     ],
     hint: '只影響之後產生的說明；已快取的說明不會重算，題目內容改過或按「↻ 重新說明」才會用新模型',
   },
+  {
+    group: '陪聊與直投',
+    key: 'delivery.directPipe',
+    label: '做法 B：直接投進 VS Code 分頁',
+    type: 'select',
+    options: [
+      { value: null,  label: '開啟（預設）：分頁已登記就直投，忙碌＝回合中送達、閒置＝當場開新回合' },
+      { value: false, label: '關閉：一律走既有的監看聯動／無頭進程' },
+    ],
+    hint: '影響 TC 聊天室／侍酒師送訊息與 QA 動作的投遞；直投失敗時會自動退回既有路線',
+  },
+  {
+    group: '陪聊與直投',
+    key: 'companion.model',
+    label: '陪聊使用的模型',
+    type: 'select',
+    options: [
+      { value: null,    label: 'Sonnet（預設：實測第二句起首字約 1–2 秒）' },
+      { value: 'haiku', label: 'Haiku（最快最省、想法整理較淺）' },
+      { value: 'opus',  label: 'Opus（最深入、回應較慢）' },
+    ],
+    hint: '下一次陪聊啟動時生效（關掉面板閒置後、或按 ↺ 重新開始）',
+  },
+  {
+    group: '陪聊與直投',
+    key: 'companion.effort',
+    label: '陪聊的模型強度',
+    type: 'select',
+    options: [
+      { value: null,     label: '預設' },
+      { value: 'low',    label: '低（回應最快）' },
+      { value: 'medium', label: '中' },
+      { value: 'high',   label: '高（想得較深、回應較慢）' },
+    ],
+  },
+  {
+    group: '陪聊與直投',
+    key: 'companion.idleMinutes',
+    label: '陪聊閒置多久後休息',
+    type: 'select',
+    options: [
+      { value: null, label: '15 分鐘（預設）' },
+      { value: 5,    label: '5 分鐘' },
+      { value: 30,   label: '30 分鐘' },
+      { value: 60,   label: '60 分鐘' },
+    ],
+    hint: '休息＝結束常駐進程；對話與想法板都保留，下次說話會自動接上',
+  },
 ]
 
 function TcSettingsModal({ onClose }) {
@@ -2356,6 +2404,16 @@ export default function App() {
     // AutoQA Monitor：轉發給 QAMonitorPanel（decoupled，不佔 App state）
     if (msg.type === 'qa_run_update') {
       try { window.dispatchEvent(new CustomEvent('tc-qa-run-update', { detail: msg.run })) } catch {}
+    }
+    // 🗣 陪聊（少爺 2026-10-04）：狀態／串流文字給 CompanionPanel，購物車事件給 SommelierPanel
+    if (msg.type === 'companion_update') {
+      try { window.dispatchEvent(new CustomEvent('tc-companion-update', { detail: { key: msg.key, state: msg.state } })) } catch { /* 舊瀏覽器 */ }
+    }
+    if (msg.type === 'companion_delta') {
+      try { window.dispatchEvent(new CustomEvent('tc-companion-delta', { detail: { key: msg.key, msgId: msg.msgId, text: msg.text, status: msg.status } })) } catch { /* 舊瀏覽器 */ }
+    }
+    if (msg.type === 'companion_cart') {
+      try { window.dispatchEvent(new CustomEvent('tc-companion-cart', { detail: { key: msg.key, projectId: msg.projectId, add: msg.add ?? [], remove: msg.remove ?? [] } })) } catch { /* 舊瀏覽器 */ }
     }
     // 打包進度：同樣轉發給 QAMonitorPanel（少爺 2026-08-04 打包控制列）
     if (msg.type === 'package_update') {

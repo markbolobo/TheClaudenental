@@ -5,10 +5,13 @@ import * as OpenCC from 'opencc-js'
 import fs from 'fs'
 import path from 'path'
 import { spawnSync, spawn } from 'child_process'
+import net from 'net'
 import os from 'os'
 import crypto from 'crypto'
 import { buildCatalog, getCatalog, priceFor, catalogFingerprint } from './modelCatalog.js'
 import { claudeVersionFromPath, compareClaudeVersion } from './modelPushSource.js'
+import { createLaneRegistry, createRefCountSet } from './claudeLanes.js'
+import { commentIntendsClose, transitionCancelsArm, canArmInStatus } from './qaCloseArm.js'
 
 const PORT = 3001
 const CLAUDIA_URL = 'http://localhost:48901'
@@ -54,9 +57,9 @@ const sessions           = new Map()   // sessionId → Session
 const clients            = new Set()   // WebSocket clients
 const pendingPermissions = new Map()   // permId → { resolve, timer, sessionId }
 const logHistory         = []          // all log entries, capped at 500
-const claudeProcs        = new Map()   // projectPath → { proc, sessionId, status }
+const claudeLanes        = createLaneRegistry()   // 無頭聊天室執行道：一個聊天室一條道，跨聊天室並行（claudeLanes.js）
 const subprocessSids     = new Set()   // session_ids spawned by us (filtered from sessions list)
-const pendingSpawnCwds   = new Set()   // project paths currently spawning (pre-registers before init event)
+const pendingSpawnCwds   = createRefCountSet()   // project paths currently spawning (pre-registers before init event)；同 cwd 可並行多個，計數歸零才移除
 const monitorHeartbeats  = new Map()   // sessionId → last Watch-QAComments heartbeat ms（監看存活的 VERIFIED 證據）
 
 // 監看存活 = 最後心跳在 MONITOR_ALIVE_MS 內（Watch-QAComments 輪詢 5s，20s 容 3 拍遺失不誤判死）
@@ -86,8 +89,8 @@ function isMonitorAlive(sessionId) {
 const CLAUDE_SESSIONS_DIR = path.join(os.homedir(), '.claude', 'sessions')
 const LIVE_SESSIONS_TTL_MS = 2000
 let _liveSessionsCache = { ts: 0, map: new Map() }
-function readLiveSessions() {
-  if (Date.now() - _liveSessionsCache.ts < LIVE_SESSIONS_TTL_MS) return _liveSessionsCache.map
+function readLiveSessions(InFresh = false) {
+  if (!InFresh && Date.now() - _liveSessionsCache.ts < LIVE_SESSIONS_TTL_MS) return _liveSessionsCache.map
   const _map = new Map()
   try {
     for (const _f of fs.readdirSync(CLAUDE_SESSIONS_DIR)) {
@@ -138,6 +141,7 @@ const sessionInbox = new Map()   // sessionId → [{ id, ts, kind, text }]
 const INBOX_MAX = 50
 const INBOX_TTL_MS = 30 * 60 * 1000
 const _autoMountInjectedAt = new Map()   // sessionId → 上次注入「補掛監看」的時間（節流）
+const _ccmsgInjectedAt = new Map()       // sessionId → 上次注入「直投登記」的時間（節流）
 const AUTO_MOUNT_THROTTLE_MS = 10 * 60 * 1000
 function pushSessionInbox(sessionId, kind, text) {
   if (!sessionId) return null
@@ -149,6 +153,166 @@ function pushSessionInbox(sessionId, kind, text) {
   logEvent('tc.inbox.push', { sessionId, kind, len: _item.text.length })
   return _item
 }
+
+// ─── 做法 B：直投活分頁（Claude Code 官方跨工作階段收件管道）──────────────────────
+// 少爺 2026-10-04「實測TC做法B」。官方文件 cross-session-messaging §The session's inbox socket：收件位址
+// （Windows＝具名管道）＋第一行 auth（Windows 必帶）＋user 訊框。實測（2.1.286、VS Code、bypass 模式）：
+// 分頁忙碌＝下一次工具結果後注入、閒置＝當場開新回合；錯權杖／沒授權行＝立即斷線、零送達。
+// 權杖用分頁匯出的 CLAUDE_CODE_MESSAGING_TOKEN（官方「自己的子程序」驗證路徑，bypass 分頁不會被扣住）——
+// 由 hook 以標頭帶來登記；只放記憶體與本機檔，絕不進事件紀錄、廣播或 API 回應。
+// 規格與實測：memory project_spec_tc_companion.md、.agent/knowledge/bettercallgpt_解析.md §六。
+const CCMSG_REGISTRY_FILE = path.join(os.homedir(), '.claude', 'tc_ccmsg_registry.json')
+const CCMSG_CONNECT_TIMEOUT_MS = 5000
+const CCMSG_RECEIPT_WAIT_MS = 3200
+const ccmsgRegistry = new Map()   // sessionId → { socket, token, pid, ts }
+try {
+  for (const [_sid, _e] of Object.entries(JSON.parse(fs.readFileSync(CCMSG_REGISTRY_FILE, 'utf-8')))) {
+    if (_e?.socket && _e?.token) ccmsgRegistry.set(_sid, _e)
+  }
+} catch {}
+function persistCcmsgRegistry() {
+  try { atomicWriteJson(CCMSG_REGISTRY_FILE, Object.fromEntries(ccmsgRegistry)) } catch {}
+}
+
+/** 登記直投：只收「本機註冊表上活著的互動分頁、且收件位址與註冊表一致」者 */
+function ccmsgRegister(InSessionId, InSocket, InToken, InSource) {
+  if (!InSessionId || !InSocket || !InToken) return false
+  const _live = readLiveSessions(true).get(InSessionId)
+  if (!_live || _live.kind !== 'interactive' || _live.messagingSocketPath !== InSocket) return false
+  const _prev = ccmsgRegistry.get(InSessionId)
+  if (_prev?.socket === InSocket && _prev?.token === InToken) { _prev.ts = Date.now(); return true }
+  ccmsgRegistry.set(InSessionId, { socket: InSocket, token: InToken, pid: _live.pid, ts: Date.now() })
+  persistCcmsgRegistry()
+  logEvent('tc.ccmsg.register', { sessionId: InSessionId, source: InSource, pid: _live.pid })
+  return true
+}
+
+/** hook 標頭帶來的登記（SessionStart／UserPromptSubmit／Stop 共用） */
+function ccmsgRegisterFromHook(InSessionId, InRequest) {
+  const _socket = InRequest?.headers?.['x-cc-msg-socket']
+  const _token = InRequest?.headers?.['x-cc-msg-token']
+  if (_socket && _token) ccmsgRegister(InSessionId, String(_socket), String(_token), 'hook')
+}
+
+/** 能不能直投：已登記＋分頁活著＋收件位址沒換（/clear、resume 換對話、PID 回收都會換位址） */
+function ccmsgTarget(InSessionId) {
+  const _e = InSessionId ? ccmsgRegistry.get(InSessionId) : null
+  if (!_e) return null
+  const _live = readLiveSessions().get(InSessionId)
+  if (!_live || _live.messagingSocketPath !== _e.socket) return null
+  return _e
+}
+function isDirectPipeEnabled() { return getTcSetting('delivery.directPipe', true) !== false }
+function ccmsgAvailable(InSessionId) { return isDirectPipeEnabled() && !!ccmsgTarget(InSessionId) }
+
+/** 投一則訊息，回報走到哪一步。寫出第一個位元組後永不重送（對方可能已照做——一句話跟按鍵一樣收不回） */
+function ccmsgPost(InSessionId, InText, { priority = '', kind = 'tc' } = {}) {
+  return new Promise((resolve) => {
+    const _target = ccmsgTarget(InSessionId)
+    const _tag = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+    const _report = { ok: false, sessionId: InSessionId, tag: _tag, state: 'not_sent', drained: false, error: '' }
+    if (!_target) { _report.error = 'not_registered_or_stale'; resolve(_report); return }
+    const _frame = { type: 'user', message: { role: 'user', content: `${InText}\n⟨tc#${_tag}⟩` }, session_id: InSessionId, from: 'TheClaudenental' }
+    if (priority) _frame.priority = priority
+    const _payload = `${JSON.stringify({ type: 'auth', token: _target.token })}\n${JSON.stringify(_frame)}\n`
+    let _settled = false
+    const _sock = net.connect({ path: _target.socket })
+    const _finish = () => {
+      if (_settled) return
+      _settled = true
+      clearTimeout(_timer)
+      resolve(_report)
+    }
+    const _timer = setTimeout(() => {
+      if (!_report.error) _report.error = 'timeout'
+      try { _sock.destroy() } catch {}
+      _finish()
+    }, CCMSG_CONNECT_TIMEOUT_MS)
+    _sock.on('connect', () => {
+      _report.state = 'posting'
+      _sock.write(_payload, (InErr) => {
+        if (InErr) { _report.state = 'post_unknown'; _report.error = String(InErr.code ?? InErr.message); return }
+        _report.state = 'posted'
+        _report.ok = true
+        _sock.end()
+      })
+    })
+    _sock.on('data', () => {})
+    _sock.on('error', (InErr) => {
+      _report.error = String(InErr.code ?? InErr.message)
+      if (_report.state === 'posting') _report.state = 'post_unknown'
+    })
+    _sock.on('close', () => {
+      if (_report.state === 'posted') _report.drained = true
+      _finish()
+    })
+  }).then((InReport) => {
+    logEvent('tc.ccmsg.post', { sessionId: InSessionId, kind, tag: InReport.tag, state: InReport.state, drained: InReport.drained, error: InReport.error || null, len: String(InText ?? '').length })
+    return InReport
+  })
+}
+
+/** 收據階梯（實測 2.1.286）：enqueue＝收到；queued_command 附件或 user 字串＝已進模型（回合中注入／開新回合）；
+ *  其後的 assistant＝處理中；end_turn＝回合結束。讀不到＝unknown，永不當成閒置 */
+function ccmsgReceipt(InSessionId, InTag) {
+  const _fp = InSessionId ? findJsonlPath(InSessionId) : null
+  if (!_fp || !InTag) return { stage: 'unknown', at: null }
+  let _text = ''
+  try {
+    const _size = fs.statSync(_fp).size
+    const _len = Math.min(_size, 512 * 1024)
+    const _fd = fs.openSync(_fp, 'r')
+    const _buf = Buffer.alloc(_len)
+    fs.readSync(_fd, _buf, 0, _len, _size - _len)
+    fs.closeSync(_fd)
+    _text = _buf.toString('utf8')
+  } catch { return { stage: 'unknown', at: null } }
+  const _needle = `⟨tc#${InTag}⟩`
+  let _stage = 'none', _at = null, _consumed = false
+  for (const _line of _text.split('\n')) {
+    if (!_line) continue
+    if (_line.includes(_needle)) {
+      let _o
+      try { _o = JSON.parse(_line) } catch { continue }
+      if (_o.type === 'queue-operation' && _o.operation === 'enqueue' && _stage === 'none') { _stage = 'received'; _at = _o.timestamp }
+      else if ((_o.type === 'attachment' && _o.attachment?.type === 'queued_command') || (_o.type === 'user' && typeof _o.message?.content === 'string')) {
+        _stage = 'consumed'; _at = _o.timestamp; _consumed = true
+      }
+      continue
+    }
+    if (!_consumed || !_line.includes('"type":"assistant"')) continue
+    if (_stage === 'consumed') _stage = 'processing'
+    if (_line.includes('"stop_reason":"end_turn"')) _stage = 'done'
+  }
+  return { stage: _stage, at: _at }
+}
+
+/** 投遞＋等收據（最多約 3 秒）；沒收據也不重送，只回報讓呼叫端上牆 */
+async function ccmsgPostVerified(InSessionId, InText, InOpts = {}) {
+  const _report = await ccmsgPost(InSessionId, InText, InOpts)
+  if (!_report.ok) return _report
+  const _deadline = Date.now() + CCMSG_RECEIPT_WAIT_MS
+  while (Date.now() < _deadline) {
+    await new Promise(res => setTimeout(res, 400))
+    const _rc = ccmsgReceipt(InSessionId, _report.tag)
+    if (_rc.stage !== 'none' && _rc.stage !== 'unknown') { _report.receipt = _rc.stage; return _report }
+  }
+  _report.receipt = 'none'
+  logEvent('tc.ccmsg.no_receipt', { sessionId: InSessionId, kind: InOpts.kind ?? 'tc', tag: _report.tag })
+  return _report
+}
+
+// 登記表清掃：分頁關掉或位址換掉的條目移除（權杖不留在已失效的條目裡）
+setInterval(() => {
+  let _dirty = false
+  const _live = readLiveSessions(true)
+  for (const [_sid, _e] of ccmsgRegistry) {
+    if (_live.get(_sid)?.messagingSocketPath === _e.socket) continue
+    ccmsgRegistry.delete(_sid)
+    _dirty = true
+  }
+  if (_dirty) persistCcmsgRegistry()
+}, 10 * 60 * 1000)
 
 // 解析真 python.exe 絕對路徑（少爺 2026-07-17：Monitor 非互動 shell 下裸 `python`＝WindowsApps store shim → exit 127；
 // 注入指令與監看掛載都需絕對路徑）。boot 解析一次快取；py launcher 問不到才退回裸 python。
@@ -268,13 +432,13 @@ function sweepGhostSessions(deep = false) {
         _changed++
       }
     }
-    // TC 出身聊天室回填（deep）：spawn 生命週期建檔機制上線前就存在的、或 cli 視窗喚醒（不經 claudeProcs）的，
+    // TC 出身聊天室回填（deep）：spawn 生命週期建檔機制上線前就存在的、或 cli 視窗喚醒（不經 claudeLanes）的，
     // 只要最近有真實對話就補進側欄（origin:'tc'、最初首句名）——少爺 2026-07-15「TC 出身一樣要顯示」
     if (deep) {
       for (const _sid of subprocessSids) {
         if (sessions.has(_sid)) continue
         const _fp = findJsonlPath(_sid)
-        if (!_fp) continue
+        if (!_fp || _fp.includes('tc-companion')) continue   // 陪聊的常駐進程不是聊天室
         let _lastTs = 0
         try {
           const _lines = fs.readFileSync(_fp, 'utf-8').split('\n').filter(Boolean)
@@ -449,6 +613,7 @@ app.post('/hook/SessionStart', async (request) => {
   const e = request.body
   logEvent('debug.sessionstart', e)  // 臨時診斷（少爺 2026-07-15 子代理辨識）：抓 payload 欄位，確認後移除
   forwardToClaudia(e, 'SessionStart')
+  ccmsgRegisterFromHook(e?.session_id, request)
   // Ignore sessions spawned by our own subprocess — they appear in Chat, not Sessions list
   // Check both confirmed session_ids and pending spawns (by cwd) to handle race condition
   const cwdNorm = (e.cwd ?? '').replace(/\\/g, '/').toLowerCase()
@@ -479,6 +644,7 @@ app.post('/hook/SessionStart', async (request) => {
 app.post('/hook/Stop', async (request) => {
   const e = request.body
   forwardToClaudia(e, 'Stop')
+  ccmsgRegisterFromHook(e?.session_id, request)
   if (subprocessSids.has(e.session_id) && !sessions.has(e.session_id)) return { ok: true }
   const reason = e.stop_reason ?? ''
   const isSleeping = reason === 'max_tokens'
@@ -603,16 +769,30 @@ app.post('/hook/UserPromptSubmitSync', async (request, reply) => {
   const e = request.body ?? {}
   const _sid = e.session_id
   if (!_sid) return ''
+  ccmsgRegisterFromHook(_sid, request)
   const _prompt = String(e.prompt ?? '')
   if (_prompt.startsWith('(TC')) return ''   // TC 自己的喚醒/通知 prompt 不注入
   // TC 自家無頭進程正在跑這個 session ＝ 這句不是少爺在互動介面打的
-  for (const [, _p] of claudeProcs) if (_p.sessionId === _sid && _p.status === 'running') return ''
+  if (claudeLanes.runningEntry(_sid)) return ''
+  // 做法 B 直投登記（少爺 2026-10-04）：hook 標頭自動登記只在新開的分頁生效（hook 指令啟動時載入）；
+  // 更早開著的分頁沒有標頭 → 注入一次「用 Bash 自行登記」（權杖只經環境變數傳給本機 TC，不回顯；節流 10 分鐘）
+  const _ccmsgNote = () => {
+    if (!isDirectPipeEnabled() || ccmsgTarget(_sid) || !isLiveInteractiveSession(_sid)) return ''
+    if (Date.now() - (_ccmsgInjectedAt.get(_sid) ?? 0) < AUTO_MOUNT_THROTTLE_MS) return ''
+    _ccmsgInjectedAt.set(_sid, Date.now())
+    logEvent('tc.ccmsg.register_injected', { sid: _sid })
+    return `(TC 直投登記) 這個分頁還沒登記 TC 直投（做法 B：TC 的訊息直接送進本分頁，不必靠監看）。` +
+      `請在處理少爺訊息前用 Bash 工具執行一次（不要印出或回顯權杖值）：` +
+      `curl -s -X POST -H "X-CC-Msg-Socket: $CLAUDE_CODE_MESSAGING_SOCKET" -H "X-CC-Msg-Token: $CLAUDE_CODE_MESSAGING_TOKEN" "http://127.0.0.1:3001/api/ccmsg/register?session=${_sid}"` +
+      `，回應 "ok":true 即完成，接著照常處理少爺的訊息。`
+  }
+  const _asContext = (InText) => InText ? { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: InText } } : ''
   // 監看心跳還在＝已原地聯動、不重掛（避免每句注入）；心跳斷才注入（涵蓋兩種：spawn run 首掛 + monitor 死掉重掛）
-  if (isMonitorAlive(_sid)) return ''
+  if (isMonitorAlive(_sid)) return _asContext(_ccmsgNote())
   // 少爺 2026-09-08「全部都要聯動」：原本要求「綁著未結案 QA run」才注入 → 沒開 run 的分頁永遠不會
   // 掛監看，TC 聊天室／侍酒師送進來的訊息就只能走無頭、分頁不動。改成活的互動分頁一律補掛（節流 10 分鐘）。
   if (!isLiveInteractiveSession(_sid)) return ''
-  if (Date.now() - (_autoMountInjectedAt.get(_sid) ?? 0) < AUTO_MOUNT_THROTTLE_MS) return ''
+  if (Date.now() - (_autoMountInjectedAt.get(_sid) ?? 0) < AUTO_MOUNT_THROTTLE_MS) return _asContext(_ccmsgNote())
   const _run = readQaRuns().runs.find(r =>
     r.boundSessionId === _sid && !r.archivedAt && !['closed', 'aborted'].includes(r.status))
   _autoMountInjectedAt.set(_sid, Date.now())
@@ -625,7 +805,8 @@ app.post('/hook/UserPromptSubmitSync', async (request, reply) => {
         `在掛上之前，少爺從 TC 聊天室／侍酒師送進來的訊息${_run ? `、以及 QA run「${_run.topic}」(${_run.id}) 的留言／▶／✔ 結案` : ''}都只會走無頭進程，這個分頁不會動。` +
         `請在處理少爺訊息前先用 Monitor 工具掛上（persistent=true）：command='${monitorMountCommand(_sid)}'` +
         (_run && _run.wakeMode !== 'monitor' ? `，掛好後 PATCH http://127.0.0.1:3001/api/qa/runs/${_run.id} body {"wakeMode":"monitor"}` : '') +
-        `。完成後照常處理少爺的訊息，並簡短告知已完成聯動設定。`,
+        `。完成後照常處理少爺的訊息，並簡短告知已完成聯動設定。` +
+        (() => { const _n = _ccmsgNote(); return _n ? `\n${_n}` : '' })(),
     },
   }
 })
@@ -656,9 +837,37 @@ app.get('/api/session-inbox', async (request) => {
   return { ok: true, session: _sid ?? null, items: _items, now: Date.now() }
 })
 
+// 做法 B 直投 API（少爺 2026-10-04）。權杖只從標頭進來、永不出現在任何回應。
+// 登記：分頁自己在 Bash 執行（子程序才有匯出的權杖）：
+//   curl -s -X POST -H "X-CC-Msg-Socket: $CLAUDE_CODE_MESSAGING_SOCKET" -H "X-CC-Msg-Token: $CLAUDE_CODE_MESSAGING_TOKEN" "http://127.0.0.1:3001/api/ccmsg/register?session=<sid>"
+app.post('/api/ccmsg/register', async (request) => {
+  const _sid = request.query?.session ?? request.body?.session ?? null
+  const _ok = ccmsgRegister(_sid, request.headers['x-cc-msg-socket'], request.headers['x-cc-msg-token'], 'manual')
+  return { ok: _ok, session: _sid, ...(_ok ? {} : { error: '分頁不在本機註冊表、不是互動分頁，或收件位址不符' }) }
+})
+app.get('/api/ccmsg/status', async (request) => {
+  const _sid = request.query?.session ?? null
+  const _e = _sid ? ccmsgRegistry.get(_sid) : null
+  return { ok: true, session: _sid, enabled: isDirectPipeEnabled(), registered: !!_e, live: !!ccmsgTarget(_sid), registeredAt: _e?.ts ?? null }
+})
+// 送一則（delayMs>0＝排程送，用來驗「分頁閒置時開新回合」）；priority 只收 now/next/later（官方未記載，預設不帶）
+app.post('/api/ccmsg/send', async (request) => {
+  const { session, text, priority, delayMs } = request.body ?? {}
+  if (!session || !text) return { ok: false, error: 'missing session/text' }
+  const _priority = ['now', 'next', 'later'].includes(priority) ? priority : ''
+  const _delay = Math.min(Math.max(Number(delayMs) || 0, 0), 10 * 60 * 1000)
+  if (_delay > 0) {
+    setTimeout(() => { ccmsgPostVerified(session, String(text), { priority: _priority, kind: 'send-delayed' }).catch(() => {}) }, _delay)
+    return { ok: true, scheduled: true, delayMs: _delay }
+  }
+  return await ccmsgPostVerified(session, String(text), { priority: _priority, kind: 'send' })
+})
+app.get('/api/ccmsg/receipt', async (request) => ({ ok: true, ...ccmsgReceipt(request.query?.session, request.query?.tag) }))
+
 app.post('/hook/UserPromptSubmit', async (request) => {
   const e = request.body
   forwardToClaudia(e, 'UserPromptSubmit')
+  ccmsgRegisterFromHook(e?.session_id, request)
   if (subprocessSids.has(e.session_id) && !sessions.has(e.session_id)) return { ok: true }
   const raw = e.prompt ?? ''
   // Strip leading XML system tags (e.g. <task-notification>, <system-reminder>)
@@ -685,7 +894,8 @@ app.post('/hook/UserPromptSubmit', async (request) => {
   // 對應 memory/project_tc_clean_tool_principle.md + auto_card_rules_schema.md
   // 規則由 ~/.claude/tc_user_config/auto_card_rules.json 控制（首次啟動 auto-copy）
   try {
-    if (clean) {
+    // TC 自己投進分頁的訊息（做法 B 直投帶 ⟨tc#…⟩ 標記、喚醒通知以「(TC」開頭）不是少爺的需求，不自動建卡
+    if (clean && !clean.startsWith('(TC') && !/⟨tc#[0-9a-z]+⟩/.test(raw)) {
       const rules = loadAutoCardRules()
       if (rules.enabled !== false) {
         const score = scoreTaskPrompt(clean, rules)
@@ -755,8 +965,7 @@ app.post('/api/session/relogin', async (request, reply) => {
     const _s = readLiveSessions().get(sessionId)
     return { ok: false, alreadyLive: true, error: `這個聊天室已經是活的互動分頁（${_s?.entrypoint === 'cli' ? '終端' : 'VS Code'}，pid ${_s?.pid}）——直接在那裡輸入即可；監看沒掛的話它會自動補掛` }
   }
-  const _running = [...claudeProcs.values()].find(e => e.sessionId === sessionId && e.status === 'running')
-  if (_running) return { ok: false, error: '這個聊天室正有 TC 的無頭進程在跑，等它結束再重新登入（否則雙寫 transcript）' }
+  if (claudeLanes.isSessionBusy(sessionId)) return { ok: false, error: '這個聊天室正有 TC 的無頭進程在跑，等它結束再重新登入（否則雙寫 transcript）' }
   const _cwd = path.normalize(String(projectPath || sessions.get(sessionId)?.cwd || 'C:\\Project\\RomanPrototype'))
   if (!fs.existsSync(_cwd)) { reply.code(400); return { ok: false, error: `專案路徑不存在：${_cwd}` } }
   const _exe = getClaudeExe()
@@ -1366,7 +1575,7 @@ function refreshHistoryIndex() {
     for (const proj of fs.readdirSync(projectsDir)) {
       const projPath = path.join(projectsDir, proj)
       if (!fs.statSync(projPath).isDirectory()) continue
-      if (proj.includes('tc-tagger')) continue   // 標籤器工作目錄不算聊天室
+      if (proj.includes('tc-tagger') || proj.includes('tc-companion')) continue   // 標籤器／陪聊的工作目錄不算聊天室
       for (const file of fs.readdirSync(projPath)) {
         if (!file.endsWith('.jsonl')) continue
         const sessionId = file.replace('.jsonl', '')
@@ -1801,8 +2010,7 @@ function parseNewLines(filePath, fromLine) {
 // 檔案監看再發一次＝同句話雙路上畫面（重複的架構性來源）。進程結束後恢復（外部寫入照常直播）。
 function emitSessionLive(sessionId, messages) {
   if (subprocessSids.has(sessionId)) {
-    for (const [, e] of claudeProcs)
-      if (e.sessionId === sessionId && e.status === 'running') return
+    if (claudeLanes.runningEntry(sessionId)) return
   }
   broadcast({ type: 'session_live', sessionId, messages })
 }
@@ -1993,21 +2201,35 @@ app.get('/api/logs', async (request) => {
 
 // Server side queue — 思考中送出時不 kill 上一個，自動排隊接續
 // （少爺 2026-04-27 報「我做的事讓對話中斷」根因 = spawnClaude 開頭的 kill existing）
-const claudeRunQueue = new Map()  // projectPath → array of { prompt, sessionId }
+// 少爺 2026-10-05：隊伍以聊天室為單位——只有「同一個聊天室已有進程在跑」才排隊，不同聊天室一律並行；
+// 新聊天室（沒有 session id）永不排隊。記帳在 claudeLanes.js。
 
-function processQueueIfIdle(projectPath) {
-  const existing = claudeProcs.get(projectPath)
-  if (existing?.status === 'running') return
-  const q = claudeRunQueue.get(projectPath)
-  if (!q || q.length === 0) return
-  const next = q.shift()
-  if (q.length === 0) claudeRunQueue.delete(projectPath)
-  // 用佇列裡的 sessionId（同 session 接續）；若空則用最後一個 entry 的
-  // 少爺 2026-08-06：newSession（仕酒師「開新聊天室」）明示要全新 session——不沿用前一個 entry 的 sessionId
-  const sid = next.newSession ? null : (next.sessionId ?? existing?.sessionId ?? null)
-  broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath),
-    event: { type: 'system', subtype: 'queue_dequeue', queueRemaining: q.length } })
-  spawnClaude(projectPath, next.prompt, sid, next.model ?? null, next.effort ?? null, next.onInit ?? null)
+/** 排進該聊天室自己的隊伍並通知前端；回傳 { pos, coalesced } */
+function enqueueSessionRun(InSessionId, InItem, InOpts = {}) {
+  const _r = claudeLanes.enqueue(InSessionId, InItem, InOpts)
+  broadcast({ type: 'claude_stream', projectPath: normalizePath(InItem.projectPath), sessionId: InSessionId,
+    event: { type: 'system', subtype: 'queue_enqueue', queuePos: _r.pos, coalesced: _r.coalesced } })
+  return _r
+}
+
+/** 該聊天室閒置時送出隊伍的下一則 */
+function processQueueIfIdle(InSessionId) {
+  const next = claudeLanes.dequeue(InSessionId)
+  if (!next) return
+  broadcast({ type: 'claude_stream', projectPath: normalizePath(next.projectPath), sessionId: InSessionId,
+    event: { type: 'system', subtype: 'queue_dequeue', queueRemaining: claudeLanes.queueLength(InSessionId) } })
+  spawnClaude(next.projectPath, next.prompt, InSessionId, next.model ?? null, next.effort ?? null, next.onInit ?? null)
+}
+
+/** 送一則給指定聊天室：該室忙碌就排進它自己的隊伍，閒置就直接起進程（跨聊天室並行）。
+ *  回傳 { queued:true, pos, coalesced } 或 { queued:false, entry } */
+function runOrQueueForSession(InProjectPath, InPrompt, InSessionId, InModel = null, InEffort = null, InOnInit = null, InOpts = {}) {
+  if (InSessionId && claudeLanes.isSessionBusy(InSessionId)) {
+    return { queued: true, ...enqueueSessionRun(InSessionId, { projectPath: InProjectPath, prompt: InPrompt, model: InModel, effort: InEffort, onInit: InOnInit }, InOpts) }
+  }
+  const _parallel = claudeLanes.runningInProject(InProjectPath)
+  if (_parallel.length) logEvent('claude.lane.parallel', { projectPath: normalizePath(InProjectPath), sessionId: InSessionId ?? null, alongside: _parallel.map(e => e.sessionId ?? e.laneKey) })
+  return { queued: false, entry: spawnClaude(InProjectPath, InPrompt, InSessionId, InModel, InEffort, InOnInit) }
 }
 
 // 少爺 2026-07-14：模型強度白名單（claude CLI --effort 支援值）
@@ -2035,11 +2257,14 @@ const QA_FLOW_DIRECTIVE = '\n\n(TC QA 流程) 少爺勾選了「啟用 QA 流程
 
 function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort = null, onInit = null, retryCount = 0) {
   // ⚠️ 不再 kill existing（會中斷使用者進行中的 thinking）
-  // 呼叫端必須先檢查 claudeProcs.get(projectPath)?.status，running 時 push 到 queue 而非呼叫 spawnClaude
+  // 續聊既有聊天室一律經 runOrQueueForSession（同室忙碌要排隊）；直接呼叫本函式＝開新聊天室或確定該室閒置
 
   // Pre-register before spawn so SessionStart hook can filter by cwd (race condition fix)
+  // 計數式：同 cwd 並行多個時，各自在 init 或結束時釋放一次（沒拿到 init 就結束也要釋放，否則該 cwd 的分頁永遠被當成子進程）
   const normalCwd = projectPath.replace(/\\/g, '/').toLowerCase()
   pendingSpawnCwds.add(normalCwd)
+  let _cwdReleased = false
+  const _releaseCwd = () => { if (_cwdReleased) return; _cwdReleased = true; pendingSpawnCwds.delete(normalCwd) }
 
   const args = [
     '--output-format', 'stream-json',
@@ -2056,7 +2281,9 @@ function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort
   // CLI 會把 prompt enqueue 進 transcript 後無人消費地退出（2026-07-17 close 喚醒石沉實錄）——
   // 那種進程 exit 0 但零 assistant 產出，靠這旗標識別。
   const entry = { proc, sessionId, projectPath, status: 'running', model, effort, sawAssistant: false }
-  claudeProcs.set(projectPath, entry)
+  claudeLanes.register(entry)
+  // 石沉重試的空窗由本進程接手（重試前視同忙碌的保留到此為止）
+  if (sessionId) claudeLanes.unhold(sessionId)
 
   // 少爺 2026-07-14：spawn 參數可觀察化——落 log + 推 Chat 面板顯示（effort 在 init/transcript 皆無痕跡，這裡是唯一觀察點）
   if (model || effort) {
@@ -2081,10 +2308,10 @@ function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort
         const event = JSON.parse(line)
         // Capture session_id from init + mark as subprocess session
         if (event.type === 'system' && event.subtype === 'init') {
-          entry.sessionId = event.session_id
+          claudeLanes.adopt(entry, event.session_id)
           subprocessSids.add(event.session_id)
           persistSubprocessSids()
-          pendingSpawnCwds.delete(normalCwd)
+          _releaseCwd()
           // 新聊天室的 model/effort 選擇在拿到 session id 後記成偏好，續聊/QA 喚醒沿用
           setSessionPrefs(event.session_id, entry.model ?? null, entry.effort ?? null)
           // TC 出身聊天室進 Sessions 側欄（少爺 2026-07-15 拍板）：建檔由 spawn 生命週期做（hook 對
@@ -2117,30 +2344,40 @@ function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort
   proc.stderr.setEncoding('utf-8')
   proc.stderr.on('data', chunk => {
     const text = String(chunk).trim()
-    if (text) broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath), event: { type: 'stderr', text } })
+    // 帶 sessionId：同專案多室並行時，前端才分得出是哪一室的輸出
+    if (text) broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath), sessionId: entry.sessionId ?? null, event: { type: 'stderr', text } })
   })
 
   proc.on('close', code => {
     entry.status = 'done'
-    broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath), event: { type: 'done', exitCode: code } })
+    _releaseCwd()
+    // 帶 sessionId：沒帶的 done 會讓同專案每個聊天室面板都以為自己跑完了
+    broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath), sessionId: entry.sessionId ?? null, event: { type: 'done', exitCode: code } })
     // 側欄的 TC 聊天室轉 done（閒置 20 分鐘後自動退場）
     if (entry.sessionId && sessions.has(entry.sessionId)) setStatus(entry.sessionId, 'done')
-    setTimeout(() => { if (claudeProcs.get(projectPath) === entry) claudeProcs.delete(projectPath) }, 10_000)
+    setTimeout(() => claudeLanes.release(entry), 10_000)
     // 喚醒石沉偵測（少爺 2026-07-17「按結案沒反應」根治）：resume 進程零 assistant 產出＝prompt 被
     // enqueue 進 transcript 但無人消費（同 session 交接縫隙競態）→ 隔 8 秒重試一次（競態窗已過，
     // 重試幾乎必達）；重試仍石沉 → 綁定 run 標 undelivered 上牆，請少爺在聊天室說「請繼續」。
+    // 重試前的 8 秒該室視同忙碌（hold）：期間進來的請求排進該室隊伍，不搶進同一個縫隙。
     if (sessionId && !entry.sawAssistant) {
       logEvent('claude.headless.swallowed', { projectPath: normalizePath(projectPath), sessionId, exitCode: code, retryCount })
       if (retryCount < 1) {
+        claudeLanes.hold(sessionId)
         setTimeout(() => {
-          if (claudeProcs.get(projectPath)?.status === 'running') { markWakeUndelivered(sessionId); return }
+          // 正常不會有別的進程在同室跑（hold 期間都排隊）；萬一有，重試改排隊、不丟
+          if (claudeLanes.runningEntry(sessionId)) {
+            claudeLanes.unhold(sessionId)
+            enqueueSessionRun(sessionId, { projectPath, prompt, model, effort, onInit })
+            return
+          }
           spawnClaude(projectPath, prompt, sessionId, model, effort, onInit, retryCount + 1)
         }, 8000)
-      } else { markWakeUndelivered(sessionId); processQueueIfIdle(projectPath) }
+      } else { markWakeUndelivered(sessionId); processQueueIfIdle(sessionId) }
       return   // 首次石沉不觸發 queue 消化（重試在途，避免 queue 下一則撞同一縫隙）
     }
-    // 處理 queue 下一個（如果有）— 維持「直接送 + 不中斷」UX
-    processQueueIfIdle(projectPath)
+    // 處理該聊天室隊伍的下一則（如果有）— 維持「直接送 + 不中斷」UX
+    processQueueIfIdle(entry.sessionId)
   })
 
   return entry
@@ -2183,6 +2420,19 @@ app.post('/api/claude/run', async (request) => {
   // 少爺 2026-07-14：勾選啟用 QA 流程 → 需求尾端附掛 Mode C 指令
   if (qaFlow === true) fullPrompt += QA_FLOW_DIRECTIVE
 
+  // ⭐ 做法 B 直投優先（少爺 2026-10-04「實測TC做法B」）：分頁已登記直投 → 直接投進它的官方收件管道
+  //    （忙碌＝回合中注入、閒置＝當場開新回合），不必靠監看輪詢；投不出去（未登記／位址已換）才走下面既有的監看 inbox／無頭。
+  //    寫出位元組後一律不重送（post_unknown 也算已送）。總設定 delivery.directPipe=false 可關。
+  if (newSession !== true && sessionId && ccmsgAvailable(sessionId)) {
+    const _direct = await ccmsgPostVerified(sessionId, fullPrompt, { kind: 'chat' })
+    if (_direct.state === 'posted' || _direct.state === 'post_unknown') {
+      emitLog(sessionId, `[TC] 訊息已直投到 VS Code 分頁（做法 B，收據：${_direct.receipt ?? '不明'}）`, 'hook')
+      logEvent('tc.chat.delivered_direct', { sessionId, projectPath: normalizePath(projectPath), tag: _direct.tag, receipt: _direct.receipt ?? null })
+      if (tempFiles.length) setTimeout(() => { for (const f of tempFiles) try { fs.unlinkSync(f) } catch {} }, INBOX_TTL_MS)
+      return { ok: true, projectPath: normalizePath(projectPath), sessionId, delivered: 'direct', receipt: _direct.receipt ?? null }
+    }
+  }
+
   // ⭐ 原地聯動優先（少爺 2026-09-08「全部都要聯動」）：目標聊天室掛著活監看 → 投進 inbox 讓那個
   // VS Code 分頁原地處理，不 spawn 無頭（無頭恆不會讓已開的分頁動，且與分頁進程雙寫 transcript）。
   // 分頁的回應照樣寫進同一份 transcript，/api/session/watch 的 tail 會把畫面帶回 TC 聊天室面板。
@@ -2195,26 +2445,13 @@ app.post('/api/claude/run', async (request) => {
     return { ok: true, projectPath: normalizePath(projectPath), sessionId, delivered: 'monitor' }
   }
 
-  // 思考中（同 projectPath 已有 running process）→ push 到 queue，不 kill 上一個
-  // 少爺 2026-08-06：newSession=true（仕酒師「開新聊天室」）＝明示開全新聊天室——排隊時不得 fallback 沿用
-  // running 進程的 sessionId（否則新需求被併進忙碌中的既有聊天室；sessionId=null 的 fallback 只服務
-  // 「同聊天室接續但 client 尚未拿到 session id」的 ChatPanel 情境）
-  // 少爺 2026-09-11：newSession=true 完全跳過佇列，直接 spawn 獨立進程——每個侍酒師「開新聊天室」
-  // 都是獨立 session，不必等前一個結束。舊進程繼續跑、各自 broadcast stream event（sessionId 區分）。
+  // 該聊天室思考中 → 排進它自己的隊伍，不 kill 上一個；其他聊天室（含同專案）照樣並行（少爺 2026-10-05）。
+  // 沒帶 sessionId＝新聊天室，永不排隊、直接起獨立進程（少爺 2026-08-06／09-11 開新聊天室的規則一般化）；
+  // ChatPanel 新聊天室在 init 前的第二則由前端先留著、拿到 session id 才送（ChatPanel.jsx handleSend）。
   const _newSession = newSession === true
-  const existing = claudeProcs.get(projectPath)
-  if (existing?.status === 'running' && !_newSession) {
-    let q = claudeRunQueue.get(projectPath)
-    if (!q) { q = []; claudeRunQueue.set(projectPath, q) }
-    q.push({ prompt: fullPrompt, sessionId: _newSession ? null : (sessionId ?? existing.sessionId ?? null), newSession: _newSession, model: _model, effort: _effort })
-    broadcast({ type: 'claude_stream', projectPath: normalizePath(projectPath),
-      event: { type: 'system', subtype: 'queue_enqueue', queuePos: q.length, newSession: _newSession } })
-    return { ok: true, queued: true, queuePos: q.length }
-  }
-  if (_newSession && existing?.status === 'running') {
-    logEvent('tc.chat.concurrent_spawn', { projectPath: normalizePath(projectPath), existingSession: existing.sessionId ?? null })
-  }
-  const entry = spawnClaude(projectPath, fullPrompt, _newSession ? null : (sessionId ?? null), _model, _effort)
+  const _r = runOrQueueForSession(projectPath, fullPrompt, _newSession ? null : (sessionId ?? null), _model, _effort)
+  if (_r.queued) return { ok: true, queued: true, queuePos: _r.pos }
+  const entry = _r.entry
 
   // Clean up temp files after subprocess closes
   if (tempFiles.length) {
@@ -2226,16 +2463,21 @@ app.post('/api/claude/run', async (request) => {
   return { ok: true, projectPath: normalizePath(projectPath), sessionId: entry.sessionId }
 })
 
+// 停止＝停該聊天室的進程（同專案別室並行中的不受影響）；沒帶 sessionId＝停同專案還沒拿到 session id 的新聊天室
 app.post('/api/claude/stop', async (request) => {
-  const { projectPath } = request.body
-  const entry = claudeProcs.get(projectPath)
-  if (entry?.proc) try { entry.proc.kill(); entry.status = 'stopped' } catch {}
-  return { ok: true }
+  const { projectPath, sessionId } = request.body ?? {}
+  const _targets = sessionId
+    ? [claudeLanes.runningEntry(sessionId)].filter(Boolean)
+    : claudeLanes.pendingInitInProject(projectPath)
+  for (const entry of _targets) if (entry?.proc) try { entry.proc.kill(); entry.status = 'stopped' } catch {}
+  return { ok: true, stopped: _targets.length }
 })
 
+// 每室一列（並行時同專案會有多列）；Restart-TCServer.ps1 靠本 API 判斷有沒有無頭聊天室在跑
 app.get('/api/claude/processes', async () => ({
-  processes: [...claudeProcs.entries()].map(([p, e]) => ({
-    projectPath: p, sessionId: e.sessionId, status: e.status,
+  processes: claudeLanes.entries().map(e => ({
+    projectPath: e.projectPath, sessionId: e.sessionId ?? null, status: e.status,
+    queued: e.sessionId ? claudeLanes.queueLength(e.sessionId) : 0,
   }))
 }))
 
@@ -3857,10 +4099,7 @@ function triggerPackageFailureAnalysis(job) {
   try {
     const _cwd = 'C:\\Project\\RomanPrototype'
     if (!isSafeCwd(_cwd)) return
-    if (claudeProcs.get(_cwd)?.status === 'running') {
-      job.analysis = { state: 'skipped', reason: '該專案已有 Claude 進程執行中', at: Date.now() }
-      return
-    }
+    // 分析是開新聊天室、只讀 log 建 QA Run——與同專案其他聊天室並行，不因專案忙碌而跳過（少爺 2026-10-05）
 
     const _failed = job.results.filter(r => r.status === 'failed').map(r => `${r.target}(${r.reason})`).join('、')
       || `exit ${job.exitCode}`
@@ -4355,8 +4594,8 @@ app.post('/api/git/auto-commit', async (request, reply) => {
   const _root = gitRepoRoot(_proj)
   if (!_root || !fs.existsSync(path.join(_root, '.git'))) return { ok: false, error: `不是 git repo：${_root}` }
   if (!isSafeCwd(_root)) return { ok: false, error: `工作目錄不存在：${_root}` }
-  // 同一 cwd 已有 Claude 在跑就不搶（避免踩到少爺正在進行的對話）
-  if (claudeProcs.get(_root)?.status === 'running') return { ok: false, error: `該專案已有 Claude 進程執行中，等它跑完再按` }
+  // 專案層閘門（不是聊天室排隊）：同 repo 有無頭聊天室正在改檔時不提交，免得把別人改到一半的檔案包進 commit
+  if (claudeLanes.runningInProject(_root).length) return { ok: false, error: `該專案已有 Claude 進程執行中（可能正在改檔），等它跑完再按` }
 
   const _policy = gitProjectPolicy(_proj)
   const _prompt = buildAutoCommitPrompt(projectId, _proj, _policy, 'TC 版控面板「一鍵依規則 Commit」')
@@ -4567,8 +4806,8 @@ app.post('/api/tools/run/:id', async (request) => {
   if (_t.kind === 'claude') {
     const _c = _t.claude ?? {}
     if (!isSafeCwd(_c.cwd)) return { ok: false, error: `工作目錄不存在：${_c.cwd}` }
-    // 同一 cwd 已有 Claude 在跑就不搶（spawnClaude 不 kill 既有進程，硬送會踩到少爺正在進行的對話）
-    if (claudeProcs.get(_c.cwd)?.status === 'running') return { ok: false, error: `「${_t.name}」：該專案已有 Claude 進程執行中，等它跑完再按` }
+    // 專案層閘門（不是聊天室排隊）：酒窖的 Claude 工具目前都是提交類，同 cwd 有無頭聊天室正在改檔時不跑
+    if (claudeLanes.runningInProject(_c.cwd).length) return { ok: false, error: `「${_t.name}」：該專案已有 Claude 進程執行中（可能正在改檔），等它跑完再按` }
     // gitProjectId 型：prompt 依該專案當下的 git 規則現算（規則改了不必動程式碼）
     let _prompt = _c.prompt
     if (_c.gitProjectId) {
@@ -5395,7 +5634,7 @@ app.get('/api/decisions/state/:projectId', async (request, reply) => {
   const dispatches = {}
   for (const _rec of readDecisionDispatch().items) {
     if (_rec.projectId !== _pid) continue
-    const _running = !!_rec.sessionId && [...claudeProcs.values()].some(e => e.sessionId === _rec.sessionId && e.status === 'running')
+    const _running = !!_rec.sessionId && !!claudeLanes.runningEntry(_rec.sessionId)
     for (const k of _rec.keys ?? []) dispatches[k] = { id: _rec.id, ts: _rec.ts, cardId: _rec.cardId ?? null, sessionId: _rec.sessionId ?? null, target: _rec.target, kind: _rec.kinds?.[k] ?? null, running: _running }
   }
   return { ok: true, explanations, dispatches, explainModel: getTcSetting('decision.explainModel', DECISION_EXPLAIN_DEFAULT_MODEL), graph: buildDecisionGraph(_proj, _pid) }
@@ -5825,11 +6064,15 @@ app.patch('/api/qa/runs/:id', async (request, reply) => {
   const run = data.runs.find(r => r.id === request.params.id)
   if (!run) { reply.code(404); return { ok: false, error: 'not found' } }
   const body = request.body ?? {}
+  const _prevStatus = run.status
   if (typeof body.status === 'string') {
     run.status = body.status
     if (body.status === 'running' && !run.startedAt) run.startedAt = Date.now()
     if (body.status === 'finished' || body.status === 'aborted') run.finishedAt = Date.now()
   }
+  // 預約結案（少爺 2026-10-05）：Claude 依少爺在聊天室的話預約（closeArmed:true），或判斷留言不是要結案時取消（false）
+  if (body.closeArmed === true && run.status !== 'closed') qaArmClose(run, 'claude', typeof body.closeArmedReason === 'string' ? body.closeArmedReason : null)
+  if (body.closeArmed === false) qaDisarmClose(run, 'claude')
   if (typeof body.outcome === 'string') run.outcome = body.outcome
   if (typeof body.sessionDir === 'string') run.sessionDir = body.sessionDir
   if (typeof body.boundSessionId === 'string') run.boundSessionId = body.boundSessionId
@@ -5886,9 +6129,22 @@ app.patch('/api/qa/runs/:id', async (request, reply) => {
   if (run.claudeAck) { if (['pending', 'undelivered'].includes(run.claudeAck.state)) run.claudeAck.state = 'working'; run.claudeAck.workingAt = Date.now() }
   // 少爺引導語（2026-07-07：接手後換成告訴少爺當下該做什麼，如「請 PIE 後將 Feedback 填入留言」；空字串=清除）
   if (typeof body.guidance === 'string') run.guidance = body.guidance ? { text: body.guidance, t: Date.now() } : null
+  // 分支迴圈開新一輪（轉回待放行／倒數中）或中止＝少爺表態的是上一輪，預約結案作廢
+  if (transitionCancelsArm(_prevStatus, run.status)) qaDisarmClose(run, `status:${_prevStatus}→${run.status}`)
+  // ⭐ 預約結案代按：run 在（或剛進）已完成且有預約 → 做跟 ✔ 結案鈕完全相同的事。必須在上面「任何 PATCH＝處理中」之後，
+  //    否則本次 PATCH 會把結案剛設的「等待接手」翻掉
+  const _autoClose = (run.status === 'finished' && run.closeArmed) ? run.closeArmed : null
+  if (_autoClose) qaApplyClose(run, _autoClose)
   run.updatedAt = Date.now()
   writeQaRuns(data)
   qaBroadcast(run)
+  if (_autoClose) {
+    logEvent('qa.run.control', { id: run.id, action: 'close', auto: true, source: _autoClose.source })
+    logEvent('qa.close.auto', { id: run.id, source: _autoClose.source, via: 'patch-finished' })
+    qaWakeBoundSession(run, 'close', qaAutoCloseWakeText(_autoClose), [], null, null, true)
+    return { ok: true, run, autoClosed: true,
+      note: '少爺已預約結案：TC 已代按 ✔ 結案，run 轉為已結案，結案通知（階段五）照聯動方式送到綁定聊天室（監看印出／直投／無頭喚醒；本聊天室忙碌時排在本回合之後）。收到那則再照階段五執行，本回合不要先做，免得重複。' }
+  }
   return { ok: true, run }
 })
 
@@ -5977,6 +6233,30 @@ function markWakeUndelivered(sessionId) {
 const QA_WAKE_ACTIONS = { 'start-now': '按了「▶ 立即開跑」→ 請進入階段二（埋 LOG + 雙編譯 + 重啟 Editor）', pause: '要求暫停', resume: '要求繼續', abort: '要求中止', comment: '留言', close: '按了「✔ 結案」→ 階段五（清 QAC LOG + 雙編譯 + 重啟 Editor；無頭啟動 Editor 用 Start-Process detached）＋維護侍酒師閉環：把本 run 需求「實作驗證後的收斂」沉澱回四種血肉（C++ code / 架構 canvas / 拼圖 memory；藍圖 md 暫跳過），Editor 開著時跑 extract_asset_graph.py 更新藍圖資產層，最後 POST /api/sommelier/refresh/roman 重萃取讓侍酒師吃到最新拼圖＋設計思路模板維護（增量）：分析本 run「需求原話→設計決策/取捨→驗證結果」軌跡，萃取少爺這輪怎麼設計體驗，增量併入 .agent/knowledge/Roman_DesignThinking_Templates.md（基線 2026-07-31 全量、此後僅以 run 為單位增量），有更新列入 knowledgeUpdated 回寫＋情境體驗層維護（少爺 2026-09-15 立）：本 run 動到的意圖檔所涵蓋的情境檔 scenario/S##_*.md 推進狀態標記（💡→📐→🔬→✅）、補討論紀錄與素材清單（qa_finalize_check.py B8 機檢；SOP .agent/workflows/z_sub_scenario_experience.md §6）' }
 function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, effort = null, inPlaceLink = true) {
   try {
+    // 預約結案中的留言喚醒：讓 Claude 知道推 finished 時 TC 會代按 ✔ 結案（少爺 2026-10-05）
+    const _armNote = (action === 'comment' && run.closeArmed)
+      ? `\n（TC 已預約結案：照 Mode C 逐項勾核、全過推 finished 時，TC 會自動代按 ✔ 結案並送出結案喚醒，不必請少爺再按；若判斷少爺不是要結案，PATCH /api/qa/runs/${run.id} {closeArmed:false} 取消）`
+      : ''
+    // ⭐ 做法 B（少爺 2026-10-04）：監看沒活著、但綁定分頁已登記直投 → 直接投進分頁當場處理（取代原本只能走的無頭補送）。
+    //    監看活著時維持既有監看聯動——監看會自己從 run 資料印出這個動作，再直投＝重複送達。
+    //    投不出去才退回下方既有鏈（inPlaceLink=false＝強制無頭，等同原本監看死掉後的補送）。
+    if (inPlaceLink !== false && run.boundSessionId && !isMonitorAlive(run.boundSessionId) && ccmsgAvailable(run.boundSessionId)) {
+      const _dFp = findJsonlPath(run.boundSessionId)
+      const _dBefore = lastAssistantActivityMs(_dFp)
+      let _dPrompt = `(TC QA 聯動通知) 少爺在 QA Monitor 對 run「${run.topic}」(${run.id}) ${QA_WAKE_ACTIONS[action] ?? action}${text ? `：「${text}」` : ''}。請照 Mode C 流程繼續（QA/README.md §Mode C），先 GET http://127.0.0.1:3001/api/qa/runs/${run.id}?ackComments=1 讀留言。${_armNote}`
+      for (const _p of (Array.isArray(attachPaths) ? attachPaths : [])) _dPrompt += `\n${_p}`
+      ccmsgPostVerified(run.boundSessionId, _dPrompt, { kind: `qa-${action}` }).then((_r) => {
+        if (_r.state === 'not_sent') {
+          logEvent('qa.wake.direct_failed', { id: run.id, action, sessionId: run.boundSessionId, error: _r.error })
+          qaWakeBoundSession(run, action, text, attachPaths, model, effort, false)
+          return
+        }
+        logEvent('qa.wake.direct', { id: run.id, action, sessionId: run.boundSessionId, tag: _r.tag, receipt: _r.receipt ?? null })
+        if (_r.receipt === 'none') { markWakeUndelivered(run.boundSessionId); return }
+        armAckEarlyFlip(run.id, _dFp, _dBefore)
+      }).catch((e) => logEvent('qa.wake.error', { id: run.id, action, error: String(e?.message ?? e) }))
+      return
+    }
     // monitor 模式＝該 session 自掛監看，不可 spawn（雙寫 transcript）；其餘一律喚醒。
     // ⭐ 心跳活著也走本分支（少爺 2026-07-17）：run 還掛 spawn 但監看確實在跑時，喚醒本就靠監看輪詢 run 資料原地聯動，
     //    再 spawn 無頭＝雙重觸發。以 VERIFIED 心跳為準，活著一律交給原地聯動、不 spawn。
@@ -5986,7 +6266,7 @@ function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, e
     if (inPlaceLink !== false && (run.wakeMode === 'monitor' || isMonitorAlive(run.boundSessionId))) {
       const _mFp = findJsonlPath(run.boundSessionId)
       const _mBefore = lastAssistantActivityMs(_mFp)
-      const _mPrompt = `(TC QA 聯動通知) 少爺在 QA Monitor 對 run「${run.topic}」(${run.id}) ${QA_WAKE_ACTIONS[action] ?? action}${text ? `：「${text}」` : ''}。原 monitor 監看已無回應（分頁可能已關閉），本喚醒為無頭補送，run 已轉回 spawn 模式。請照 Mode C 流程繼續（QA/README.md §Mode C），先 GET /api/qa/runs/${run.id}?ackComments=1 讀留言。`
+      const _mPrompt = `(TC QA 聯動通知) 少爺在 QA Monitor 對 run「${run.topic}」(${run.id}) ${QA_WAKE_ACTIONS[action] ?? action}${text ? `：「${text}」` : ''}。原 monitor 監看已無回應（分頁可能已關閉），本喚醒為無頭補送，run 已轉回 spawn 模式。請照 Mode C 流程繼續（QA/README.md §Mode C），先 GET /api/qa/runs/${run.id}?ackComments=1 讀留言。${_armNote}`
       // 無頭補送（監看確定不在／卡住時保底）：run 轉回 spawn、避免同進程雙寫
       const _doHeadlessFallback = (reason) => {
         const _d = readQaRuns()
@@ -5994,10 +6274,12 @@ function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, e
         if (_r) { _r.wakeMode = 'spawn'; _r.updatedAt = Date.now(); writeQaRuns(_d); qaBroadcast(_r) }
         logEvent('qa.wake.monitor_fallback', { id: run.id, action, sessionId: run.boundSessionId, reason })
         const _pp = (run.boundProjectPath ?? 'C:/Project/RomanPrototype').replace(/\//g, path.sep)
-        if (!isSafeCwd(_pp)) return
+        if (!isSafeCwd(_pp)) { logEvent('qa.wake.error', { id: run.id, action, error: `unsafe cwd ${_pp}` }); return }
         const _sp = getSessionPrefs(run.boundSessionId)
-        if (claudeProcs.get(_pp)?.status === 'running') return
-        spawnClaude(_pp, _mPrompt, run.boundSessionId, _sp?.model ?? null, _sp?.effort ?? null)
+        // ⚠️ 補送絕不丟（少爺 2026-10-05 實錄：舊版「專案有別的聊天室在跑就 return」把 603e640e／966a3d51 的留言喚醒整個吃掉）：
+        //    同室忙碌＝排進該室隊伍（併入同室已排的一則），閒置＝直接起；別室在跑不相干
+        const _lane = runOrQueueForSession(_pp, _mPrompt, run.boundSessionId, _sp?.model ?? null, _sp?.effort ?? null, null, { coalesce: true, coalesceSeparator: '\n\n(追加喚醒) ' })
+        logEvent(_lane.queued ? (_lane.coalesced ? 'qa.wake.coalesced' : 'qa.wake.queued') : 'qa.wake.spawned', { id: run.id, action, sessionId: run.boundSessionId, via: 'monitor_fallback' })
       }
       // 心跳已斷＝分頁確定沒掛監看：不等 150s，立即無頭補送（喚醒不聾、不拖延）。
       // 心跳沒斷的話，喚醒本就靠監看輪詢 run 資料原地聯動（不 spawn）——只留 transcript 活性看門狗防「監看活著但卡住」
@@ -6031,7 +6313,7 @@ function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, e
     const _model = model ?? _sessPrefs?.model ?? null
     const _effort = effort ?? _sessPrefs?.effort ?? null
     const detail = QA_WAKE_ACTIONS[action] ?? action
-    let prompt = `(TC QA 聯動通知) 少爺在 QA Monitor 對 run「${run.topic}」(${run.id}) ${detail}${text ? `：「${text}」` : ''}。請照 Mode C 流程繼續（QA/README.md §Mode C）。`
+    let prompt = `(TC QA 聯動通知) 少爺在 QA Monitor 對 run「${run.topic}」(${run.id}) ${detail}${text ? `：「${text}」` : ''}。請照 Mode C 流程繼續（QA/README.md §Mode C）。${_armNote}`
     if (_unbound) prompt += `\n（本 run 原無綁定聊天室，你是新開接手的 session、已自動綁定為本 run 的處理聊天室。請先 GET http://127.0.0.1:3001/api/qa/runs/${run.id}?ackComments=1 讀完整 run 內容與留言再照 SOP 處理。）`
     for (const _p of (Array.isArray(attachPaths) ? attachPaths : [])) prompt += `\n${_p}`
     const projectPath = (run.boundProjectPath ?? 'C:/Project/RomanPrototype').replace(/\//g, path.sep)
@@ -6057,33 +6339,69 @@ function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, e
       const _aFp = findJsonlPath(run.boundSessionId)
       armAckEarlyFlip(run.id, _aFp, lastAssistantActivityMs(_aFp))
     }
-    const existing = claudeProcs.get(projectPath)
-    if (existing?.status === 'running') {
-      let q = claudeRunQueue.get(projectPath)
-      if (!q) { q = []; claudeRunQueue.set(projectPath, q) }
-      // 同 session 已有排隊中的喚醒 → 併入同一則（少爺 2026-07-15 修：喚醒堆積成 N 個回合、每回合重複回答）
-      const _pending = q.find(x => x.sessionId === (run.boundSessionId ?? null))
-      if (_pending) {
-        _pending.prompt += `\n\n(追加喚醒) ${prompt}`
-        logEvent('qa.wake.coalesced', { id: run.id, action, sessionId: run.boundSessionId ?? null })
-      } else {
-        q.push({ prompt, sessionId: run.boundSessionId ?? null, model: _model, effort: _effort, onInit: _onInit })
-        logEvent('qa.wake.queued', { id: run.id, action, sessionId: run.boundSessionId ?? null })
-      }
-    } else {
-      spawnClaude(projectPath, prompt, run.boundSessionId ?? null, _model, _effort, _onInit)
-      logEvent('qa.wake.spawned', { id: run.id, action, sessionId: run.boundSessionId ?? null })
-    }
+    // 只有「綁定的同一個聊天室」正在跑才排隊；別的聊天室在跑照樣並行（少爺 2026-10-05）。未綁定＝開新聊天室，永不排隊。
+    // 同室已有排隊中的一則 → 併入同一則（少爺 2026-07-15 修：喚醒堆積成 N 個回合、每回合重複回答）
+    const _r = runOrQueueForSession(projectPath, prompt, run.boundSessionId ?? null, _model, _effort, _onInit, { coalesce: true, coalesceSeparator: '\n\n(追加喚醒) ' })
+    logEvent(_r.queued ? (_r.coalesced ? 'qa.wake.coalesced' : 'qa.wake.queued') : 'qa.wake.spawned', { id: run.id, action, sessionId: run.boundSessionId ?? null })
   } catch (e) { logEvent('qa.wake.error', { id: run.id, action, error: String(e?.message ?? e) }) }
 }
 
-// 少爺控制：start-now / pause / resume / abort / comment / close
+// ─── 預約結案（少爺 2026-10-05）──────────────────────────────────────────────────
+// 「如果我說 QA 進入{或是按下}結案，Run 進入已完成的狀態，就會自動補上（替我手按），讓 QA Run 進入已結案」。
+// 少爺表態時 run 常常還在執行中（Claude 還要逐項勾核、推 finished），舊流程得等推完再回來按一次 ✔ 結案。
+// 預約後 run 一進「已完成」，server 就做跟按 ✔ 結案完全相同的事（轉已結案＋喚醒綁定聊天室進階段五）。
+// 預約來源：執行中 ✔ 結案鈕／整則留言表態結案（判斷在 qaCloseArm.js）／Claude 依少爺在聊天室的話 PATCH closeArmed:true。
+// 轉回待放行／倒數中（分支迴圈新一輪）或中止＝預約作廢；QA 面板可取消。
+
+/** 記下預約（已預約就保留最早那筆的來源） */
+function qaArmClose(InRun, InSource, InText = null) {
+  if (InRun.closeArmed) return false
+  InRun.closeArmed = { t: Date.now(), source: InSource, text: InText ? String(InText).slice(0, 200) : null }
+  logEvent('qa.close.armed', { id: InRun.id, source: InSource })
+  return true
+}
+
+/** 預約作廢 */
+function qaDisarmClose(InRun, InReason) {
+  if (!InRun.closeArmed) return false
+  InRun.closeArmed = null
+  logEvent('qa.close.disarmed', { id: InRun.id, reason: InReason })
+  return true
+}
+
+/** 結案狀態轉換（✔ 結案鈕與預約代按共用）：已完成／已中止 → 已結案、等 Claude 接手做階段五。InAuto＝代按時的預約紀錄 */
+function qaApplyClose(InRun, InAuto = null) {
+  if (InRun.status !== 'finished' && InRun.status !== 'aborted') return false
+  InRun.status = 'closed'
+  InRun.closedAt = Date.now()
+  InRun.claudeAck = { action: 'close', t: Date.now(), state: 'pending' }
+  InRun.guidance = null
+  if (InAuto) InRun.autoClose = { t: Date.now(), source: InAuto.source, text: InAuto.text ?? null }
+  InRun.closeArmed = null
+  return true
+}
+
+/** 代按結案時附在喚醒 prompt「按了 ✔ 結案」後面的說明 */
+function qaAutoCloseWakeText(InArm) {
+  const _src = { button: '按了執行中的 ✔ 結案', comment: '留言表態結案', claude: '在聊天室表態結案' }[InArm?.source] ?? '表態結案'
+  return `預約結案——少爺${_src}${InArm?.text ? `（${InArm.text}）` : ''}，run 已到已完成，由 TC 代按`
+}
+
+// 少爺控制：start-now / pause / resume / abort / comment / close / disarm-close
 // pause / abort 對跑動中的 run 只立 flag，由 emitter 在「項目邊界」執行後 ack（狀態乾淨、不硬斷 PIE）
 app.post('/api/qa/runs/:id/control', async (request, reply) => {
   const data = readQaRuns()
   const run = data.runs.find(r => r.id === request.params.id)
   if (!run) { reply.code(404); return { ok: false, error: 'not found' } }
-  const { action, text, itemId, attachments, model, effort, inPlaceLink } = request.body ?? {}
+  const { action, text, itemId, attachments, model, effort, inPlaceLink, armClose } = request.body ?? {}
+  // 取消預約結案：只動標記，不喚醒 Claude、不改處理中狀態
+  if (action === 'disarm-close') {
+    if (qaDisarmClose(run, 'owner-cancel')) { run.updatedAt = Date.now(); writeQaRuns(data); qaBroadcast(run) }
+    return { ok: true, run }
+  }
+  const _prevStatus = run.status
+  let _wakeAction = action    // 留言表態結案且 run 已完成＝當場代按，喚醒改走結案
+  let _wakeText = action === 'comment' ? String(text ?? '') : ''
   // 少爺 2026-07-14：QA 留言可指定喚醒子進程的 AI 模型＋強度（只在 comment 動作使用）
   const _wakeModel = (typeof model === 'string' && model.trim()) ? model.trim() : null
   const _wakeEffort = EFFORT_LEVELS.includes(effort) ? effort : null
@@ -6111,21 +6429,32 @@ app.post('/api/qa/runs/:id/control', async (request, reply) => {
     const _attNames = (Array.isArray(attachments) ? attachments : []).map(a => a?.name).filter(Boolean)
     const _commentText = String(text ?? '') + (_attNames.length ? ` 📎 ${_attNames.join(', ')}` : '')
     run.comments.push({ t: Date.now(), itemId: itemId ?? null, text: _commentText, seenByClaude: false, reply: null })
+    // 預約結案：執行中 ✔ 結案鈕（armClose）或整則留言在表態結案 → run 已完成就當場代按、還沒到就預約
+    if (armClose === true || commentIntendsClose(text, itemId ?? null)) {
+      const _arm = { source: armClose === true ? 'button' : 'comment', text: String(text ?? '') }
+      if (run.status === 'finished') {
+        qaApplyClose(run, _arm)
+        _wakeAction = 'close'
+        _wakeText = qaAutoCloseWakeText(_arm)
+        logEvent('qa.close.auto', { id: run.id, source: _arm.source, via: 'comment-on-finished' })
+      } else if (canArmInStatus(run.status)) qaArmClose(run, _arm.source, _arm.text)
+    }
   } else if (action === 'close') {
     // 少爺結案（第五階段觸發訊號）：已完成/已中止 → 結案；Claude 收到通知後清 QAC LOG + 雙編譯
-    if (run.status === 'finished' || run.status === 'aborted') { run.status = 'closed'; run.closedAt = Date.now() }
-    else { reply.code(400); return { ok: false, error: `cannot close run in status ${run.status}` } }
+    if (!qaApplyClose(run)) { reply.code(400); return { ok: false, error: `cannot close run in status ${run.status}` } }
   } else { reply.code(400); return { ok: false, error: `unknown action ${action}` } }
+  // 中止＝這輪不做了，預約結案作廢
+  if (run.status === 'aborted' && _prevStatus !== 'aborted') qaDisarmClose(run, 'aborted')
   // 少爺動作 → 顯示「等待 Claude 接手」（Claude 第一次 API 觸碰時翻成 working — 見 PATCH/events/ackComments）
-  run.claudeAck = { action, t: Date.now(), state: 'pending' }
+  run.claudeAck = { action: _wakeAction, t: Date.now(), state: 'pending' }
   // 少爺推進了狀態 → 上一階段的引導語過期；留言＝Feedback 送達（2026-07-07 少爺：送出後要顯示新階段、不是還掛「請進 PIE」）
-  if (action !== 'comment') run.guidance = null
+  if (_wakeAction !== 'comment') run.guidance = null
   else run.guidance = { text: 'Feedback 已送出，等待 Claude 讀取分析…', t: Date.now() }
   run.updatedAt = Date.now()
   writeQaRuns(data)
-  logEvent('qa.run.control', { id: run.id, action })
+  logEvent('qa.run.control', { id: run.id, action, ...(_wakeAction !== action ? { wakeAs: _wakeAction } : {}) })
   qaBroadcast(run)
-  qaWakeBoundSession(run, action, action === 'comment' ? String(text ?? '') : '', _attachPaths, action === 'comment' ? _wakeModel : null, action === 'comment' ? _wakeEffort : null, inPlaceLink !== false)
+  qaWakeBoundSession(run, _wakeAction, _wakeText, _attachPaths, action === 'comment' ? _wakeModel : null, action === 'comment' ? _wakeEffort : null, inPlaceLink !== false)
   return { ok: true, run }
 })
 
@@ -6148,6 +6477,458 @@ app.get('/api/qa/runs/:id/artifact', async (request, reply) => {
     : 'text/plain; charset=utf-8'
   reply.type(mime)
   return fs.readFileSync(abs)
+})
+
+// ─── 陪聊（少爺 2026-10-04）────────────────────────────────────────────────────
+// 「QA Run 中有個按鈕(對應不同的QA)…陪我腦力激盪…將我的想法整理並實作，也會即時回應我」＋「仕酒師也需要…
+//  加入購物車…我可以知道你將我哪些想法加入購物車」＋「語音功能算是附加的(第二套做法)…原本的文字互動依舊保留」。
+// 每個 QA run／侍酒師專案一位常駐無頭 Claude（stream-json 輸入、唯讀三工具、不載 MCP、關 hook），每輪回覆尾端附
+// <tc-board> 機讀區塊 → server 維護想法板。QA＝少爺按「交付實作」或說「交付」才送進綁定分頁（走既有留言＋喚醒鏈，
+// 含做法 B 直投）；侍酒師＝想法即時進購物車（client 端 localStorage），可撤回。語音在 client 端（瀏覽器內建辨識與朗讀）。
+// 規格：memory project_spec_tc_companion.md
+const COMPANION_FILE = path.join(os.homedir(), '.claude', 'tc_companions.json')
+const COMPANION_CWD = path.join(os.homedir(), '.claude', 'tc-companion')   // transcript 落在含 tc-companion 的專案夾：History／側欄排除
+const COMPANION_MSG_MAX = 200
+const COMPANION_RECAP_MSGS = 12
+const companionProcs = new Map()   // key → { proc, buf, status, turnText, turnMsgId, pending[], idleTimer, deltaTimer }
+const companionStore = (() => { try { return JSON.parse(fs.readFileSync(COMPANION_FILE, 'utf-8')) } catch { return {} } })()
+let _companionPersistTimer = null
+function persistCompanions() {
+  if (_companionPersistTimer) return
+  _companionPersistTimer = setTimeout(() => {
+    _companionPersistTimer = null
+    try { atomicWriteJson(COMPANION_FILE, companionStore) } catch {}
+  }, 500)
+}
+
+/** 陪聊對象的脈絡：標題、專案根、可讀資料夾、簡介 */
+function companionContext(InScope, InRefId) {
+  if (InScope === 'qa') {
+    const _run = readQaRuns().runs.find(r => r.id === InRefId)
+    if (!_run) return null
+    const _proj = findSommelierProject(_run.project ?? 'roman')
+    return {
+      title: `QA｜${_run.topic}`,
+      projectRoot: _run.boundProjectPath ?? _proj?.projectRoot ?? null,
+      dirs: [_proj?.designIntentDir, _proj?.scenarioDir].filter(Boolean),
+      brief: [
+        `QA run「${_run.topic}」(${_run.id})，狀態 ${_run.status}；${_run.boundSessionId ? `綁定實作聊天室 ${_run.boundSessionId}` : '尚未綁定實作聊天室（交付時會開新聊天室接手）'}`,
+        _run.requirement ? `需求：${String(_run.requirement).slice(0, 1500)}` : '',
+        _run.items?.length ? `驗收項目：${_run.items.slice(0, 20).map(it => `${it.id}. ${it.text}（${it.status}）`).join('；').slice(0, 1800)}` : '',
+        _run.qapPath ? `計畫檔：${_run.qapPath}` : '',
+      ].filter(Boolean).join('\n'),
+    }
+  }
+  if (InScope === 'som') {
+    const _proj = findSommelierProject(InRefId)
+    if (!_proj) return null
+    const _memDirs = String(_proj.memoryDir ?? '').split(',').map(s => s.trim()).filter(Boolean)
+    return {
+      title: `侍酒師｜${_proj.name}`,
+      projectRoot: _proj.projectRoot ?? null,
+      dirs: [_proj.designIntentDir, _proj.scenarioDir, ..._memDirs].filter(Boolean),
+      brief: `專案 ${_proj.name}（${_proj.id}）${_proj.designIntentDir ? `；設計意圖在 ${_proj.designIntentDir}` : ''}${_proj.scenarioDir ? `；情境檔在 ${_proj.scenarioDir}` : ''}`,
+    }
+  }
+  return null
+}
+
+const COMPANION_RULES = [
+  '全程繁體中文、口語、短句（一到三句），像坐在旁邊的同事；不念表格、程式碼、路徑、長清單，少爺要細節再說。',
+  '你的工作是聽懂少爺的想法、在關鍵處追問一句、把想法整理成條目；不要動手改任何檔案、不要假裝已經做了什麼。',
+  '需要佐證時可以用 Read／Grep／Glob 查專案的設計意圖、情境檔與計畫，但回覆仍要短。',
+  '少爺的訊息可能來自語音辨識（沒有標點、有錯字）：讀意圖，關鍵字聽不懂就問。',
+  '訊息開頭的「（系統：…）」是 TC 告訴你的狀態變化（例如少爺手動改了想法板、已交付），照著更新，不必複述。',
+  '每次回覆的最後另起一行附一個機讀區塊（少爺看不到）：<tc-board>{JSON}</tc-board>，只能有一個、必須是合法 JSON。',
+]
+
+function companionSystemPrompt(InScope, InCtx) {
+  if (InScope === 'qa') return [
+    '你是 TheClaudenental 的「陪聊」：少爺（遊戲製作人）的腦力激盪夥伴，現在陪他聊一個 QA run。',
+    InCtx.brief,
+    '規則：', ...COMPANION_RULES.map(r => `・${r}`),
+    '<tc-board> 格式：{"ideas":[{"id":"i1","text":"整理後的一句話","status":"draft|confirmed"}],"handoff":null}',
+    '・ideas＝目前完整的想法清單（每次全量給、id 沿用不重編）；少爺明確同意的標 confirmed；被否決的直接移除；已交付的不必再列。',
+    '・少爺表示要交給實作（例如「就這樣做」「交給它」）時，handoff 填 {"summary":"給實作聊天室的一段完整整理：背景、要做什麼、怎麼驗收"}，口語上問一句「要交付嗎？」——真正送出要等少爺按「交付實作」或說「交付」，你只提議，不要說已送出。',
+  ].join('\n')
+  return [
+    '你是 TheClaudenental 侍酒師的「陪聊」：陪少爺（遊戲製作人）做前期腦力激盪，把成形的想法放進侍酒師購物車，之後少爺結帳帶去聊天室實作。',
+    InCtx.brief,
+    '規則：', ...COMPANION_RULES.map(r => `・${r}`),
+    '<tc-board> 格式：{"ideas":[{"id":"i1","text":"整理後的一句話","status":"draft|carted"}],"cart":[{"id":"i1","text":"放進購物車的一句話","anchors":["相關名詞"]}],"uncart":[]}',
+    '・ideas＝目前完整的想法清單（每次全量、id 沿用）；已放進購物車的標 carted。',
+    '・cart＝這一輪「新」放進購物車的想法（只列新的）；少爺說要放，或想法已清楚成形、值得帶去結帳時就放，口語上簡短說「已放進購物車：…」讓少爺知道；anchors 填相關的類別名、INV 編號、情境 S## 等（沒有就給空陣列）。',
+    '・少爺說拿掉／不要了：從 ideas 移除，並在 uncart 列出那些 id。',
+  ].join('\n')
+}
+
+/** 給 client 的狀態（不含進程物件；訊息只回最近 100 則） */
+function companionPublic(InKey) {
+  const _c = companionStore[InKey]
+  if (!_c) return null
+  const _p = companionProcs.get(InKey)
+  return {
+    key: InKey, scope: _c.scope, refId: _c.refId, title: _c.title,
+    messages: _c.messages.slice(-100), ideas: _c.ideas, cartLog: _c.cartLog, pendingHandoff: _c.pendingHandoff,
+    status: _p ? _p.status : 'off', model: _c.model ?? null, updatedAt: _c.updatedAt,
+  }
+}
+function companionBroadcast(InKey) { broadcast({ type: 'companion_update', key: InKey, state: companionPublic(InKey) }) }
+
+function companionPushMessage(InKey, InRole, InText, InVia = null) {
+  const _c = companionStore[InKey]
+  const _m = { id: `cm${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`, role: InRole, text: String(InText ?? ''), ts: Date.now(), ...(InVia ? { via: InVia } : {}) }
+  _c.messages.push(_m)
+  if (_c.messages.length > COMPANION_MSG_MAX) _c.messages = _c.messages.slice(-COMPANION_MSG_MAX)
+  _c.updatedAt = Date.now()
+  persistCompanions()
+  return _m
+}
+
+/** 串流中顯示的文字：藏掉 <tc-board> 區塊（含尚未寫完的開頭片段） */
+function companionVisibleText(InText) {
+  let _t = String(InText ?? '')
+  const _i = _t.indexOf('<tc-board')
+  if (_i >= 0) return _t.slice(0, _i).trimEnd()
+  const _m = _t.match(/<[a-z-]{0,8}$/)
+  if (_m && '<tc-board'.startsWith(_m[0])) _t = _t.slice(0, _m.index)
+  return _t.trimEnd()
+}
+
+/** 取最後一個能解析的想法板：模型偶爾先寫壞一段再自行補正（實測），從尾端往前找第一個合法 JSON */
+function companionParseBoard(InText) {
+  const _text = String(InText ?? '')
+  const _open = '<tc-board>', _close = '</tc-board>'
+  for (let _end = _text.lastIndexOf(_close); _end >= 0; _end = _text.lastIndexOf(_close, _end - 1)) {
+    for (let _start = _text.lastIndexOf(_open, _end); _start >= 0; _start = _text.lastIndexOf(_open, _start - 1)) {
+      try { return JSON.parse(_text.slice(_start + _open.length, _end).trim()) } catch { /* 往前找 */ }
+    }
+  }
+  return null
+}
+
+/** 套用想法板：ideas 全量覆蓋（已交付的保留為紀錄）；侍酒師的 cart／uncart 轉成購物車事件 */
+function companionApplyBoard(InKey, InBoard) {
+  const _c = companionStore[InKey]
+  if (!_c || !InBoard || typeof InBoard !== 'object') return
+  if (Array.isArray(InBoard.ideas)) {
+    const _handed = _c.ideas.filter(i => i.status === 'handed')
+    const _fresh = InBoard.ideas
+      .filter(i => i && typeof i.text === 'string' && i.text.trim())
+      .map(i => ({ id: String(i.id ?? `i${Math.random().toString(36).slice(2, 6)}`), text: i.text.trim().slice(0, 400), status: ['draft', 'confirmed', 'carted'].includes(i.status) ? i.status : 'draft', ts: Date.now() }))
+      .filter(i => !_handed.some(h => h.id === i.id))
+    _c.ideas = [..._handed, ..._fresh]
+  }
+  if (_c.scope === 'qa') {
+    if (InBoard.handoff && typeof InBoard.handoff.summary === 'string' && InBoard.handoff.summary.trim()) {
+      _c.pendingHandoff = { summary: InBoard.handoff.summary.trim().slice(0, 4000), ts: Date.now() }
+    }
+  }
+  if (_c.scope === 'som') {
+    const _added = []
+    for (const _it of (Array.isArray(InBoard.cart) ? InBoard.cart : [])) {
+      if (!_it || typeof _it.text !== 'string' || !_it.text.trim()) continue
+      const _id = String(_it.id ?? `i${Math.random().toString(36).slice(2, 6)}`)
+      const _existing = _c.cartLog.find(x => x.id === _id)
+      if (_existing && !_existing.removed) continue
+      const _entry = { id: _id, text: _it.text.trim().slice(0, 400), anchors: Array.isArray(_it.anchors) ? _it.anchors.map(String).slice(0, 8) : [], ts: Date.now(), removed: false }
+      if (_existing) Object.assign(_existing, _entry); else _c.cartLog.push(_entry)
+      _added.push(_entry)
+    }
+    const _removed = []
+    for (const _id of (Array.isArray(InBoard.uncart) ? InBoard.uncart : [])) {
+      const _e = _c.cartLog.find(x => x.id === String(_id))
+      if (_e && !_e.removed) { _e.removed = true; _removed.push(_e.id) }
+    }
+    if (_added.length || _removed.length) {
+      broadcast({ type: 'companion_cart', key: InKey, projectId: _c.refId, add: _added, remove: _removed })
+      logEvent('tc.companion.cart', { key: InKey, add: _added.length, remove: _removed.length })
+    }
+  }
+  _c.updatedAt = Date.now()
+  persistCompanions()
+}
+
+function companionArmIdle(InKey) {
+  const _p = companionProcs.get(InKey)
+  if (!_p) return
+  clearTimeout(_p.idleTimer)
+  const _mins = Number(getTcSetting('companion.idleMinutes', 15)) || 15
+  _p.idleTimer = setTimeout(() => companionStop(InKey, 'idle'), _mins * 60 * 1000)
+}
+
+function companionStop(InKey, InReason) {
+  const _p = companionProcs.get(InKey)
+  if (!_p) return
+  clearTimeout(_p.idleTimer)
+  clearTimeout(_p.deltaTimer)
+  companionProcs.delete(InKey)
+  try { _p.proc.stdin.end() } catch {}
+  setTimeout(() => { try { _p.proc.kill() } catch {} }, 3000)
+  logEvent('tc.companion.stop', { key: InKey, reason: InReason })
+  if (companionStore[InKey]) companionBroadcast(InKey)
+}
+
+/** 寫一則使用者訊息進常駐進程（stream-json 輸入） */
+function companionWrite(InKey, InText) {
+  const _p = companionProcs.get(InKey)
+  if (!_p) return false
+  _p.status = 'thinking'
+  _p.turnText = ''
+  _p.turnMsgId = `cm${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`
+  try { _p.proc.stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: InText } })}\n`) } catch { return false }
+  companionArmIdle(InKey)
+  companionBroadcast(InKey)
+  return true
+}
+
+/** 一輪結束：解析想法板、收進訊息、送下一則排隊中的話 */
+function companionFinishTurn(InKey, InResultText) {
+  const _p = companionProcs.get(InKey)
+  const _c = companionStore[InKey]
+  if (!_p || !_c) return
+  const _full = _p.turnText || String(InResultText ?? '')
+  companionApplyBoard(InKey, companionParseBoard(_full))
+  const _visible = companionVisibleText(_full)
+  if (_visible) {
+    const _m = companionPushMessage(InKey, 'assistant', _visible)
+    _m.id = _p.turnMsgId ?? _m.id
+  }
+  _p.status = 'idle'
+  _p.turnText = ''
+  clearTimeout(_p.deltaTimer)
+  _p.deltaTimer = null
+  companionBroadcast(InKey)
+  if (_p.pending.length) {
+    const _next = _p.pending.splice(0).join('\n')
+    companionWrite(InKey, _next)
+  }
+}
+
+function companionSpawn(InKey) {
+  const _c = companionStore[InKey]
+  if (!_c) return null
+  const _ctx = companionContext(_c.scope, _c.refId)
+  if (!_ctx) return null
+  try { fs.mkdirSync(COMPANION_CWD, { recursive: true }) } catch {}
+  const _model = getTcSetting('companion.model', null) || 'sonnet'
+  const _effort = getTcSetting('companion.effort', null)
+  const _args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--include-partial-messages',
+    '--model', _model, '--tools', 'Read,Grep,Glob', '--strict-mcp-config', '--mcp-config', JSON.stringify({ mcpServers: {} }),
+    '--settings', JSON.stringify({ disableAllHooks: true }), '--dangerously-skip-permissions',
+    '--append-system-prompt', companionSystemPrompt(_c.scope, _ctx)]
+  if (EFFORT_LEVELS.includes(_effort)) _args.push('--effort', _effort)
+  for (const _d of [_ctx.projectRoot, ..._ctx.dirs]) if (_d && isSafeCwd(_d)) _args.push('--add-dir', _d)
+  if (_c.claudeSid && findJsonlPath(_c.claudeSid)) _args.push('--resume', _c.claudeSid)
+  else _c.claudeSid = null
+  const _env = { ...process.env }
+  for (const _k of Object.keys(_env)) if (_k.startsWith('CLAUDE')) delete _env[_k]
+  let _proc
+  try { _proc = spawn(getClaudeExe(), _args, { cwd: COMPANION_CWD, env: _env, stdio: ['pipe', 'pipe', 'pipe'] }) }
+  catch (e) { logEvent('tc.companion.spawn_error', { key: InKey, error: String(e?.message ?? e) }); return null }
+  // 狀態直接給 idle：stream-json 輸入模式要等第一句話寫進去才會吐 init（實測），stdin 先收著不會掉
+  const _p = { proc: _proc, buf: '', status: 'idle', gotInit: false, turnText: '', turnMsgId: null, pending: [], idleTimer: null, deltaTimer: null, recapDue: !_c.claudeSid && _c.messages.length > 0 }
+  companionProcs.set(InKey, _p)
+  _c.title = _ctx.title
+  _c.model = _model
+  logEvent('tc.companion.spawn', { key: InKey, model: _model, resume: !!_c.claudeSid })
+  _proc.stdout.setEncoding('utf-8')
+  _proc.stdout.on('data', (InChunk) => {
+    _p.buf += InChunk
+    const _lines = _p.buf.split('\n')
+    _p.buf = _lines.pop()
+    for (const _line of _lines) {
+      if (!_line.trim()) continue
+      let _ev
+      try { _ev = JSON.parse(_line) } catch { continue }
+      if (_ev.type === 'system' && _ev.subtype === 'init') {
+        _p.gotInit = true
+        if (_ev.session_id && _c.claudeSid !== _ev.session_id) {
+          _c.claudeSid = _ev.session_id
+          subprocessSids.add(_ev.session_id)
+          persistSubprocessSids()
+          persistCompanions()
+        }
+        continue
+      }
+      if (_ev.type === 'stream_event') {
+        const _e = _ev.event
+        if (_e?.type === 'content_block_start' && _e.content_block?.type === 'tool_use') {
+          if (_p.status !== 'tool') { _p.status = 'tool'; companionBroadcast(InKey) }
+        } else if (_e?.type === 'content_block_delta' && _e.delta?.type === 'text_delta') {
+          if (_p.status !== 'thinking') { _p.status = 'thinking' }
+          _p.turnText += _e.delta.text
+          if (!_p.deltaTimer) {
+            _p.deltaTimer = setTimeout(() => {
+              _p.deltaTimer = null
+              broadcast({ type: 'companion_delta', key: InKey, msgId: _p.turnMsgId, text: companionVisibleText(_p.turnText), status: _p.status })
+            }, 80)
+          }
+        }
+        continue
+      }
+      if (_ev.type === 'result') {
+        if (_ev.is_error || (_ev.subtype && _ev.subtype !== 'success')) companionPushMessage(InKey, 'system', `這一句陪聊沒有完成（${_ev.subtype ?? 'error'}），可以再說一次。`)
+        companionFinishTurn(InKey, _ev.result)
+      }
+    }
+  })
+  _proc.stderr.setEncoding('utf-8')
+  _proc.stderr.on('data', (InChunk) => { const _t = String(InChunk).trim(); if (_t) logEvent('tc.companion.stderr', { key: InKey, text: _t.slice(0, 300) }) })
+  _proc.on('close', (InCode) => {
+    if (companionProcs.get(InKey) !== _p) return
+    clearTimeout(_p.idleTimer)
+    clearTimeout(_p.deltaTimer)
+    companionProcs.delete(InKey)
+    logEvent('tc.companion.exit', { key: InKey, code: InCode, midTurn: _p.status !== 'idle', gotInit: _p.gotInit })
+    // 回合中途結束或啟動就失敗（續聊 id 失效＝「No conversation found」實測）：清掉續聊 id，
+    // 下一句改帶前情提要重開，不會反覆用壞掉的 id 重試；有話卡在半路才告訴少爺
+    if ((_p.status !== 'idle' || !_p.gotInit) && companionStore[InKey]) {
+      companionStore[InKey].claudeSid = null
+      persistCompanions()
+      if (_p.status !== 'idle') companionPushMessage(InKey, 'system', '陪聊中斷了，再說一句就會自動重新接上（會帶前情提要）。')
+    }
+    if (companionStore[InKey]) companionBroadcast(InKey)
+  })
+  companionArmIdle(InKey)
+  return _p
+}
+
+/** 前情提要：續聊 id 失效重開時，把最近幾則對話與想法板帶進第一句 */
+function companionRecap(InKey) {
+  const _c = companionStore[InKey]
+  const _recent = _c.messages.filter(m => m.role !== 'system').slice(-COMPANION_RECAP_MSGS)
+  const _lines = _recent.map(m => `${m.role === 'user' ? '少爺' : '你'}：${m.text.slice(0, 300)}`)
+  const _ideas = _c.ideas.map(i => `${i.id}［${i.status}］${i.text}`)
+  return `（系統：陪聊重新接上，前情提要——\n${_lines.join('\n')}${_ideas.length ? `\n目前想法板：\n${_ideas.join('\n')}` : ''}\n）`
+}
+
+function companionEnsure(InScope, InRefId) {
+  const _key = `${InScope}:${InRefId}`
+  if (!companionStore[_key]) {
+    const _ctx = companionContext(InScope, InRefId)
+    if (!_ctx) return null
+    companionStore[_key] = { scope: InScope, refId: InRefId, title: _ctx.title, messages: [], ideas: [], cartLog: [], pendingHandoff: null, notes: [], claudeSid: null, createdAt: Date.now(), updatedAt: Date.now() }
+    persistCompanions()
+  }
+  return _key
+}
+
+function companionSay(InKey, InText, InVia) {
+  const _c = companionStore[InKey]
+  if (!_c) return { ok: false, error: 'no companion' }
+  const _text = String(InText ?? '').trim()
+  if (!_text) return { ok: false, error: 'empty' }
+  companionPushMessage(InKey, 'user', _text, InVia)
+  let _p = companionProcs.get(InKey)
+  if (!_p) _p = companionSpawn(InKey)
+  if (!_p) { companionBroadcast(InKey); return { ok: false, error: '找不到陪聊對象（run 或專案已不存在）' } }
+  const _prefix = []
+  if (_p.recapDue) { _prefix.push(companionRecap(InKey)); _p.recapDue = false }
+  if (_c.notes?.length) { _prefix.push(..._c.notes.map(n => `（系統：${n}）`)); _c.notes = [] }
+  const _payload = [..._prefix, _text].join('\n')
+  if (_p.status === 'thinking' || _p.status === 'tool') _p.pending.push(_payload)
+  else companionWrite(InKey, _payload)
+  companionBroadcast(InKey)
+  return { ok: true }
+}
+
+app.post('/api/companion/open', async (request, reply) => {
+  const { scope, refId, warm } = request.body ?? {}
+  if (!['qa', 'som'].includes(scope) || !refId) { reply.code(400); return { ok: false, error: 'bad scope/refId' } }
+  const _key = companionEnsure(scope, String(refId))
+  if (!_key) { reply.code(404); return { ok: false, error: '找不到陪聊對象' } }
+  // 預熱：開面板就先起進程，第一句話不必等啟動
+  if (warm !== false && !companionProcs.get(_key)) companionSpawn(_key)
+  return { ok: true, key: _key, state: companionPublic(_key) }
+})
+app.get('/api/companion/state', async (request) => {
+  const _key = request.query?.key
+  return { ok: !!companionStore[_key], state: companionPublic(_key) }
+})
+app.post('/api/companion/say', async (request) => {
+  const { key, text, via } = request.body ?? {}
+  return companionSay(key, text, via === 'voice' ? 'voice' : 'text')
+})
+// 手動改想法板（刪除／確認／改字／新增）；改動以系統訊息帶給陪聊，下一句生效
+app.post('/api/companion/board', async (request) => {
+  const { key, op, id, text } = request.body ?? {}
+  const _c = companionStore[key]
+  if (!_c) return { ok: false, error: 'no companion' }
+  const _idea = _c.ideas.find(i => i.id === id)
+  if (op === 'remove' && _idea) { _c.ideas = _c.ideas.filter(i => i !== _idea); _c.notes.push(`少爺從想法板刪掉了 ${_idea.id}「${_idea.text}」`) }
+  else if (op === 'confirm' && _idea) { _idea.status = 'confirmed'; _c.notes.push(`少爺確認了 ${_idea.id}「${_idea.text}」`) }
+  else if (op === 'edit' && _idea && String(text ?? '').trim()) { _idea.text = String(text).trim().slice(0, 400); _c.notes.push(`少爺把 ${_idea.id} 改成「${_idea.text}」`) }
+  else if (op === 'add' && String(text ?? '').trim()) {
+    const _new = { id: `u${Date.now().toString(36)}`, text: String(text).trim().slice(0, 400), status: 'confirmed', ts: Date.now() }
+    _c.ideas.push(_new)
+    _c.notes.push(`少爺自己加了想法 ${_new.id}「${_new.text}」`)
+  } else return { ok: false, error: 'bad op' }
+  _c.updatedAt = Date.now()
+  persistCompanions()
+  companionBroadcast(key)
+  return { ok: true }
+})
+// 侍酒師：少爺在購物車手動移除／放回陪聊加的想法 → 記到 cartLog 並告訴陪聊
+app.post('/api/companion/cart-sync', async (request) => {
+  const { key, id, removed } = request.body ?? {}
+  const _c = companionStore[key]
+  const _e = _c?.cartLog.find(x => x.id === id)
+  if (!_e) return { ok: false }
+  _e.removed = !!removed
+  _c.notes.push(`少爺${removed ? '從購物車拿掉了' : '把它放回購物車：'} ${_e.id}「${_e.text}」`)
+  persistCompanions()
+  companionBroadcast(key)
+  return { ok: true }
+})
+// QA 交付：組成留言走既有 /control 留言鏈（含喚醒：監看活著→監看、否則做法 B 直投、再否則無頭／新開聊天室接手）
+app.post('/api/companion/handoff', async (request, reply) => {
+  const { key, summary, via } = request.body ?? {}
+  const _c = companionStore[key]
+  if (!_c || _c.scope !== 'qa') { reply.code(400); return { ok: false, error: '只有 QA 陪聊可以交付' } }
+  const _ideas = _c.ideas.filter(i => i.status !== 'handed')
+  const _summary = String(summary ?? _c.pendingHandoff?.summary ?? '').trim()
+  if (!_summary && !_ideas.length) return { ok: false, error: '想法板是空的，沒有可交付的內容' }
+  const _text = [
+    '🗣 陪聊交付（少爺在 TC 陪聊中整理並確認要實作的想法）',
+    _summary,
+    _ideas.length ? `想法清單：\n${_ideas.map(i => `- ${i.status === 'confirmed' ? '［已確認］' : '［草稿］'}${i.text}`).join('\n')}` : '',
+    '請照 Mode C 流程處理：先列計畫給少爺在 QA 分頁審，少爺放行前不動工。',
+  ].filter(Boolean).join('\n\n')
+  const _res = await app.inject({ method: 'POST', url: `/api/qa/runs/${_c.refId}/control`, payload: { action: 'comment', text: _text, inPlaceLink: true } })
+  let _body = null
+  try { _body = _res.json() } catch {}
+  if (_res.statusCode >= 400 || !_body?.ok) return { ok: false, error: _body?.error ?? `HTTP ${_res.statusCode}` }
+  for (const _i of _ideas) _i.status = 'handed'
+  _c.pendingHandoff = null
+  _c.notes.push('少爺已把目前的想法交付給實作聊天室；之後的新想法另外整理')
+  companionPushMessage(key, 'system', `已交付給實作聊天室（${_ideas.length} 個想法${via === 'voice' ? '，語音口令觸發' : ''}）。實作聊天室會先列計畫，請到 QA 分頁審查。`)
+  logEvent('tc.companion.handoff', { key, ideas: _ideas.length, via: via ?? 'button' })
+  companionBroadcast(key)
+  return { ok: true }
+})
+app.post('/api/companion/dismiss-handoff', async (request) => {
+  const _c = companionStore[request.body?.key]
+  if (!_c) return { ok: false }
+  _c.pendingHandoff = null
+  _c.notes.push('少爺說再想想，交付先擱著')
+  persistCompanions()
+  companionBroadcast(request.body.key)
+  return { ok: true }
+})
+app.post('/api/companion/close', async (request) => {
+  companionStop(request.body?.key, 'closed')
+  return { ok: true }
+})
+app.post('/api/companion/reset', async (request) => {
+  const _key = request.body?.key
+  const _c = companionStore[_key]
+  if (!_c) return { ok: false }
+  companionStop(_key, 'reset')
+  Object.assign(_c, { messages: [], ideas: [], cartLog: [], pendingHandoff: null, notes: [], claudeSid: null, updatedAt: Date.now() })
+  persistCompanions()
+  companionBroadcast(_key)
+  return { ok: true }
 })
 
 // ─── Start ────────────────────────────────────────────────────────────────────

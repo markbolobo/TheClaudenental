@@ -682,19 +682,27 @@ function ChatPanel({ streamEvents, chatInit, selectedId }) {
     // 思考中送出 → 直接送（少爺 2026-04-27 報排隊機制不好用）
     // server / Claude Code CLI 自己處理同 session 重疊請求
     if (!overrideText) { setInput(''); setAttachments([]) }
+    // 新聊天室剛起跑、還沒拿到 session id：先留著，拿到 id 再送——server 只對「同一個聊天室」排隊，
+    // 沒帶 id 的會被當成另開一個新聊天室並行（少爺 2026-10-05 跨聊天室並行）
+    if (runningRef.current && !sessionId) {
+      setPendingQueue(q => [...q, { text, attachments: atts, ts: Date.now() }])
+      return
+    }
     await doActualSend(text, atts)
   }
 
-  // 思考結束後從佇列取出下一筆送出（FIFO，一次一筆，送完再取下一筆）
+  // 從佇列取出下一筆送出（FIFO，一次一筆）：閒置時，或新聊天室已拿到 session id（交給 server 排進同室隊伍）
+  // 送出當下才出列：先出列再排計時的話，出列觸發的重繪會先跑 cleanup 把計時清掉＝那一筆永遠送不出去
   useEffect(() => {
-    if (!running && pendingQueue.length > 0) {
+    if (pendingQueue.length === 0 || (running && !sessionId)) return
+    const t = setTimeout(() => {
       const [next, ...rest] = pendingQueue
       setPendingQueue(rest)
-      const t = setTimeout(() => { doActualSend(next.text, next.attachments) }, 300)
-      return () => clearTimeout(t)
-    }
+      doActualSend(next.text, next.attachments)
+    }, 300)
+    return () => clearTimeout(t)
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [running, pendingQueue])
+  }, [running, pendingQueue, sessionId])
 
   // pendingQueue 同步到 localStorage（HMR / F5 後可復原；附件不序列化）
   useEffect(() => {
@@ -705,10 +713,11 @@ function ChatPanel({ streamEvents, chatInit, selectedId }) {
   }, [pendingQueue])
 
   function handleStop() {
+    // 帶 sessionId＝只停本聊天室（同專案別室並行中的不受影響）；還沒拿到 id 時 server 停本專案剛起跑的新聊天室
     fetch('/api/claude/stop', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ projectPath }),
+      body: JSON.stringify({ projectPath, sessionId: sessionId ?? null }),
     })
     runningRef.current = false
     setRunning(false)
@@ -1075,7 +1084,12 @@ ${d.links?.length    ? `## 內含外部連結\n${d.links.join('\n')}\n`  : ''}
             </>} />
         )}
 
-        {/* 排隊機制已拿掉（少爺 2026-04-27），思考中送出直接送 */}
+        {/* 思考中送出直接送（少爺 2026-04-27）；唯一例外＝新聊天室還沒拿到 session id，先留著幾秒（少爺 2026-10-05） */}
+        {pendingQueue.length > 0 && (
+          <div className="px-2 pt-2 text-[10px] text-[var(--text-muted)] animate-pulse">
+            ⏳ 新聊天室建立中，{pendingQueue.length} 則訊息拿到聊天室後送出
+          </div>
+        )}
         {/* Attachment previews */}
         {attachments.length > 0 && (
           <div className="flex flex-wrap gap-1.5 px-2 pt-2">

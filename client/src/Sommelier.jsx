@@ -5,6 +5,7 @@ import { WorkflowLauncher } from './WorkflowLauncher.jsx'
 import { ScenarioView, RichText } from './ScenarioView.jsx'
 import { scenarioKey, SCENARIO_NEW_KEY, scenarioPromptLines, newScenarioPromptLines } from './scenarioPrompt.js'
 import { DecisionDeck, DecisionViewToggle, DerivedReview, SudokuSolveButton } from './DecisionDeck.jsx'
+import { CompanionPanel } from './CompanionPanel.jsx'
 import { intentDeckItems, intentDerivedItems, loadDecisionView, saveDecisionView } from './decisionSupport.js'
 
 // ─── Sommelier 侍酒師 — 專案名詞圖鑑(P0:C++ 骨架層 + P1:選件購物車)─────────
@@ -31,6 +32,8 @@ const searchTokens = (query) => (query ?? '').trim().toLowerCase().split(/\s+/).
 const tokensMatchAll = (tokens, ...fields) =>
   tokens.length === 0 || tokens.every(t => fields.some(f => (f ?? '').toLowerCase().includes(t)))
 const CART_STORE_KEY = 'tc_sommelier_cart_v1'
+// 陪聊放進購物車的想法：companionKey（som:<專案>）＋想法 id
+const ideaCartKey = (InCompanionKey, InIdeaId) => `${InCompanionKey}:idea:${InIdeaId}`
 
 function daysAgo(iso) {
   if (!iso) return null
@@ -118,6 +121,11 @@ function composePrompt(draft, items) {
         if (it.invariants?.length) lines.push(`   不變量: ${it.invariants.map(v => `${v.checked ? '✓' : '○'}${v.id} ${v.text}`).join(' | ').slice(0, 900)}`)
         if (it.openDecisions?.length) lines.push(`   ⬜ 待定奪(需業主決策): ${it.openDecisions.map(d => `${d.id} ${d.title}${d.options ? `〔選項 ${d.options}〕` : ''}`).join(' | ').slice(0, 700)}`)
         if (it.symbolRefs?.length) lines.push(`   關聯符號: ${it.symbolRefs.join(', ')}`)
+        return
+      }
+      if (it.nodeKind === 'idea') {
+        lines.push(`${idx + 1}. 【陪聊想法】${it.ideaText}`)
+        if (it.anchors?.length) lines.push(`   相關: ${it.anchors.join(', ')}`)
         return
       }
       if (it.nodeKind === 'scenario') { lines.push(...scenarioPromptLines(idx, it)); return }
@@ -1087,6 +1095,43 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
     flash(`已加入藍圖：${b.name}`, 1500)
   }
 
+  // 🗣 陪聊 → 選件（少爺 2026-10-04「腦力激盪期間，我可以知道你將我哪些想法加入購物車」）：
+  // server 的陪聊每輪把成形想法以 companion_cart 事件推過來 → 即時放進購物車並閃提示；拿掉時回報讓陪聊知道
+  const [companionOpen, setCompanionOpen] = useState(false)
+  const addIdeaToCart = useCallback((InCompanionKey, InEntry) => {
+    const key = ideaCartKey(InCompanionKey, InEntry.id)
+    setCart(c => c.some(i => i.key === key) ? c : [...c, {
+      key, project: data?.project, nodeKind: 'idea',
+      ideaText: InEntry.text, anchors: InEntry.anchors ?? [], companionKey: InCompanionKey, ideaId: InEntry.id,
+    }])
+  }, [data?.project])
+  useEffect(() => {
+    const _onCart = (e) => {
+      const _d = e.detail
+      if (!_d || _d.projectId !== projectId) return
+      for (const _entry of _d.add ?? []) addIdeaToCart(_d.key, _entry)
+      if (_d.remove?.length) {
+        const _drop = new Set(_d.remove.map(id => ideaCartKey(_d.key, id)))
+        setCart(c => c.filter(i => !_drop.has(i.key)))
+      }
+      if (_d.add?.length) flash(`🗣 陪聊放進購物車：${_d.add.map(a => a.text).join('；').slice(0, 120)}`, 5000)
+    }
+    window.addEventListener('tc-companion-cart', _onCart)
+    return () => window.removeEventListener('tc-companion-cart', _onCart)
+  }, [projectId, addIdeaToCart, flash])
+  // 從購物車或陪聊面板拿掉／放回陪聊加的想法 → 同步回陪聊（它下一句就知道）
+  const toggleIdeaCart = useCallback((InCompanionKey, InEntry, InPutBack) => {
+    const key = ideaCartKey(InCompanionKey, InEntry.id)
+    if (InPutBack) addIdeaToCart(InCompanionKey, InEntry)
+    else setCart(c => c.filter(i => i.key !== key))
+    fetch('/api/companion/cart-sync', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: InCompanionKey, id: InEntry.id, removed: !InPutBack }) }).catch(() => {})
+  }, [addIdeaToCart])
+  const removeCartItem = (it) => {
+    if (it.nodeKind === 'idea') { toggleIdeaCart(it.companionKey, { id: it.ideaId, text: it.ideaText, anchors: it.anchors }, false); return }
+    setCart(c => c.filter(x => x.key !== it.key))
+  }
+
   const composed = useMemo(() => composePrompt(draft, cart), [draft, cart])
 
   const checkout = () => {
@@ -1208,6 +1253,11 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
             : mode === 'scenario' ? '搜尋情境（標題 / 一句話 / 內文）· 空格＝且'
             : '搜尋藍圖 / 父類 · 空格＝且'}
           className="w-64 max-w-full bg-transparent border border-[var(--border)] focus:border-[var(--gold)]/60 rounded px-2 py-1 text-[11px] text-[var(--text)] outline-none" />
+        <button onClick={() => setCompanionOpen(true)} disabled={!projectId}
+          title="陪聊：陪你做前期腦力激盪，成形的想法即時放進購物車（看得到放了哪些、可拿掉）；文字為本、語音可選"
+          className="text-[11px] px-2 py-1 rounded border border-[var(--gold)]/50 text-[var(--gold)] hover:bg-[var(--gold)]/10 disabled:opacity-40">
+          🗣 陪聊
+        </button>
         <button onClick={() => setCartOpen(o => !o)}
           className={`text-[11px] px-2 py-1 rounded border ${cart.length ? 'border-[var(--gold)]/60 text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)]'} hover:border-[var(--gold)]`}
           title="選件購物車">
@@ -1432,6 +1482,13 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
         </div>
 
         </>)}
+        {/* 🗣 陪聊（少爺 2026-10-04）：想法即時進購物車，面板右欄看得到放了哪些 */}
+        {companionOpen && projectId && (
+          <CompanionPanel key={projectId} scope="som" refId={projectId}
+            subtitle={projects.find(p => p.id === projectId)?.name ?? projectId}
+            cartKeyOf={ideaCartKey} cartKeys={cartKeys} onCartToggle={toggleIdeaCart}
+            onClose={() => setCompanionOpen(false)} />
+        )}
         {/* 右:購物車抽屜 */}
         {cartOpen && (
           <div className="absolute inset-y-0 right-0 w-96 max-w-[92vw] z-10 bg-[var(--surface)] border-l border-[var(--gold)]/30 shadow-2xl flex flex-col">
@@ -1486,13 +1543,15 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
                   {cart.map(it => (
                     <div key={it.key} className="flex items-start gap-2 px-2 py-1 rounded border border-[var(--border)]">
                       <span className="text-[9px] text-[var(--text-muted)] w-3 text-center shrink-0">
-                        {it.nodeKind === 'archNode' ? '🗺️' : it.nodeKind === 'memoryNote' ? '📓' : it.nodeKind === 'bp' ? '🎨' : it.nodeKind === 'intent' ? '🧭' : (it.nodeKind === 'scenario' || it.nodeKind === 'scenarioNew') ? '🎬' : it.member ? (MEMBER_ICON[it.kind] ?? '·') : (KIND_META[it.kind]?.icon ?? '◆')}
+                        {it.nodeKind === 'idea' ? '💡' : it.nodeKind === 'archNode' ? '🗺️' : it.nodeKind === 'memoryNote' ? '📓' : it.nodeKind === 'bp' ? '🎨' : it.nodeKind === 'intent' ? '🧭' : (it.nodeKind === 'scenario' || it.nodeKind === 'scenarioNew') ? '🎬' : it.member ? (MEMBER_ICON[it.kind] ?? '·') : (KIND_META[it.kind]?.icon ?? '◆')}
                       </span>
                       <div className="flex-1 min-w-0">
                         <code className="text-[10px] text-[var(--text)] break-all">
-                          {it.nodeKind === 'archNode' ? it.nodeTitle : it.nodeKind === 'memoryNote' ? it.noteTitle : it.nodeKind === 'bp' ? it.bpName : it.nodeKind === 'intent' ? it.intentTitle : it.nodeKind === 'scenario' ? it.scenarioTitle : it.nodeKind === 'scenarioNew' ? '新情境（建骨架＋九面向訪談）' : it.member ? `${it.symbol}::${it.member}` : it.symbol}
+                          {it.nodeKind === 'idea' ? it.ideaText : it.nodeKind === 'archNode' ? it.nodeTitle : it.nodeKind === 'memoryNote' ? it.noteTitle : it.nodeKind === 'bp' ? it.bpName : it.nodeKind === 'intent' ? it.intentTitle : it.nodeKind === 'scenario' ? it.scenarioTitle : it.nodeKind === 'scenarioNew' ? '新情境（建骨架＋九面向訪談）' : it.member ? `${it.symbol}::${it.member}` : it.symbol}
                         </code>
-                        {it.nodeKind === 'archNode'
+                        {it.nodeKind === 'idea'
+                          ? <div className="text-[9px] text-[var(--text-muted)] truncate">🗣 陪聊放入{it.anchors?.length ? ` · 相關：${it.anchors.join('、')}` : ''}</div>
+                          : it.nodeKind === 'archNode'
                           ? <div className="text-[9px] text-[var(--text-muted)] truncate">{it.canvasTitle}</div>
                           : it.nodeKind === 'memoryNote'
                           ? <div className="text-[9px] text-[var(--text-muted)] truncate">{it.description || MEMORY_TYPE_META[it.noteType]?.label}</div>
@@ -1506,7 +1565,7 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
                           ? <div className="text-[9px] text-[var(--text-muted)] truncate">情境名與階段寫在需求描述裡</div>
                           : it.comment && <div className="text-[9px] text-[var(--text-muted)] truncate">{it.comment.split('\n')[0]}</div>}
                       </div>
-                      <button onClick={() => setCart(c => c.filter(x => x.key !== it.key))}
+                      <button onClick={() => removeCartItem(it)}
                         className="text-[10px] text-[var(--text-muted)] hover:text-red-400 shrink-0" title="移除">✕</button>
                     </div>
                   ))}

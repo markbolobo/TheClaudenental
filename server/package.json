@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "check:models": "node modelCatalog.check.mjs"
+    "check:models": "node modelCatalog.check.mjs",
+    "check:lanes": "node claudeLanes.check.mjs",
+    "check:closearm": "node qaCloseArm.check.mjs"
   },
   "keywords": [],
   "author": "",

@@ -7,6 +7,7 @@ import { useModelOptions, EFFORT_OPTIONS } from './modelOptions.js'
 import { confirmIfLiveInteractive } from './liveSessionGuard.js'
 import { reloginSession } from './relogin.js'
 import { WorkflowLauncher } from './WorkflowLauncher.jsx'
+import { CompanionPanel } from './CompanionPanel.jsx'
 
 const STATUS_META = {
   announced: { label: '待放行', cls: 'text-yellow-400 border-yellow-500/50' },
@@ -176,6 +177,8 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
   const [lightbox, setLightbox] = useState(null)   // artifact url 放大檢視
   // C 區塊：目前展開哪一份設計說明（null = 全部收合）
   const [openDesignId, setOpenDesignId] = useState(null)
+  // 🗣 陪聊（少爺 2026-10-04）：每個 run 各自一段陪聊；開著的是哪個 run（null＝關）
+  const [companionRunId, setCompanionRunId] = useState(null)
   const selectedRunIdRef = useRef(null)
   useEffect(() => { selectedRunIdRef.current = selectedRunId }, [selectedRunId])
 
@@ -532,14 +535,14 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
     e.target.value = ''
   }
 
-  async function sendComment(overrideText) {
+  async function sendComment(overrideText, extra = {}) {
     // onClick={sendComment} 會把 event 當第一參數傳入 → 只認字串 override（心腹 ⚡ 啟動用）
     const text = (typeof overrideText === 'string' ? overrideText : commentText).trim()
     if (!text && qaAttach.length === 0) return
     // 少爺 2026-07-14「警示＋照送」：spawn 模式卻綁著 VS Code 活 session（錯配——活 session 應走 monitor）→ 確認後才喚醒
     if (run?.wakeMode === 'spawn' && run?.boundSessionId)
       if (!(await confirmIfLiveInteractive(run.boundSessionId, '無頭喚醒'))) return
-    const _res = await control('comment', { text, itemId: commentItemId ? Number(commentItemId) : null, attachments: qaAttach, model: qaModel || null, effort: qaEffort || null, inPlaceLink: qaInPlaceLink })
+    const _res = await control('comment', { text, itemId: commentItemId ? Number(commentItemId) : null, attachments: qaAttach, model: qaModel || null, effort: qaEffort || null, inPlaceLink: qaInPlaceLink, ...extra })
     setCommentText('')
     setQaAttach([])
     // 少爺 2026-07-08：送出 Feedback＝QA 手動階段完成 → 無縫切到 Chat 看 Claude 處理（同 History Continue / 仕酒師送入聊天室）
@@ -563,6 +566,11 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
 
   return (
     <div className="flex h-full min-h-0">
+      {companionRunId && (
+        <CompanionPanel key={companionRunId} scope="qa" refId={companionRunId}
+          subtitle={runs.find(r => r.id === companionRunId)?.topic ?? ''}
+          onClose={() => setCompanionRunId(null)} />
+      )}
       {/* C 歷史區（左欄）；少爺 2026-08-07：點空白處（run 清單以外的底）＝取消選擇，右側回到乾淨等待畫面 */}
       <aside onClick={(e) => { if (e.target === e.currentTarget) setSelectedRunId(null) }}
         className="w-52 shrink-0 border-r border-[var(--border)] bg-[var(--surface)] overflow-y-auto">
@@ -1084,6 +1092,13 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
                   <span title={`綁定聊天室 ${run.boundSessionId}`}
                     className="text-[9px] px-1.5 py-0.5 rounded border border-blue-500/40 text-blue-400">🔗 {run.boundSessionId.slice(0, 8)}</span>
                 )}
+                {run.status === 'closed' && run.autoClose && (
+                  <span title={`預約結案：run 到已完成時由 TC 代按 ✔ 結案${run.autoClose.text ? `（你說「${run.autoClose.text}」）` : ''}`}
+                    className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--gold)]/40 text-[var(--gold)]">⏳ 預約代按結案</span>
+                )}
+                <button onClick={() => setCompanionRunId(run.id)}
+                  title="陪聊：陪你腦力激盪這個 QA，想法即時整理在想法板，確認後交付給綁定聊天室實作（文字為本、語音可選）"
+                  className="text-[10px] px-2 py-0.5 rounded border border-[var(--gold)]/50 text-[var(--gold)] hover:bg-[var(--gold)]/10">🗣 陪聊</button>
                 <div className="flex-1" />
                 <span className="text-[10px] text-[var(--text-muted)]">
                   {doneCount}/{run.items.length} 項 · {fmtTime(run.startedAt)} → {fmtTime(run.finishedAt)}
@@ -1170,6 +1185,21 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
                 {['announced', 'countdown', 'running', 'paused'].includes(run.status) && !run.controls?.abortRequested && (
                   <button onClick={() => { if (confirm('確定中止這輪 QA？')) control('abort') }}
                     className="text-[11px] px-3 py-1 rounded border border-red-500/50 text-red-400 hover:bg-red-500/10">■ 中止</button>
+                )}
+                {/* 少爺 2026-10-05：執行中直接結案＝等同留言輸入「OK」送出（走同一條留言喚醒鏈，Claude 照 Mode C 判定全過→推 finished→結案） */}
+                {/* 同日：並預約結案——Claude 推 finished 時 TC 代按 ✔ 結案，不必回來再按一次 */}
+                {run.status === 'running' && !run.closeArmed && (
+                  <button title="結案＝等同在留言輸入「OK」送出並預約結案：Claude 逐項判定、推到已完成時，TC 自動代按 ✔ 結案進入階段五"
+                    onClick={() => { if (confirm('全部 OK、結案這輪 QA？等同在留言送出「OK」；Claude 推到已完成時會自動結案，不必再按一次')) sendComment('OK', { armClose: true }) }}
+                    className="text-[11px] px-3 py-1 rounded border border-[var(--gold)]/50 text-[var(--gold)] hover:bg-[var(--gold)]/10">✔ 結案</button>
+                )}
+                {run.closeArmed && !['finished', 'closed', 'aborted'].includes(run.status) && (
+                  <span title={`預約來源：${{ button: '執行中 ✔ 結案鈕', comment: '留言表態結案', claude: 'Claude 依你在聊天室的話預約' }[run.closeArmed.source] ?? run.closeArmed.source}${run.closeArmed.text ? `「${run.closeArmed.text}」` : ''}`}
+                    className="text-[11px] px-2 py-1 rounded border border-[var(--gold)]/40 text-[var(--gold)] flex items-center gap-1.5">
+                    ⏳ 已預約結案：進入已完成時自動結案
+                    <button onClick={() => control('disarm-close')} title="取消預約：run 到已完成時停住，等你自己按 ✔ 結案"
+                      className="text-[10px] px-1.5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text)]">取消</button>
+                  </span>
                 )}
                 {['finished', 'aborted'].includes(run.status) && (
                   <button title="結案＝通知 Claude 進入第五階段（移除驗證用 LOG + 雙編譯）"
