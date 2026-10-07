@@ -38,9 +38,14 @@ async function postJson(InUrl, InBody) {
  * @param refId QA run id 或侍酒師專案 id
  * @param cartKeyOf 侍酒師用：(companionKey, ideaId) → 購物車條目 key（判斷是否還在購物車）
  * @param cartKeys 侍酒師用：目前購物車的 key 集合
- * @param onCartToggle 侍酒師用：(entry, inCart) → 從面板放回／拿掉
+ * @param onCartToggle 侍酒師用：(companionKey, entry, putBack) → 從面板放回／拿掉陪聊想法
+ * @param refInfo 侍酒師用：(ref) → { icon, title, inCart } | null（目錄條目在購物車的狀態）
+ * @param onRefToggle 侍酒師用：(companionKey, ref, putBack) → 從面板放回／拿掉目錄條目
+ * @param onStateLoaded 侍酒師用：開面板拿到狀態時呼叫（補回漏接的購物車選件）
+ * @param onGoToCart 侍酒師用：轉跳購物車（接著開新聊天室）
  */
-export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf = null, cartKeys = null, onCartToggle = null }) {
+export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf = null, cartKeys = null, onCartToggle = null,
+  refInfo = null, onRefToggle = null, onStateLoaded = null, cartCount = 0, onGoToCart = null }) {
   const [state, setState] = useState(null)
   const [streaming, setStreaming] = useState(null)   // { msgId, text }
   const [input, setInput] = useState('')
@@ -56,6 +61,8 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
   const spokenRef = useRef({ msgId: null, upTo: 0 })
   const streamingRef = useRef(null)
   const openedAtRef = useRef(0)   // 開面板的時間：之前的訊息不朗讀（開面板 effect 內設定）
+  const onStateLoadedRef = useRef(onStateLoaded)
+  useEffect(() => { onStateLoadedRef.current = onStateLoaded })
 
   useEffect(() => { try { localStorage.setItem('tc_companion_voice_mode', voiceMode) } catch { /* 無痕模式 */ } }, [voiceMode])
   useEffect(() => { try { localStorage.setItem('tc_companion_tts', ttsOn ? '1' : '0') } catch { /* 無痕模式 */ } }, [ttsOn])
@@ -73,7 +80,7 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
     openedAtRef.current = Date.now()
     postJson('/api/companion/open', { scope, refId }).then(d => {
       if (!_alive) return
-      if (d.ok) { keyRef.current = d.key; setState(d.state) }
+      if (d.ok) { keyRef.current = d.key; setState(d.state); onStateLoadedRef.current?.(d.state) }
       else flash(d.error ?? '開啟陪聊失敗（TC 伺服器可能還沒重啟到新版）', 8000)
     })
     return () => { _alive = false }
@@ -175,7 +182,10 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
   const _messages = state?.messages ?? []
   const _ideas = (state?.ideas ?? []).filter(i => i.status !== 'handed')
   const _handed = (state?.ideas ?? []).filter(i => i.status === 'handed')
-  const _cartLog = state?.cartLog ?? []
+  const _cartLog = (state?.cartLog ?? []).filter(c => !c.checkedOut)
+  const _cartRefs = (state?.cartRefs ?? []).filter(c => !c.checkedOut)
+  const _checkedOutCount = [...(state?.cartLog ?? []), ...(state?.cartRefs ?? [])].filter(c => c.checkedOut).length
+  const _contextRefs = state?.contextRefs ?? []
   const _streamingShown = streaming && !_messages.some(m => m.id === streaming.msgId) ? streaming : null
 
   return (
@@ -190,6 +200,12 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
             <span className={`inline-block w-1.5 h-1.5 rounded-full ${_status.dot}`} />{_status.label}
           </span>
           <div className="flex-1" />
+          {onGoToCart && (
+            <button onClick={onGoToCart} title="轉跳購物車——檢查選件、寫描述，接著按「➕ 開新聊天室」"
+              className={`text-[10px] px-2 py-0.5 rounded border ${cartCount ? 'border-[var(--gold)]/70 text-[var(--gold)] bg-[var(--gold)]/10' : 'border-[var(--border)] text-[var(--text-muted)]'} hover:bg-[var(--gold)]/20`}>
+              🛒 前往購物車{cartCount ? `（${cartCount}）` : ''} →
+            </button>
+          )}
           <select value={voiceMode} onChange={e => { setVoiceMode(e.target.value); setInterim('') }}
             title={_support.ok ? '語音（附加的第二套做法）：外放＝朗讀時暫停收音防回音；耳機＝全雙工，開口就能打斷朗讀' : _support.reason}
             className="bg-transparent border border-[var(--border)] rounded px-1 py-0.5 text-[10px] text-[var(--text)]">
@@ -218,7 +234,7 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
                 <div className="text-[11px] text-[var(--text-muted)] text-center mt-8 leading-relaxed">
                   {scope === 'qa'
                     ? <>說說你對這個 QA 的想法——我會邊聊邊整理到右邊的想法板，<br />你確認後按「📤 交付實作」或說「交付」，就送進綁定的聊天室動工。</>
-                    : <>說說你想做的方向——成形的想法我會直接放進購物車，<br />右邊看得到放了哪些，隨時可以拿掉。</>}
+                    : <>說說你的議題——我會邊查侍酒師的設計脈絡與情境邊跟你對齊，<br />把議題和相關條目放進購物車（跟你手動 🛒 加入的一樣），右邊看得到放了哪些；<br />聊完按「🛒 前往購物車」接著開新聊天室。</>}
                 </div>
               )}
               {_messages.map(m => (
@@ -319,8 +335,28 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
               {/* 侍酒師：放進購物車的清單（看得到加了哪些、可拿掉／放回） */}
               {scope === 'som' && (
                 <div className="pt-2 mt-2 border-t border-[var(--border)] space-y-1">
-                  <div className="text-[10px] uppercase tracking-widest text-[var(--gold)]/80">🛒 我放進購物車的（{_cartLog.filter(c => !c.removed).length}）</div>
-                  {!_cartLog.length && <div className="text-[10px] text-[var(--text-muted)]">還沒有——想法成形時我會放進去並告訴你。</div>}
+                  <div className="text-[10px] uppercase tracking-widest text-[var(--gold)]/80">🛒 我放進購物車的（{_cartLog.filter(c => !c.removed).length + _cartRefs.filter(c => !c.removed).length}）</div>
+                  {!_cartLog.length && !_cartRefs.length && <div className="text-[10px] text-[var(--text-muted)]">還沒有——聊到議題時，我會查侍酒師的脈絡與情境，把議題和相關條目放進去並告訴你。</div>}
+                  {/* 目錄條目：與手動 🛒 加入相同的選件（設計脈絡／情境／符號／藍圖／拼圖／架構節點） */}
+                  {_cartRefs.map(c => {
+                    const _info = refInfo?.(c.ref)
+                    const _inCart = !!_info?.inCart
+                    return (
+                      <div key={c.ref} className={`rounded border px-2 py-1 ${_inCart ? 'border-[var(--gold)]/40' : 'border-[var(--border)] opacity-60'}`}>
+                        <div className="text-[10px] text-[var(--text)] break-words">{_info?.icon ?? c.icon ?? '·'} {_info?.title ?? c.title}</div>
+                        <div className="flex items-center gap-1 mt-0.5">
+                          <span className="text-[9px] text-[var(--text-muted)]">{!_info ? '侍酒師資料裡找不到（可能已改名）' : _inCart ? '✓ 在購物車' : '已拿掉'}</span>
+                          <div className="flex-1" />
+                          {onRefToggle && _info && (
+                            <button onClick={() => onRefToggle(state?.key, c.ref, !_inCart)}
+                              className={`text-[9px] ${_inCart ? 'text-[var(--text-muted)] hover:text-red-400' : 'text-[var(--gold)] hover:underline'}`}>
+                              {_inCart ? '拿掉' : '＋放回'}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )
+                  })}
                   {_cartLog.map(c => {
                     const _inCart = !!(cartKeyOf && cartKeys?.has(cartKeyOf(state?.key, c.id)))
                     return (
@@ -340,6 +376,15 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
                       </div>
                     )
                   })}
+                  {_checkedOutCount > 0 && <div className="text-[9px] text-[var(--text-muted)]">（另有 {_checkedOutCount} 項已結帳帶去聊天室）</div>}
+                </div>
+              )}
+
+              {/* QA：陪聊查到的相關脈絡（交付時一併附給實作聊天室） */}
+              {scope === 'qa' && _contextRefs.length > 0 && (
+                <div className="pt-2 mt-2 border-t border-[var(--border)] space-y-1">
+                  <div className="text-[10px] uppercase tracking-widest text-[var(--gold)]/80">🔗 相關脈絡（交付時附上）</div>
+                  {_contextRefs.map(r => <div key={r.ref} className="text-[10px] text-[var(--text-muted)] break-words" title={r.ref}>{r.icon ?? '·'} {r.title}</div>)}
                 </div>
               )}
 
@@ -351,6 +396,14 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
                 </div>
               )}
             </div>
+            {scope === 'som' && onGoToCart && (
+              <div className="shrink-0 p-2 border-t border-[var(--border)]">
+                <button onClick={onGoToCart}
+                  className="w-full py-1.5 rounded border border-green-500/50 text-green-400 text-[11px] hover:bg-green-500/10">
+                  🛒 前往購物車{cartCount ? `（${cartCount}）` : ''} → 開新聊天室
+                </button>
+              </div>
+            )}
             {scope === 'qa' && (
               <div className="shrink-0 p-2 border-t border-[var(--border)]">
                 <button onClick={() => { if (confirm(`把想法板上 ${_ideas.length} 個想法交付給實作聊天室？（它會先列計畫給你審）`)) handoff('button') }}

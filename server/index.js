@@ -1413,7 +1413,8 @@ function runTagWorker() {
   const args = ['--model', TAG_LLM_MODEL, '--output-format', 'stream-json', '--verbose',
     '--dangerously-skip-permissions', '--max-turns', '1', '-p', buildBatchTagPrompt(job.items)]
   let proc
-  try { proc = spawn(getClaudeExe(), args, { cwd: TAGGER_CWD, stdio: ['ignore', 'pipe', 'pipe'] }) }
+  // 勿擾跟著誓約「夜間語意標籤」的設定（手動即時重標也走這條 worker，一併適用）
+  try { proc = spawn(getClaudeExe(), args, { cwd: TAGGER_CWD, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: isQuietSetting(markerQuietKey('tc:nightly-tagging')) }) }
   catch { pendingSpawnCwds.delete(_cwdNorm); _release(); return }
   let _sid = null, _text = '', _buf = ''
   const _timeout = setTimeout(() => { try { proc.kill() } catch {} }, 180_000)   // 批次放寬到 180s
@@ -1688,6 +1689,66 @@ app.post('/api/history/tags/run-nightly', async () => {
   return { ok: true, candidates: _n, queue: tagQueue.length }
 })
 
+// ─── 勿擾（少爺 2026-10-06）：執行時不跳出主控台／終端視窗，酒窖與誓約逐項獨立設定 ─────────
+// 跳窗根因：TC server 在 pm2 底下沒有主控台，spawn 主控台程式（claude／cmd／python…）時 Windows 會替它
+// 開新終端（本機預設＝Windows Terminal）。勿擾開＝只拿掉主控台視窗，工具自己的介面／對話框照常出現：
+// - TC 直接起的 Claude 進程（酒窖 claude 型、夜間語意標籤）→ windowsHide
+// - 酒窖 execute 型、Windows 排程 → 經 RunHidden.exe 轉交（只加 CREATE_NO_WINDOW、命令列逐字轉交、結束碼原樣回傳）
+//   ⚠️ 不用 wscript 隱藏啟動：它靠 SW_HIDE，會連「沒加 -WindowStyle Hidden 的 PowerShell 對話框」一起藏掉；
+//      conhost --headless 在本機連指令都不會真的執行（2026-10-06 實測）
+// 偏好存 TC 總設定：cellar.quiet.<工具 id>／marker.quiet.<誓約 id>；未設＝關＝維持原行為。
+// Windows 排程的 SSOT 是偏好：排程被別的腳本重新註冊（動作被蓋回原樣）時由對帳自動補包回去。
+const RUN_HIDDEN_DIR = 'C:\\Project\\MasterBrain\\.agent\\scripts\\RunHidden'
+const RUN_HIDDEN_EXE = path.join(RUN_HIDDEN_DIR, 'RunHidden.exe')
+const MARKER_QUIET_RECONCILE_MS = 30 * 60 * 1000
+
+function markerQuietKey(InMarkerId) { return `marker.quiet.${InMarkerId}` }
+function isQuietSetting(InKey) { return getTcSetting(InKey, false) === true }
+
+// 排程動作是否已經由 RunHidden 轉交
+function isRunHiddenWrapped(InExecute) {
+  return path.basename(String(InExecute ?? '').replace(/"/g, '').trim()).toLowerCase() === 'runhidden.exe'
+}
+
+// 啟動器不在就現場建置（換機器／被清掉時自癒）；回傳是否可用
+async function ensureRunHiddenExe() {
+  if (fs.existsSync(RUN_HIDDEN_EXE)) return true
+  const _r = await runPowerShell(`& '${path.join(RUN_HIDDEN_DIR, 'Build-RunHidden.ps1')}'`)
+  logEvent('quiet.runhidden.build', { ok: fs.existsSync(RUN_HIDDEN_EXE), out: _r.out.slice(0, 300) })
+  return fs.existsSync(RUN_HIDDEN_EXE)
+}
+
+// 把 Windows 排程的每個執行動作包進／拆出 RunHidden（拆回＝逐字還原原本的程式與參數）
+async function applyWindowsTaskQuiet(InTaskName, InQuiet) {
+  if (InQuiet && !(await ensureRunHiddenExe())) return { ok: false, error: `啟動器建置失敗：${RUN_HIDDEN_EXE}` }
+  const _r = await runPowerShell(
+    '$t = Get-ScheduledTask -TaskName $env:MARKER_TASK_NAME -ErrorAction Stop; $changed = $false; '
+    + 'foreach ($a in $t.Actions) { if (-not $a.Execute) { continue }; '
+    + '$wrapped = [IO.Path]::GetFileName($a.Execute.Trim(\'"\')) -ieq \'RunHidden.exe\'; '
+    + 'if ($env:MARKER_QUIET -eq \'1\' -and -not $wrapped) { '
+    + '$a.Arguments = \'"\' + $a.Execute.Trim(\'"\') + \'"\' + $(if ($a.Arguments) { \' \' + $a.Arguments } else { \'\' }); $a.Execute = $env:RUN_HIDDEN_EXE; $changed = $true } '
+    + 'elseif ($env:MARKER_QUIET -ne \'1\' -and $wrapped) { '
+    + 'if ($a.Arguments -match \'^\\s*"([^"]+)"\\s?(.*)$\' -or $a.Arguments -match \'^\\s*(\\S+)\\s?(.*)$\') { $a.Execute = $Matches[1]; $a.Arguments = $Matches[2]; $changed = $true } } }; '
+    + 'if ($changed) { Set-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Action $t.Actions | Out-Null }',
+    { MARKER_TASK_NAME: InTaskName, MARKER_QUIET: InQuiet ? '1' : '0', RUN_HIDDEN_EXE })
+  return _r.code === 0 ? { ok: true } : { ok: false, error: _r.out.slice(0, 300) || `exit ${_r.code}` }
+}
+
+// 對帳：偏好有明確設定、排程實際狀態不同 → 照偏好補套（排程被重新註冊、手動改過時自癒）
+let markerQuietReconciling = false
+async function reconcileMarkerQuiet(InListed = null, InReason = 'periodic') {
+  if (markerQuietReconciling) return
+  markerQuietReconciling = true
+  try {
+    for (const _w of InListed ?? await listWindowsMarkers()) {
+      const _want = getTcSetting(markerQuietKey(_w.id), null)
+      if (typeof _want !== 'boolean' || !_w.quietSupported || _want === _w.quiet) continue
+      const _r = await applyWindowsTaskQuiet(_w.name, _want)
+      logEvent('marker.quiet.reconcile', { id: _w.id, quiet: _want, reason: InReason, ok: _r.ok, error: _r.error ?? null })
+    }
+  } finally { markerQuietReconciling = false }
+}
+
 // ─── Marker（誓約）：定期會執行的委託任務清單（少爺 2026-08-06）───────────────────
 // 兩源合流：(1) TC server 內建定時＝下方 registry（只登記「語義上是委託任務」的；心跳／幽靈
 //   清掃／持久化那些基礎設施 setInterval 不列）(2) Windows 排程＝Get-ScheduledTask 過濾少爺／
@@ -1702,6 +1763,7 @@ registerMarker({
   name: '夜間語意標籤',
   desc: 'LLM 增量標 History／侍酒師的 tags＋summary',
   source: 'TC 內建',
+  supportsQuiet: true,
   getTime: () => formatHHMM(...getNightlyHM()),
   setTime: (InTime) => {
     writeTcSettings({ 'marker.time.nightly-tagging': InTime })
@@ -1743,6 +1805,7 @@ function listWindowsMarkers() {
       '); Get-ScheduledTask | Where-Object { $t=$_.TaskName; ($pats | Where-Object { $t -like "*$_*" }).Count -gt 0 } | ' +
       'ForEach-Object { $i=$_ | Get-ScheduledTaskInfo; $tr=$_.Triggers | Select-Object -First 1; [PSCustomObject]@{ name=$_.TaskName; state="$($_.State)"; ' +
       'desc=$_.Description; ' +
+      'exec=($_.Actions | Where-Object { $_.Execute } | Select-Object -First 1).Execute; ' +
       'trigger=$tr.StartBoundary; ttype=$(if($tr){$tr.CimClass.CimClassName}else{$null}); ' +
       'lastRun=$(if($i.LastRunTime){$i.LastRunTime.ToString("o")}else{$null}); ' +
       'lastResult=$i.LastTaskResult; ' +
@@ -1772,6 +1835,8 @@ function listWindowsMarkers() {
               lastRun: (!_notRun && w.lastRun) ? Date.parse(w.lastRun) : null,
               lastResult: (_notRun || w.lastResult === SCHED_S_TASK_RUNNING) ? null : (w.lastResult ?? null),
               nextRun: w.nextRun ? Date.parse(w.nextRun) : null,
+              // 勿擾＝排程動作實際已由 RunHidden 轉交（不是偏好值；偏好與實況不同時由對帳補套）
+              quiet: isRunHiddenWrapped(w.exec), quietSupported: !!w.exec,
             }
           }))
         } catch { resolve([]) }
@@ -1784,12 +1849,55 @@ function listWindowsMarkers() {
 // 誓約清單：TC 內建 registry ＋ Windows 排程合流（少爺 2026-08-06 Marker 系統）
 app.get('/api/markers', async () => {
   const _win = await listWindowsMarkers()
+  // 勿擾：顯示偏好值；排程實況與偏好不同＝標「套用中」並背景補套
+  for (const _w of _win) {
+    const _want = getTcSetting(markerQuietKey(_w.id), null)
+    _w.quietPending = typeof _want === 'boolean' && _w.quietSupported && _want !== _w.quiet
+    if (_w.quietPending) _w.quiet = _want
+  }
+  if (_win.some(w => w.quietPending)) reconcileMarkerQuiet(null, 'list')
   const _tc = MARKER_REGISTRY.map(_m => ({
     id: `tc:${_m.id}`, name: _m.name, desc: _m.desc ?? '', source: _m.source, state: 'Ready',
     schedule: _m.getTime ? dailyLabel(...parseHHMM(_m.getTime())) : _m.schedule, time: _m.getTime?.() ?? null, editable: !!_m.setTime,
     lastRun: _m.getLast?.() ?? null, lastResult: 0, nextRun: _m.getNext?.() ?? null,
+    quiet: isQuietSetting(markerQuietKey(`tc:${_m.id}`)), quietSupported: !!_m.supportsQuiet,
   }))
   return { ok: true, markers: [..._tc, ..._win], defaultDailyTime: getMarkerDefaultDailyTime() }
+})
+
+// 設定單一誓約的勿擾：TC 內建只存偏好（下次起進程生效）；Windows 排程存偏好＋改排程動作並回讀驗證
+async function setMarkerQuiet(InId, InQuiet) {
+  const _key = markerQuietKey(InId)
+  if (InId.startsWith('tc:')) {
+    const _m = MARKER_REGISTRY.find(x => `tc:${x.id}` === InId)
+    if (!_m?.supportsQuiet) return { ok: false, code: 404, error: '此誓約不支援勿擾' }
+    writeTcSettings({ [_key]: InQuiet })
+    logEvent('marker.quiet.set', { id: InId, quiet: InQuiet, ok: true })
+    return { ok: true, quiet: InQuiet }
+  }
+  if (!InId.startsWith('win:')) return { ok: false, code: 400, error: '未知誓約' }
+  const _name = InId.slice(4)
+  const _listed = (await listWindowsMarkers()).find(w => w.name === _name)
+  if (!_listed) return { ok: false, code: 404, error: `找不到排程 ${_name}` }
+  if (!_listed.quietSupported) return { ok: false, code: 400, error: '此排程沒有可轉交的執行動作' }
+  const _prev = getTcSetting(_key, null)
+  writeTcSettings({ [_key]: InQuiet })
+  const _r = await applyWindowsTaskQuiet(_name, InQuiet)
+  const _after = (await listWindowsMarkers()).find(w => w.name === _name)
+  const _ok = _r.ok && _after?.quiet === InQuiet
+  logEvent('marker.quiet.set', { id: InId, quiet: InQuiet, ok: _ok, error: _r.error ?? null })
+  if (_ok) return { ok: true, quiet: InQuiet }
+  // 套用失敗就退回原偏好，免得對帳每半小時重試同一個失敗
+  writeTcSettings({ [_key]: _prev })
+  return { ok: false, code: 500, error: `套用失敗：${_r.error ?? '排程動作未改變'}` }
+}
+
+app.post('/api/markers/quiet', async (request, reply) => {
+  const { id, quiet } = request.body ?? {}
+  if (typeof id !== 'string' || typeof quiet !== 'boolean') { reply.code(400); return { ok: false, error: '需要 id 與 quiet（true／false）' } }
+  const _r = await setMarkerQuiet(id, quiet)
+  if (!_r.ok) reply.code(_r.code ?? 500)
+  return { ok: _r.ok, quiet: _r.quiet, error: _r.error }
 })
 
 // 知識訂閱來源登錄（排程時刻 SSOT）與註冊腳本
@@ -1844,6 +1952,8 @@ app.post('/api/markers/time', async (request, reply) => {
   const _after = (await listWindowsMarkers()).find(w => w.name === _name)
   const _ok = _r.code === 0 && _after?.time === _time
   logEvent('marker.time.set', { id, time: _time, knowledgeSource: _sub?.id ?? null, ok: _ok })
+  // 重新註冊會把排程動作蓋回原樣 → 照勿擾偏好補包
+  if (_sub) await reconcileMarkerQuiet(_after ? [_after] : null, 'reregister')
   if (!_ok) { reply.code(500); return { ok: false, error: `設定失敗：${_r.out.slice(0, 300) || '排程時刻未改變'}` } }
   return { ok: true, time: _time, knowledgeSource: _sub?.id ?? null }
 })
@@ -2255,7 +2365,8 @@ function getSessionPrefs(sessionId) {
 // 少爺 2026-07-14：仕酒師/Chat 勾選「啟用 QA 流程」→ 需求 prompt 尾端附掛 Mode C 指令（流程 SSOT 在 skill 與 QA/README，不在此重抄）
 const QA_FLOW_DIRECTIVE = '\n\n(TC QA 流程) 少爺勾選了「啟用 QA 流程」——本需求必須走 Mode C 協作驗證收尾：照 theclaudenental_operator skill 的「QA Run 操作 SOP（Mode C）」與專案 QA/README.md §Mode C，從 Step 0 開 QA Run（POST /api/qa/runs，必綁 boundSessionId=本 session id、boundProjectPath、project；⚠️ wakeMode 不要自己填——server 會依本 session 是不是少爺開著的 VS Code 分頁自動決定），列 QAPC 計畫（操作步驟＋預期 LOG 劇本＋LOG 埋點計畫）供少爺在 QA 分頁審查；少爺按 ▶ 之前零編譯零埋 LOG。\n⭐ POST 回應若帶 mountCommand（＝wakeMode 判為 monitor），**必須在同一個 response 內**用 Monitor 工具把它掛起（persistent=true），再 GET http://127.0.0.1:3001/api/qa/monitor-status?session=<本 session id> 驗 alive:true 才算數——這是 VS Code 原地聯動唯一成立的方式，缺這步少爺按 ▶／留言／✔ 結案都只會走無頭，分頁不動。'
 
-function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort = null, onInit = null, retryCount = 0) {
+// quiet＝勿擾：不配終端視窗（見「勿擾」段）；目前只有酒窖開新聊天室時會傳
+function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort = null, onInit = null, retryCount = 0, quiet = false) {
   // ⚠️ 不再 kill existing（會中斷使用者進行中的 thinking）
   // 續聊既有聊天室一律經 runOrQueueForSession（同室忙碌要排隊）；直接呼叫本函式＝開新聊天室或確定該室閒置
 
@@ -2276,7 +2387,7 @@ function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort
   if (model) args.unshift('--model', model)
   if (sessionId) args.unshift('--resume', sessionId)
 
-  const proc = spawn(getClaudeExe(), args, { cwd: projectPath, stdio: ['ignore', 'pipe', 'pipe'] })
+  const proc = spawn(getClaudeExe(), args, { cwd: projectPath, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: quiet })
   // sawAssistant = 送達證明（唯一可信定義：出現 assistant 回應）。resume 撞上同 session 交接縫隙時，
   // CLI 會把 prompt enqueue 進 transcript 後無人消費地退出（2026-07-17 close 喚醒石沉實錄）——
   // 那種進程 exit 0 但零 assistant 產出，靠這旗標識別。
@@ -2371,7 +2482,7 @@ function spawnClaude(projectPath, prompt, sessionId = null, model = null, effort
             enqueueSessionRun(sessionId, { projectPath, prompt, model, effort, onInit })
             return
           }
-          spawnClaude(projectPath, prompt, sessionId, model, effort, onInit, retryCount + 1)
+          spawnClaude(projectPath, prompt, sessionId, model, effort, onInit, retryCount + 1, quiet)
         }, 8000)
       } else { markWakeUndelivered(sessionId); processQueueIfIdle(sessionId) }
       return   // 首次石沉不觸發 queue 消化（重試在途，避免 queue 下一則撞同一縫隙）
@@ -4796,12 +4907,33 @@ const CELLAR_TOOLS = [
     desc: '立刻跑一輪誓約 Claude_知識訂閱_TheOrangeDuck：偵測新文章／文章修改／微部落格，有新內容就自動吸收；結果看 Marker 與自動建立的 TC 卡',
     // 觸發同一個 Windows 排程，Marker 的上次執行與成敗同步更新
     exec: ['cmd.exe', ['/c', 'schtasks', '/run', '/tn', 'Claude_知識訂閱_TheOrangeDuck']],
+    // 跑的就是該誓約的排程 → 勿擾與誓約共用同一個設定（兩邊顯示、改哪邊都一樣）
+    markerId: 'win:Claude_知識訂閱_TheOrangeDuck',
   },
 ]
-app.get('/api/tools', async () => ({ ok: true, tools: CELLAR_TOOLS.map(t => ({ id: t.id, name: t.name, kind: t.kind, desc: t.desc })) }))
+// 酒窖工具的勿擾設定鍵：觸發誓約排程的工具沿用該誓約的鍵
+function cellarQuietKey(InTool) { return InTool.markerId ? markerQuietKey(InTool.markerId) : `cellar.quiet.${InTool.id}` }
+app.get('/api/tools', async () => ({
+  ok: true,
+  tools: CELLAR_TOOLS.map(t => ({ id: t.id, name: t.name, kind: t.kind, desc: t.desc, quiet: isQuietSetting(cellarQuietKey(t)), quietMarkerId: t.markerId ?? null })),
+}))
+app.post('/api/tools/quiet', async (request, reply) => {
+  const { id, quiet } = request.body ?? {}
+  const _t = CELLAR_TOOLS.find(t => t.id === id)
+  if (!_t || typeof quiet !== 'boolean') { reply.code(400); return { ok: false, error: '需要有效的工具 id 與 quiet（true／false）' } }
+  if (_t.markerId) {
+    const _r = await setMarkerQuiet(_t.markerId, quiet)
+    if (!_r.ok) reply.code(_r.code ?? 500)
+    return { ok: _r.ok, quiet: _r.quiet, error: _r.error }
+  }
+  writeTcSettings({ [cellarQuietKey(_t)]: quiet })
+  logEvent('cellar.quiet.set', { id: _t.id, quiet })
+  return { ok: true, quiet }
+})
 app.post('/api/tools/run/:id', async (request) => {
   const _t = CELLAR_TOOLS.find(t => t.id === request.params.id)
   if (!_t) return { ok: false, error: '未知工具' }
+  const _quiet = isQuietSetting(cellarQuietKey(_t))
   // 喚 Claude 型：跑固定 prompt 的子進程（打包失敗自動分析同一套做法）
   if (_t.kind === 'claude') {
     const _c = _t.claude ?? {}
@@ -4816,16 +4948,19 @@ app.post('/api/tools/run/:id', async (request) => {
       _prompt = buildAutoCommitPrompt(_c.gitProjectId, _gp, gitProjectPolicy(_gp), `TC 酒窖「${_t.name}」`)
     }
     if (!_prompt) return { ok: false, error: `「${_t.name}」：沒有可執行的 prompt` }
-    spawnClaude(_c.cwd, _prompt, null, _c.model ?? null, _c.effort ?? null)
-    logEvent('cellar.claude.spawn', { id: _t.id, cwd: _c.cwd, model: _c.model ?? null, effort: _c.effort ?? null })
-    return { ok: true, ran: `${_t.name}（已喚起 Claude，完成後看版控狀態或聊天室）` }
+    spawnClaude(_c.cwd, _prompt, null, _c.model ?? null, _c.effort ?? null, null, 0, _quiet)
+    logEvent('cellar.claude.spawn', { id: _t.id, cwd: _c.cwd, model: _c.model ?? null, effort: _c.effort ?? null, quiet: _quiet })
+    return { ok: true, ran: `${_t.name}（已喚起 Claude${_quiet ? '・勿擾' : ''}，完成後看版控狀態或聊天室）` }
   }
   if (_t.kind !== 'execute') return { ok: false, error: '此工具非執行型（execute）' }
   if (!_t.exec) return { ok: false, error: `「${_t.name}」尚未接上啟動指令（UE 內 GUI 開發中）` }
   try {
-    // 不加 windowsHide：執行型工具可能自帶 UI（AutoClicker 介面）要顯示給少爺
-    spawn(_t.exec[0], _t.exec[1], { detached: true, stdio: 'ignore' }).unref()
-    return { ok: true, ran: _t.name }
+    // 不加 windowsHide：執行型工具可能自帶 UI（AutoClicker 介面）要顯示給少爺；windowsHide 的 SW_HIDE 會連那個介面一起藏
+    // 勿擾改經 RunHidden 轉交：只拿掉主控台視窗，工具介面照常
+    const _hidden = _quiet && await ensureRunHiddenExe()
+    if (_hidden) spawn(RUN_HIDDEN_EXE, [_t.exec[0], ..._t.exec[1]], { detached: true, stdio: 'ignore' }).unref()
+    else spawn(_t.exec[0], _t.exec[1], { detached: true, stdio: 'ignore' }).unref()
+    return { ok: true, ran: `${_t.name}${_hidden ? '（勿擾）' : _quiet ? '（⚠️ 勿擾未生效：啟動器建置失敗）' : ''}` }
   } catch (e) { return { ok: false, error: e.message } }
 })
 
@@ -6509,6 +6644,7 @@ function companionContext(InScope, InRefId) {
     const _proj = findSommelierProject(_run.project ?? 'roman')
     return {
       title: `QA｜${_run.topic}`,
+      projectId: _proj?.id ?? null,
       projectRoot: _run.boundProjectPath ?? _proj?.projectRoot ?? null,
       dirs: [_proj?.designIntentDir, _proj?.scenarioDir].filter(Boolean),
       brief: [
@@ -6525,12 +6661,72 @@ function companionContext(InScope, InRefId) {
     const _memDirs = String(_proj.memoryDir ?? '').split(',').map(s => s.trim()).filter(Boolean)
     return {
       title: `侍酒師｜${_proj.name}`,
+      projectId: _proj.id,
       projectRoot: _proj.projectRoot ?? null,
       dirs: [_proj.designIntentDir, _proj.scenarioDir, ..._memDirs].filter(Boolean),
       brief: `專案 ${_proj.name}（${_proj.id}）${_proj.designIntentDir ? `；設計意圖在 ${_proj.designIntentDir}` : ''}${_proj.scenarioDir ? `；情境檔在 ${_proj.scenarioDir}` : ''}`,
     }
   }
   return null
+}
+
+// ─── 侍酒師目錄（少爺 2026-10-06「陪聊過程就會邊從仕酒師的脈絡跟情境理解我的議題，並將這些內容都加入購物車
+//     (視同我原本手動加入的操作)」）：把六層萃取資料攤成一行一條的目錄檔，陪聊用 Grep 查關鍵字、第一欄 ref 原樣
+//     回報；client 再用手動 🛒 同一份快照放進購物車。萃取資料換版（檔案戳記變）才重寫。
+const companionCatalogCache = new Map()   // projectId → { stamp, file, refs: Map(ref → { title, icon }) }
+function companionCatalog(InProjectId) {
+  const _proj = InProjectId ? findSommelierProject(InProjectId) : null
+  if (!_proj?.dataDir) return null
+  const _gen = path.join(_proj.dataDir, 'generated')
+  const _names = ['design_intent.json', 'scenario_experience.json', 'cpp_symbols.json', 'asset_graph.json', 'memory_notes.json', 'arch_canvas.json']
+  const _stamp = _names.map(f => { try { return fs.statSync(path.join(_gen, f)).mtimeMs } catch { return 0 } }).join('|')
+  const _file = `catalog_${_proj.id}.md`
+  const _cached = companionCatalogCache.get(_proj.id)
+  if (_cached?.stamp === _stamp && fs.existsSync(path.join(COMPANION_CWD, _file))) return _cached
+  const _read = (InName) => { try { return JSON.parse(fs.readFileSync(path.join(_gen, InName), 'utf8')) } catch { return null } }
+  const _one = (InText, InMax) => String(InText ?? '').replace(/\s+/g, ' ').trim().slice(0, InMax)
+  const _refs = new Map()
+  const _lines = [`# 侍酒師目錄（${_proj.name}）：每行第一欄就是 ref，放進購物車時原樣照抄；用 Grep 查關鍵字，要細節再 Read「檔案」欄的原檔`, '']
+  const _add = (InRef, InIcon, InTitle, InRest) => {
+    if (!InRef || /[\r\n]/.test(InRef) || _refs.has(InRef)) return
+    _refs.set(InRef, { title: InTitle, icon: InIcon })
+    _lines.push([InRef, InTitle, ...InRest.filter(Boolean)].join(' ｜ '))
+  }
+  const _intent = _read('design_intent.json')
+  _lines.push('## 🧭 設計脈絡（intent）')
+  for (const it of _intent?.intents ?? [])
+    _add(`intent:${it.id}`, '🧭', _one(it.title, 120), [`範圍 ${(it.scope ?? []).join('/')}`, _one(it.intent, 160),
+      _proj.designIntentDir && it.file ? `檔案 ${_proj.designIntentDir}/${it.file}` : '', it.symbolRefs?.length ? `符號 ${it.symbolRefs.slice(0, 8).map(r => r.name).join(',')}` : ''])
+  const _scenario = _read('scenario_experience.json')
+  _lines.push('', '## 🎬 情境（scenario）')
+  for (const sc of _scenario?.scenarios ?? [])
+    _add(`scenario:${sc.id}`, '🎬', _one(sc.title, 100), [sc.phase ? `階段 ${sc.phase}` : '', _one(sc.oneLiner, 140),
+      _proj.scenarioDir && sc.file ? `檔案 ${_proj.scenarioDir}/${sc.file}` : '', sc.intentLinks?.length ? `涵蓋意圖 ${sc.intentLinks.join(',')}` : ''])
+  const _cpp = _read('cpp_symbols.json')
+  _lines.push('', '## ◆ C++ 符號（symbol）')
+  for (const s of _cpp?.symbols ?? [])
+    _add(`symbol:${s.name}`, '◆', s.name, [s.kind, s.file ? `檔案 ${_proj.projectRoot ? `${_proj.projectRoot}/` : ''}${s.file}` : '', _one(s.comment, 100)])
+  const _assets = _read('asset_graph.json')
+  _lines.push('', '## 🎨 藍圖（bp）')
+  for (const b of _assets?.blueprints ?? [])
+    _add(`bp:${b.path}`, '🎨', b.name, [`${b.class ?? ''} 繼承 ${b.parentName ?? '?'}`])
+  const _memory = _read('memory_notes.json')
+  _lines.push('', '## 📓 拼圖（memory）')
+  for (const n of _memory?.notes ?? [])
+    _add(`memory:${n.name}`, '📓', _one(n.title, 80), [n.type, _one(n.description, 140), n.file ? `檔案 ${n.file}` : ''])
+  const _arch = _read('arch_canvas.json')
+  _lines.push('', '## 🗺️ 架構節點（arch）')
+  for (const c of _arch?.canvases ?? [])
+    for (const nd of c.nodes ?? [])
+      _add(`arch:${c.file}#${nd.id}`, '🗺️', _one(nd.title, 80), [`canvas ${_one(c.title, 60)}`, _one(nd.text, 120), nd.symbolRefs?.length ? `符號 ${nd.symbolRefs.slice(0, 6).map(r => r.name).join(',')}` : ''])
+  try {
+    fs.mkdirSync(COMPANION_CWD, { recursive: true })
+    fs.writeFileSync(path.join(COMPANION_CWD, _file), _lines.join('\n'), 'utf8')
+  } catch (e) { logEvent('tc.companion.catalog_error', { projectId: _proj.id, error: String(e?.message ?? e) }); return null }
+  const _entry = { stamp: _stamp, file: _file, refs: _refs }
+  companionCatalogCache.set(_proj.id, _entry)
+  logEvent('tc.companion.catalog', { projectId: _proj.id, refs: _refs.size })
+  return _entry
 }
 
 const COMPANION_RULES = [
@@ -6542,23 +6738,36 @@ const COMPANION_RULES = [
   '每次回覆的最後另起一行附一個機讀區塊（少爺看不到）：<tc-board>{JSON}</tc-board>，只能有一個、必須是合法 JSON。',
 ]
 
+/** 目錄規則：每個議題先查侍酒師脈絡再對齊（少爺 2026-10-06 語音原話「希望以後陪聊都能即時檢索設計脈絡還有情境，這樣子我們才能達成共識」） */
+function companionCatalogRules(InCtx) {
+  if (!InCtx.catalogFile) return []
+  return [
+    `・侍酒師目錄在你的工作目錄 ${InCtx.catalogFile}（每行第一欄是 ref：intent:／scenario:／symbol:／bp:／memory:／arch:）。少爺每提一個議題，先用 Grep 在目錄查相關的設計脈絡、情境、C++ 符號、藍圖、拼圖、架構節點，必要時 Read「檔案」欄的原檔，再用專案自己的說法跟少爺對齊——這是少爺要的達成共識方式，主動做、不要等他提醒。`,
+    '・語音聽不清楚的詞，先拿目錄比對最像的專案名詞（例如 after→Actor、充兵＝補充兵力），再跟少爺確認。',
+    '・要查資料前先說一句「我查一下○○」再動工具（少爺可能在聽語音，查資料要十幾秒，別讓他乾等）。',
+  ]
+}
+
 function companionSystemPrompt(InScope, InCtx) {
   if (InScope === 'qa') return [
     '你是 TheClaudenental 的「陪聊」：少爺（遊戲製作人）的腦力激盪夥伴，現在陪他聊一個 QA run。',
     InCtx.brief,
-    '規則：', ...COMPANION_RULES.map(r => `・${r}`),
-    '<tc-board> 格式：{"ideas":[{"id":"i1","text":"整理後的一句話","status":"draft|confirmed"}],"handoff":null}',
+    '規則：', ...COMPANION_RULES.map(r => `・${r}`), ...companionCatalogRules(InCtx),
+    '<tc-board> 格式：{"ideas":[{"id":"i1","text":"整理後的一句話","status":"draft|confirmed"}],"refs":[],"handoff":null}',
     '・ideas＝目前完整的想法清單（每次全量給、id 沿用不重編）；少爺明確同意的標 confirmed；被否決的直接移除；已交付的不必再列。',
+    '・refs＝跟這個議題相關的目錄條目 ref（照抄目錄第一欄，可累加），交付時會一併附給實作聊天室當脈絡。',
     '・少爺表示要交給實作（例如「就這樣做」「交給它」）時，handoff 填 {"summary":"給實作聊天室的一段完整整理：背景、要做什麼、怎麼驗收"}，口語上問一句「要交付嗎？」——真正送出要等少爺按「交付實作」或說「交付」，你只提議，不要說已送出。',
   ].join('\n')
   return [
-    '你是 TheClaudenental 侍酒師的「陪聊」：陪少爺（遊戲製作人）做前期腦力激盪，把成形的想法放進侍酒師購物車，之後少爺結帳帶去聊天室實作。',
+    '你是 TheClaudenental 侍酒師的「陪聊」：陪少爺（遊戲製作人）做前期腦力激盪，從侍酒師的脈絡與情境理解他的議題，把議題本身和相關條目放進侍酒師購物車，之後少爺結帳開新聊天室實作。',
     InCtx.brief,
-    '規則：', ...COMPANION_RULES.map(r => `・${r}`),
-    '<tc-board> 格式：{"ideas":[{"id":"i1","text":"整理後的一句話","status":"draft|carted"}],"cart":[{"id":"i1","text":"放進購物車的一句話","anchors":["相關名詞"]}],"uncart":[]}',
+    '規則：', ...COMPANION_RULES.map(r => `・${r}`), ...companionCatalogRules(InCtx),
+    '<tc-board> 格式：{"ideas":[{"id":"i1","text":"整理後的一句話","status":"draft|carted"}],"cart":[{"id":"i1","text":"放進購物車的一句話","anchors":["相關名詞"]}],"uncart":[],"refs":[],"unrefs":[]}',
     '・ideas＝目前完整的想法清單（每次全量、id 沿用）；已放進購物車的標 carted。',
-    '・cart＝這一輪「新」放進購物車的想法（只列新的）；少爺說要放，或想法已清楚成形、值得帶去結帳時就放，口語上簡短說「已放進購物車：…」讓少爺知道；anchors 填相關的類別名、INV 編號、情境 S## 等（沒有就給空陣列）。',
-    '・少爺說拿掉／不要了：從 ideas 移除，並在 uncart 列出那些 id。',
+    '・cart＝這一輪「新」放進購物車的想法（只列新的）；少爺說要放，或想法已清楚成形、值得帶去結帳時就放；anchors 填相關名詞（沒有就給空陣列）。',
+    '・refs＝這一輪「新」放進購物車的目錄條目（照抄目錄第一欄的 ref，只列新的）——等同少爺手動按 🛒 加入：議題牽涉到的設計脈絡、情境、C++ 符號、藍圖、拼圖、架構節點都要放，結帳開新聊天室的實作者才拿得到完整脈絡。',
+    '・放了什麼，口語上用標題簡短說一句讓少爺知道（不要念 ref）。',
+    '・少爺說拿掉／不要了：從 ideas 移除並在 uncart 列出 id；查證後發現不相關的條目放進 unrefs。',
   ].join('\n')
 }
 
@@ -6569,7 +6778,8 @@ function companionPublic(InKey) {
   const _p = companionProcs.get(InKey)
   return {
     key: InKey, scope: _c.scope, refId: _c.refId, title: _c.title,
-    messages: _c.messages.slice(-100), ideas: _c.ideas, cartLog: _c.cartLog, pendingHandoff: _c.pendingHandoff,
+    messages: _c.messages.slice(-100), ideas: _c.ideas, cartLog: _c.cartLog, cartRefs: _c.cartRefs ?? [], contextRefs: _c.contextRefs ?? [],
+    pendingHandoff: _c.pendingHandoff,
     status: _p ? _p.status : 'off', model: _c.model ?? null, updatedAt: _c.updatedAt,
   }
 }
@@ -6619,12 +6829,45 @@ function companionApplyBoard(InKey, InBoard) {
       .filter(i => !_handed.some(h => h.id === i.id))
     _c.ideas = [..._handed, ..._fresh]
   }
+  // 目錄條目 ref：只收目錄裡真的有的；查無的告訴陪聊下一句修正（不靜默丟）
+  const _catalog = companionCatalog(companionContext(_c.scope, _c.refId)?.projectId)
+  const _validRefs = (InList) => {
+    const _ok = [], _bad = []
+    for (const _r of (Array.isArray(InList) ? InList : [])) {
+      const _ref = String(_r ?? '').trim()
+      if (!_ref) continue
+      if (_catalog?.refs.has(_ref)) _ok.push(_ref); else _bad.push(_ref)
+    }
+    if (_bad.length) _c.notes.push(`這些 ref 不在目錄裡、已略過，請用 Grep 查目錄照抄第一欄：${_bad.slice(0, 6).join('、')}`)
+    return _ok
+  }
   if (_c.scope === 'qa') {
     if (InBoard.handoff && typeof InBoard.handoff.summary === 'string' && InBoard.handoff.summary.trim()) {
       _c.pendingHandoff = { summary: InBoard.handoff.summary.trim().slice(0, 4000), ts: Date.now() }
     }
+    _c.contextRefs = _c.contextRefs ?? []
+    for (const _ref of _validRefs(InBoard.refs)) {
+      if (_c.contextRefs.some(x => x.ref === _ref)) continue
+      _c.contextRefs.push({ ref: _ref, title: _catalog.refs.get(_ref).title, icon: _catalog.refs.get(_ref).icon, ts: Date.now() })
+    }
   }
   if (_c.scope === 'som') {
+    // 目錄條目進購物車（client 用手動 🛒 同一份快照）；已在車上的不重送，拿掉後再放算新的一筆
+    _c.cartRefs = _c.cartRefs ?? []
+    const _addRefs = []
+    for (const _ref of _validRefs(InBoard.refs)) {
+      if (_c.cartRefs.some(x => x.ref === _ref && !x.removed && !x.checkedOut)) continue
+      const _meta = _catalog.refs.get(_ref)
+      const _entry = { ref: _ref, title: _meta.title, icon: _meta.icon, ts: Date.now(), removed: false, checkedOut: false }
+      _c.cartRefs = _c.cartRefs.filter(x => x.ref !== _ref)
+      _c.cartRefs.push(_entry)
+      _addRefs.push(_entry)
+    }
+    const _removeRefs = []
+    for (const _r of (Array.isArray(InBoard.unrefs) ? InBoard.unrefs : [])) {
+      const _e = _c.cartRefs.find(x => x.ref === String(_r) && !x.removed)
+      if (_e) { _e.removed = true; _removeRefs.push(_e.ref) }
+    }
     const _added = []
     for (const _it of (Array.isArray(InBoard.cart) ? InBoard.cart : [])) {
       if (!_it || typeof _it.text !== 'string' || !_it.text.trim()) continue
@@ -6640,9 +6883,9 @@ function companionApplyBoard(InKey, InBoard) {
       const _e = _c.cartLog.find(x => x.id === String(_id))
       if (_e && !_e.removed) { _e.removed = true; _removed.push(_e.id) }
     }
-    if (_added.length || _removed.length) {
-      broadcast({ type: 'companion_cart', key: InKey, projectId: _c.refId, add: _added, remove: _removed })
-      logEvent('tc.companion.cart', { key: InKey, add: _added.length, remove: _removed.length })
+    if (_added.length || _removed.length || _addRefs.length || _removeRefs.length) {
+      broadcast({ type: 'companion_cart', key: InKey, projectId: _c.refId, add: _added, remove: _removed, addRefs: _addRefs, removeRefs: _removeRefs })
+      logEvent('tc.companion.cart', { key: InKey, add: _added.length, remove: _removed.length, addRefs: _addRefs.length, removeRefs: _removeRefs.length })
     }
   }
   _c.updatedAt = Date.now()
@@ -6711,6 +6954,7 @@ function companionSpawn(InKey) {
   const _ctx = companionContext(_c.scope, _c.refId)
   if (!_ctx) return null
   try { fs.mkdirSync(COMPANION_CWD, { recursive: true }) } catch {}
+  _ctx.catalogFile = companionCatalog(_ctx.projectId)?.file ?? null
   const _model = getTcSetting('companion.model', null) || 'sonnet'
   const _effort = getTcSetting('companion.effort', null)
   const _args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--include-partial-messages',
@@ -6808,7 +7052,7 @@ function companionEnsure(InScope, InRefId) {
   if (!companionStore[_key]) {
     const _ctx = companionContext(InScope, InRefId)
     if (!_ctx) return null
-    companionStore[_key] = { scope: InScope, refId: InRefId, title: _ctx.title, messages: [], ideas: [], cartLog: [], pendingHandoff: null, notes: [], claudeSid: null, createdAt: Date.now(), updatedAt: Date.now() }
+    companionStore[_key] = { scope: InScope, refId: InRefId, title: _ctx.title, messages: [], ideas: [], cartLog: [], cartRefs: [], contextRefs: [], pendingHandoff: null, notes: [], claudeSid: null, createdAt: Date.now(), updatedAt: Date.now() }
     persistCompanions()
   }
   return _key
@@ -6869,17 +7113,32 @@ app.post('/api/companion/board', async (request) => {
   companionBroadcast(key)
   return { ok: true }
 })
-// 侍酒師：少爺在購物車手動移除／放回陪聊加的想法 → 記到 cartLog 並告訴陪聊
+// 侍酒師：少爺在購物車手動移除／放回陪聊加的想法（id）或目錄條目（ref）→ 記下來並告訴陪聊
 app.post('/api/companion/cart-sync', async (request) => {
-  const { key, id, removed } = request.body ?? {}
+  const { key, id, ref, removed } = request.body ?? {}
   const _c = companionStore[key]
-  const _e = _c?.cartLog.find(x => x.id === id)
+  if (!_c) return { ok: false }
+  const _e = ref ? (_c.cartRefs ?? []).find(x => x.ref === ref) : _c.cartLog.find(x => x.id === id)
   if (!_e) return { ok: false }
   _e.removed = !!removed
-  _c.notes.push(`少爺${removed ? '從購物車拿掉了' : '把它放回購物車：'} ${_e.id}「${_e.text}」`)
+  if (!removed) _e.checkedOut = false
+  _c.notes.push(`少爺${removed ? '從購物車拿掉了' : '把它放回購物車：'} ${ref ? `${_e.ref}「${_e.title}」` : `${_e.id}「${_e.text}」`}`)
   persistCompanions()
   companionBroadcast(key)
   return { ok: true }
+})
+// 侍酒師：少爺結帳（送入／開新聊天室）或清空購物車 → 陪聊放進去的都標「已結帳」，之後補回時不會再塞回去
+app.post('/api/companion/cart-checkout', async (request) => {
+  const { key, reason } = request.body ?? {}
+  const _c = companionStore[key]
+  if (!_c) return { ok: false }
+  let _n = 0
+  for (const _e of [..._c.cartLog, ...(_c.cartRefs ?? [])]) if (!_e.removed && !_e.checkedOut) { _e.checkedOut = true; _n++ }
+  if (_n) _c.notes.push(reason === 'cleared' ? '少爺清空了購物車；之後的新想法是新一輪' : '少爺已結帳，把購物車帶去新聊天室實作；之後的新想法是新一輪')
+  persistCompanions()
+  companionBroadcast(key)
+  logEvent('tc.companion.checkout', { key, reason: reason ?? 'checkout', items: _n })
+  return { ok: true, items: _n }
 })
 // QA 交付：組成留言走既有 /control 留言鏈（含喚醒：監看活著→監看、否則做法 B 直投、再否則無頭／新開聊天室接手）
 app.post('/api/companion/handoff', async (request, reply) => {
@@ -6889,10 +7148,12 @@ app.post('/api/companion/handoff', async (request, reply) => {
   const _ideas = _c.ideas.filter(i => i.status !== 'handed')
   const _summary = String(summary ?? _c.pendingHandoff?.summary ?? '').trim()
   if (!_summary && !_ideas.length) return { ok: false, error: '想法板是空的，沒有可交付的內容' }
+  const _ctxRefs = _c.contextRefs ?? []
   const _text = [
     '🗣 陪聊交付（少爺在 TC 陪聊中整理並確認要實作的想法）',
     _summary,
     _ideas.length ? `想法清單：\n${_ideas.map(i => `- ${i.status === 'confirmed' ? '［已確認］' : '［草稿］'}${i.text}`).join('\n')}` : '',
+    _ctxRefs.length ? `相關脈絡（侍酒師目錄條目，可在侍酒師或原檔查）：\n${_ctxRefs.map(r => `- ${r.icon ?? ''}${r.title}（${r.ref}）`).join('\n')}` : '',
     '請照 Mode C 流程處理：先列計畫給少爺在 QA 分頁審，少爺放行前不動工。',
   ].filter(Boolean).join('\n\n')
   const _res = await app.inject({ method: 'POST', url: `/api/qa/runs/${_c.refId}/control`, payload: { action: 'comment', text: _text, inPlaceLink: true } })
@@ -6925,7 +7186,7 @@ app.post('/api/companion/reset', async (request) => {
   const _c = companionStore[_key]
   if (!_c) return { ok: false }
   companionStop(_key, 'reset')
-  Object.assign(_c, { messages: [], ideas: [], cartLog: [], pendingHandoff: null, notes: [], claudeSid: null, updatedAt: Date.now() })
+  Object.assign(_c, { messages: [], ideas: [], cartLog: [], cartRefs: [], contextRefs: [], pendingHandoff: null, notes: [], claudeSid: null, updatedAt: Date.now() })
   persistCompanions()
   companionBroadcast(_key)
   return { ok: true }
@@ -6945,6 +7206,10 @@ for (const [, s] of sessions) {
 // Start JSONL scanner
 scanJsonlSessions()
 setInterval(scanJsonlSessions, SCAN_INTERVAL_MS)
+
+// 誓約勿擾對帳：開機一次＋每半小時——排程被別的腳本重新註冊後，趕在下次執行前補包回去
+setTimeout(() => reconcileMarkerQuiet(null, 'boot'), 15_000)
+setInterval(() => reconcileMarkerQuiet(), MARKER_QUIET_RECONCILE_MS)
 
 // 模型目錄：開機建一次、每日重建一次。Claude Code 升版帶進新模型 alias 與新版官方模型表時自動被吃到，
 // 不必有人記得去改三份硬編清單（少爺 2026-08-15「要能自動更新這個功能」）

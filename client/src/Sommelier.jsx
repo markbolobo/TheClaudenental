@@ -765,6 +765,95 @@ function AssetView({ assetGraph, projectId, query, onJumpToSymbol, cartKeys, onT
   )
 }
 
+// ── 侍酒師條目 → 購物車選件快照（手動 🛒 與陪聊共用同一份；少爺 2026-10-06「視同我原本手動加入的操作」）──
+function cartItemOfSymbol(InPid, InData, InSym) {
+  return {
+    key: symbolKey(InPid, InSym), project: InData?.project, commit: InData?.commit,
+    symbol: InSym.name, member: null, kind: InSym.kind, reflected: InSym.reflected,
+    sig: InSym.bases?.length ? `${InSym.name} : ${InSym.bases.join(', ')}` : InSym.name,
+    file: InSym.file, line: InSym.line, region: null,
+    comment: InSym.comment ?? '',
+  }
+}
+function cartItemOfNode(InPid, InData, InCanvas, InNode) {
+  return {
+    key: archNodeKey(InPid, InCanvas.file, InNode.id), project: InData?.project, nodeKind: 'archNode',
+    canvas: InCanvas.file, canvasTitle: InCanvas.title,
+    nodeTitle: InNode.title, text: InNode.text,
+    symbolRefs: (InNode.symbolRefs ?? []).map(r => r.name),
+  }
+}
+function cartItemOfIntent(InPid, InData, InIt) {
+  return {
+    key: intentKey(InPid, InIt.id), project: InData?.project, nodeKind: 'intent',
+    intentId: InIt.id, intentTitle: InIt.title, scope: InIt.scope, intent: InIt.intent,
+    invariants: (InIt.invariants ?? []).map(v => ({ id: v.id, text: v.text, checked: v.checked })),
+    openDecisions: (InIt.openDecisions ?? []).filter(d => !d.resolved).map(d => ({ id: d.id, title: d.title, options: d.options })),
+    symbolRefs: (InIt.symbolRefs ?? []).map(r => r.name),
+  }
+}
+function cartItemOfScenario(InPid, InData, InSc) {
+  return {
+    key: scenarioKey(InPid, InSc.id), project: InData?.project, nodeKind: 'scenario',
+    scenarioId: InSc.id, scenarioTitle: InSc.title, phase: InSc.phase, flow: InSc.flow, status: InSc.status, oneLiner: InSc.oneLiner,
+    thesis: (InSc.thesis ?? []).map(t => ({ dimension: t.dimension, marker: t.marker, answer: t.answer })),
+    gaps: (InSc.gaps ?? []).map(g => ({ id: g.id, text: g.text })),
+    openDecisions: (InSc.openDecisions ?? []).filter(d => !d.resolved).map(d => ({ id: d.id, title: d.title, options: d.options })),
+    intentLinks: InSc.intentLinks ?? [],
+  }
+}
+function cartItemOfNote(InPid, InData, InNote) {
+  return {
+    key: memoryNoteKey(InPid, InNote.name), project: InData?.project, nodeKind: 'memoryNote',
+    noteName: InNote.name, noteTitle: InNote.title, noteType: InNote.type,
+    description: InNote.description, text: InNote.text,
+  }
+}
+function cartItemOfBp(InPid, InData, InBp) {
+  return {
+    key: bpKey(InPid, InBp.path), project: InData?.project, nodeKind: 'bp',
+    bpName: InBp.name, bpClass: InBp.class, parentName: InBp.parentName, deps: InBp.deps ?? [],
+  }
+}
+
+/** 陪聊回報的目錄 ref（intent:／scenario:／symbol:／bp:／memory:／arch:）→ { item, icon, title }；查無＝null */
+function resolveCartRef(InPid, InPayload, InRef) {
+  const _ref = String(InRef ?? '')
+  const _at = _ref.indexOf(':')
+  if (_at < 0 || !InPayload) return null
+  const _kind = _ref.slice(0, _at)
+  const _id = _ref.slice(_at + 1)
+  const _data = InPayload.data
+  if (_kind === 'intent') {
+    const _it = (InPayload.designIntent?.intents ?? []).find(x => x.id === _id)
+    return _it ? { item: cartItemOfIntent(InPid, _data, _it), icon: '🧭', title: _it.title } : null
+  }
+  if (_kind === 'scenario') {
+    const _sc = (InPayload.scenario?.scenarios ?? []).find(x => x.id === _id)
+    return _sc ? { item: cartItemOfScenario(InPid, _data, _sc), icon: '🎬', title: _sc.title } : null
+  }
+  if (_kind === 'symbol') {
+    const _syms = _data?.symbols ?? []
+    const _sym = _syms.find(x => x.name === _id) ?? _syms.find(x => ['U', 'A', 'I', 'F', 'E'].some(p => x.name === p + _id))
+    return _sym ? { item: cartItemOfSymbol(InPid, _data, _sym), icon: KIND_META[_sym.kind]?.icon ?? '◆', title: _sym.name } : null
+  }
+  if (_kind === 'bp') {
+    const _bp = (InPayload.assetGraph?.blueprints ?? []).find(x => x.path === _id || x.name === _id)
+    return _bp ? { item: cartItemOfBp(InPid, _data, _bp), icon: '🎨', title: _bp.name } : null
+  }
+  if (_kind === 'memory') {
+    const _note = (InPayload.memory?.notes ?? []).find(x => x.name === _id)
+    return _note ? { item: cartItemOfNote(InPid, _data, _note), icon: '📓', title: _note.title } : null
+  }
+  if (_kind === 'arch') {
+    const [_file, _nodeId] = _id.split('#')
+    const _canvas = (InPayload.arch?.canvases ?? []).find(x => x.file === _file)
+    const _node = _canvas?.nodes?.find(x => x.id === _nodeId)
+    return _node ? { item: cartItemOfNode(InPid, _data, _canvas, _node), icon: '🗺️', title: _node.title } : null
+  }
+  return null
+}
+
 export function SommelierPanel({ onGoToChat, projects: projectsProp = null, activeProjectId = null, onSelectProject = null, onManageProjects = null }) {
   const MODEL_OPTIONS = useModelOptions()   // server 目錄推來就自動換清單（少爺 2026-08-15）
   // 跨專案切換：App 傳入共享狀態時用它（與 QA 分頁同步切換）；未傳入則退回面板內自管（獨立使用相容）
@@ -998,28 +1087,17 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
   }
 
   const toggleCartSymbol = (sym) => {
-    const key = symbolKey(projectId, sym)
-    if (cartKeys.has(key)) { setCart(c => c.filter(i => i.key !== key)); return }
-    setCart(c => [...c, {
-      key, project: data?.project, commit: data?.commit,
-      symbol: sym.name, member: null, kind: sym.kind, reflected: sym.reflected,
-      sig: sym.bases?.length ? `${sym.name} : ${sym.bases.join(', ')}` : sym.name,
-      file: sym.file, line: sym.line, region: null,
-      comment: sym.comment ?? '',
-    }])
+    const _item = cartItemOfSymbol(projectId, data, sym)
+    if (cartKeys.has(_item.key)) { setCart(c => c.filter(i => i.key !== _item.key)); return }
+    setCart(c => [...c, _item])
     flash(`已加入條目:${sym.name}`, 1500)
   }
 
   // 架構節點 → 選件（帶設計說明 + 關聯符號）
   const toggleCartNode = (canvas, node) => {
-    const key = archNodeKey(projectId, canvas.file, node.id)
-    if (cartKeys.has(key)) { setCart(c => c.filter(i => i.key !== key)); return }
-    setCart(c => [...c, {
-      key, project: data?.project, nodeKind: 'archNode',
-      canvas: canvas.file, canvasTitle: canvas.title,
-      nodeTitle: node.title, text: node.text,
-      symbolRefs: node.symbolRefs.map(r => r.name),
-    }])
+    const _item = cartItemOfNode(projectId, data, canvas, node)
+    if (cartKeys.has(_item.key)) { setCart(c => c.filter(i => i.key !== _item.key)); return }
+    setCart(c => [...c, _item])
     flash(`已加入系統節點：${node.title}`, 1500)
   }
 
@@ -1040,30 +1118,17 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
   const jumpToScenario = (id) => { setScenarioJumpId(id); setMode('scenario') }
 
   const toggleCartIntent = (it) => {
-    const key = intentKey(projectId, it.id)
-    if (cartKeys.has(key)) { setCart(c => c.filter(i => i.key !== key)); return }
-    setCart(c => [...c, {
-      key, project: data?.project, nodeKind: 'intent',
-      intentId: it.id, intentTitle: it.title, scope: it.scope, intent: it.intent,
-      invariants: it.invariants.map(v => ({ id: v.id, text: v.text, checked: v.checked })),
-      openDecisions: (it.openDecisions ?? []).filter(d => !d.resolved).map(d => ({ id: d.id, title: d.title, options: d.options })),
-      symbolRefs: it.symbolRefs.map(r => r.name),
-    }])
+    const _item = cartItemOfIntent(projectId, data, it)
+    if (cartKeys.has(_item.key)) { setCart(c => c.filter(i => i.key !== _item.key)); return }
+    setCart(c => [...c, _item])
     flash(`已加入設計脈絡：${it.title}`, 1500)
   }
 
   // 🎬 情境 → 選件（帶一句話＋題目對照＋缺口＋待定奪＋涵蓋意圖；結帳＝觸發 z_sub_scenario_experience 工作流）
   const toggleCartScenario = (sc) => {
-    const key = scenarioKey(projectId, sc.id)
-    if (cartKeys.has(key)) { setCart(c => c.filter(i => i.key !== key)); return }
-    setCart(c => [...c, {
-      key, project: data?.project, nodeKind: 'scenario',
-      scenarioId: sc.id, scenarioTitle: sc.title, phase: sc.phase, flow: sc.flow, status: sc.status, oneLiner: sc.oneLiner,
-      thesis: (sc.thesis ?? []).map(t => ({ dimension: t.dimension, marker: t.marker, answer: t.answer })),
-      gaps: (sc.gaps ?? []).map(g => ({ id: g.id, text: g.text })),
-      openDecisions: (sc.openDecisions ?? []).filter(d => !d.resolved).map(d => ({ id: d.id, title: d.title, options: d.options })),
-      intentLinks: sc.intentLinks ?? [],
-    }])
+    const _item = cartItemOfScenario(projectId, data, sc)
+    if (cartKeys.has(_item.key)) { setCart(c => c.filter(i => i.key !== _item.key)); return }
+    setCart(c => [...c, _item])
     flash(`已加入情境：${sc.title}`, 1500)
   }
   const toggleCartNewScenario = () => {
@@ -1074,24 +1139,17 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
   }
 
   const toggleCartNote = (note) => {
-    const key = memoryNoteKey(projectId, note.name)
-    if (cartKeys.has(key)) { setCart(c => c.filter(i => i.key !== key)); return }
-    setCart(c => [...c, {
-      key, project: data?.project, nodeKind: 'memoryNote',
-      noteName: note.name, noteTitle: note.title, noteType: note.type,
-      description: note.description, text: note.text,
-    }])
+    const _item = cartItemOfNote(projectId, data, note)
+    if (cartKeys.has(_item.key)) { setCart(c => c.filter(i => i.key !== _item.key)); return }
+    setCart(c => [...c, _item])
     flash(`已加入拼圖：${note.title}`, 1500)
   }
 
   // 藍圖 → 選件（帶父類 + 引用資產）
   const toggleCartBp = (b) => {
-    const key = bpKey(projectId, b.path)
-    if (cartKeys.has(key)) { setCart(c => c.filter(i => i.key !== key)); return }
-    setCart(c => [...c, {
-      key, project: data?.project, nodeKind: 'bp',
-      bpName: b.name, bpClass: b.class, parentName: b.parentName, deps: b.deps ?? [],
-    }])
+    const _item = cartItemOfBp(projectId, data, b)
+    if (cartKeys.has(_item.key)) { setCart(c => c.filter(i => i.key !== _item.key)); return }
+    setCart(c => [...c, _item])
     flash(`已加入藍圖：${b.name}`, 1500)
   }
 
@@ -1105,20 +1163,55 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
       ideaText: InEntry.text, anchors: InEntry.anchors ?? [], companionKey: InCompanionKey, ideaId: InEntry.id,
     }])
   }, [data?.project])
+  // 陪聊回報的目錄條目 → 用手動 🛒 同一份快照放進購物車（只加不切換：已在車上就不動）；帶 companionKey／companionRef 讓拿掉時能回報
+  const addRefToCart = useCallback((InCompanionKey, InRef) => {
+    const _res = resolveCartRef(projectId, payload, InRef)
+    if (!_res) return null
+    setCart(c => c.some(i => i.key === _res.item.key) ? c : [...c, { ..._res.item, companionKey: InCompanionKey, companionRef: InRef }])
+    return _res
+  }, [projectId, payload])
   useEffect(() => {
     const _onCart = (e) => {
       const _d = e.detail
       if (!_d || _d.projectId !== projectId) return
       for (const _entry of _d.add ?? []) addIdeaToCart(_d.key, _entry)
-      if (_d.remove?.length) {
-        const _drop = new Set(_d.remove.map(id => ideaCartKey(_d.key, id)))
-        setCart(c => c.filter(i => !_drop.has(i.key)))
-      }
-      if (_d.add?.length) flash(`🗣 陪聊放進購物車：${_d.add.map(a => a.text).join('；').slice(0, 120)}`, 5000)
+      const _refTitles = []
+      for (const _r of _d.addRefs ?? []) { const _res = addRefToCart(_d.key, _r.ref); if (_res) _refTitles.push(`${_res.icon}${_res.title}`) }
+      const _drop = new Set((_d.remove ?? []).map(id => ideaCartKey(_d.key, id)))
+      for (const _ref of _d.removeRefs ?? []) { const _res = resolveCartRef(projectId, payload, _ref); if (_res) _drop.add(_res.item.key) }
+      if (_drop.size) setCart(c => c.filter(i => !_drop.has(i.key)))
+      const _said = [...(_d.add ?? []).map(a => `💡${a.text}`), ..._refTitles]
+      if (_said.length) flash(`🗣 陪聊放進購物車：${_said.join('；').slice(0, 160)}`, 6000)
     }
     window.addEventListener('tc-companion-cart', _onCart)
     return () => window.removeEventListener('tc-companion-cart', _onCart)
-  }, [projectId, addIdeaToCart, flash])
+  }, [projectId, payload, addIdeaToCart, addRefToCart, flash])
+  // 開陪聊面板時補回：伺服器紀錄「還在車上、沒結帳」的陪聊選件，若因漏接事件（頁面重整、面板沒開）不在購物車就補上
+  const reconcileCompanionCart = useCallback((InState) => {
+    if (!InState?.key) return
+    for (const _e of InState.cartLog ?? []) if (!_e.removed && !_e.checkedOut) addIdeaToCart(InState.key, _e)
+    for (const _e of InState.cartRefs ?? []) if (!_e.removed && !_e.checkedOut) addRefToCart(InState.key, _e.ref)
+  }, [addIdeaToCart, addRefToCart])
+  // 從購物車或陪聊面板拿掉／放回陪聊放的目錄條目 → 同步回陪聊
+  const toggleRefCart = useCallback((InCompanionKey, InRef, InPutBack) => {
+    if (InPutBack) addRefToCart(InCompanionKey, InRef)
+    else {
+      const _res = resolveCartRef(projectId, payload, InRef)
+      if (_res) setCart(c => c.filter(i => i.key !== _res.item.key))
+    }
+    fetch('/api/companion/cart-sync', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: InCompanionKey, ref: InRef, removed: !InPutBack }) }).catch(() => {})
+  }, [projectId, payload, addRefToCart])
+  // 結帳（送入／開新聊天室）或清空 → 陪聊放的選件標「已結帳」，補回時不會再塞回來
+  const markCompanionCheckout = (InItems, InReason) => {
+    for (const _key of new Set(InItems.map(i => i.companionKey).filter(Boolean)))
+      fetch('/api/companion/cart-checkout', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: _key, reason: InReason }) }).catch(() => {})
+  }
+  const refCartInfo = (InRef) => {
+    const _res = resolveCartRef(projectId, payload, InRef)
+    return _res ? { icon: _res.icon, title: _res.title, inCart: cartKeys.has(_res.item.key) } : null
+  }
   // 從購物車或陪聊面板拿掉／放回陪聊加的想法 → 同步回陪聊（它下一句就知道）
   const toggleIdeaCart = useCallback((InCompanionKey, InEntry, InPutBack) => {
     const key = ideaCartKey(InCompanionKey, InEntry.id)
@@ -1129,6 +1222,7 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
   }, [addIdeaToCart])
   const removeCartItem = (it) => {
     if (it.nodeKind === 'idea') { toggleIdeaCart(it.companionKey, { id: it.ideaId, text: it.ideaText, anchors: it.anchors }, false); return }
+    if (it.companionRef) { toggleRefCart(it.companionKey, it.companionRef, false); return }
     setCart(c => c.filter(x => x.key !== it.key))
   }
 
@@ -1174,6 +1268,7 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
     }).then(r => r.json()).catch(() => ({ ok: false }))
     if (!r.ok) { flash('送入失敗 — 請改用複製', 6000); return }
     // 少爺 2026-07-07：送入/開新聊天室＝侍酒師工作完成 → 清空購物車與描述(+附檔) + 無接縫導到 Chat（同 History Continue）
+    markCompanionCheckout(cart, 'checkout')
     setCart([])
     setDraft('')
     setAttachments([])
@@ -1487,6 +1582,8 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
           <CompanionPanel key={projectId} scope="som" refId={projectId}
             subtitle={projects.find(p => p.id === projectId)?.name ?? projectId}
             cartKeyOf={ideaCartKey} cartKeys={cartKeys} onCartToggle={toggleIdeaCart}
+            refInfo={refCartInfo} onRefToggle={toggleRefCart} onStateLoaded={reconcileCompanionCart}
+            cartCount={cart.length} onGoToCart={() => { setCompanionOpen(false); setCartOpen(true) }}
             onClose={() => setCompanionOpen(false)} />
         )}
         {/* 右:購物車抽屜 */}
@@ -1496,7 +1593,7 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
               <span className="text-[var(--gold)] text-xs">🛒 選件購物車({cart.length})</span>
               <div className="flex-1" />
               {cart.length > 0 && (
-                <button onClick={() => setCart([])} className="text-[9px] text-[var(--text-muted)] hover:text-red-400">清空選件</button>
+                <button onClick={() => { markCompanionCheckout(cart, 'cleared'); setCart([]) }} className="text-[9px] text-[var(--text-muted)] hover:text-red-400">清空選件</button>
               )}
               <button onClick={() => setCartOpen(false)} className="text-[11px] text-[var(--text-muted)] hover:text-[var(--text)]" title="關閉(Esc)">✕</button>
             </div>
@@ -1565,6 +1662,7 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
                           ? <div className="text-[9px] text-[var(--text-muted)] truncate">情境名與階段寫在需求描述裡</div>
                           : it.comment && <div className="text-[9px] text-[var(--text-muted)] truncate">{it.comment.split('\n')[0]}</div>}
                       </div>
+                      {it.companionRef && <span title="陪聊放入（與手動 🛒 加入相同的選件）" className="text-[9px] text-[var(--gold)]/70 shrink-0">🗣</span>}
                       <button onClick={() => removeCartItem(it)}
                         className="text-[10px] text-[var(--text-muted)] hover:text-red-400 shrink-0" title="移除">✕</button>
                     </div>

@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
+import QuietToggle, { QUIET_HINT } from './QuietToggle'
 
 // ─── Marker（誓約）彈跳視窗（少爺 2026-08-06）───────────────────────────────────
 // 列出「你委託 Claude 定期履行的任務」＝ TC server 內建定時 ＋ Windows 排程（GET /api/markers）。
@@ -70,6 +71,19 @@ export default function MarkerPanel({ onClose }) {
 
   useEffect(() => { load() }, [load])
 
+  // 勿擾逐項設定（POST /api/markers/quiet）：Windows 排程會改寫排程動作並回讀驗證，失敗原因顯示在該卡
+  const [quietBusy, setQuietBusy] = useState(null)
+  const [quietErr, setQuietErr] = useState({})
+  const toggleQuiet = async (m, InQuiet) => {
+    setQuietBusy(m.id); setQuietErr(_p => ({ ..._p, [m.id]: null }))
+    const _res = await fetch('/api/markers/quiet', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: m.id, quiet: InQuiet }),
+    }).then(r => r.json()).catch(e => ({ ok: false, error: e.message }))
+    setQuietBusy(null)
+    if (_res.ok) setMarkers(_prev => _prev.map(x => x.id === m.id ? { ...x, quiet: _res.quiet, quietPending: false } : x))
+    else setQuietErr(_p => ({ ..._p, [m.id]: _res.error ?? '設定失敗' }))
+  }
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onClose}>
       <div
@@ -98,8 +112,13 @@ export default function MarkerPanel({ onClose }) {
                 <div className="flex items-center gap-2">
                   <span className={`text-[9px] px-1.5 py-0.5 rounded border shrink-0 ${sm.cls}`}>{sm.icon} {m.source}</span>
                   <span className="text-[12px] text-[var(--text)] flex-1 truncate">{m.name}</span>
+                  {m.quietSupported && (
+                    <QuietToggle on={!!m.quiet} busy={quietBusy === m.id} pending={!!m.quietPending} onToggle={(v) => toggleQuiet(m, v)}
+                      title={m.quietPending ? `${QUIET_HINT}\n排程動作被改回原樣（例如重新註冊），正在照你的設定補套` : QUIET_HINT} />
+                  )}
                   <span className={`text-[9px] shrink-0 ${m.state === 'Disabled' ? 'text-[var(--text-muted)]' : 'text-green-400'}`}>{m.state}</span>
                 </div>
+                {quietErr[m.id] && <div className="text-[9px] text-red-400 mt-1">⚠️ 勿擾：{quietErr[m.id]}</div>}
                 {m.desc && <div className="text-[9px] text-[var(--text-muted)] mt-1">{m.desc}</div>}
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 mt-1.5 text-[9px]">
                   <span className="text-[var(--gold)]/80">🕒 {m.schedule}</span>
@@ -116,6 +135,7 @@ export default function MarkerPanel({ onClose }) {
         <div className="px-4 py-2 border-t border-[var(--border)] text-[8px] text-[var(--text-muted)]">
           來源：TC server 內建定時 ＋ Windows 排程（名稱含 Claude／Roman）。未來新增同類任務會自動出現。
           {defaultDaily && <> 每日行程預設時刻 {defaultDaily}（⚙ 總設定可改）。</>}
+          {' '}🔕 勿擾＝執行時不跳主控台視窗、工具自己的對話框照常（逐項設定）。
         </div>
       </div>
     </div>
