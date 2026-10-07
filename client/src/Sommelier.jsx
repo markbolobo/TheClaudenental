@@ -102,7 +102,18 @@ function composePrompt(draft, items) {
     const proj = items[0]?.project ?? ''
     const commits = [...new Set(items.map(i => i.commit).filter(Boolean))]
     lines.push(`── 🍷 侍酒師選件(${proj}${commits.length ? ' @ ' + commits.join(', ') : ''})──`)
-    items.forEach((it, idx) => {
+    // 陪聊整理排最前：實作聊天室先讀討論結果，再看各條目
+    const _ordered = [...items.filter(i => i.nodeKind === 'companionBrief'), ...items.filter(i => i.nodeKind !== 'companionBrief')]
+    _ordered.forEach((it, idx) => {
+      if (it.nodeKind === 'companionBrief') {
+        lines.push(`${idx + 1}. 【陪聊整理】開發者朋友與少爺的討論結果（之後的實作請先讀）`)
+        if (it.summary) lines.push(`   議題: ${it.summary.replace(/\n+/g, ' / ')}`)
+        if (it.decisions?.length) lines.push(`   已說定: ${it.decisions.join(' | ')}`)
+        if (it.open?.length) lines.push(`   還要少爺定（動工前先問）: ${it.open.join(' | ')}`)
+        if (it.ripples?.length) lines.push(`   採納的連帶建議: ${it.ripples.map(r => `${r.text}${r.why ? `——${r.why}` : ''}${r.facets?.length ? `〔影響：${r.facets.join('、')}〕` : ''}`).join(' | ')}`)
+        if (it.duties?.length) lines.push(`   交接要求: ${it.duties.join(' ')}`)
+        return
+      }
       if (it.nodeKind === 'archNode') {
         lines.push(`${idx + 1}. 【系統節點】${it.nodeTitle} — ${it.canvasTitle}`)
         if (it.text) lines.push(`   設計說明: ${it.text.replace(/\n+/g, ' / ').slice(0, 400)}`)
@@ -125,6 +136,8 @@ function composePrompt(draft, items) {
       }
       if (it.nodeKind === 'idea') {
         lines.push(`${idx + 1}. 【陪聊想法】${it.ideaText}`)
+        if (it.why) lines.push(`   理由（陪聊的連帶建議）: ${it.why}`)
+        if (it.facets?.length) lines.push(`   影響的體驗面向: ${it.facets.join('、')}`)
         if (it.anchors?.length) lines.push(`   相關: ${it.anchors.join(', ')}`)
         return
       }
@@ -1160,7 +1173,8 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
     const key = ideaCartKey(InCompanionKey, InEntry.id)
     setCart(c => c.some(i => i.key === key) ? c : [...c, {
       key, project: data?.project, nodeKind: 'idea',
-      ideaText: InEntry.text, anchors: InEntry.anchors ?? [], companionKey: InCompanionKey, ideaId: InEntry.id,
+      ideaText: InEntry.text, anchors: InEntry.anchors ?? [], facets: InEntry.facets ?? [], why: InEntry.why ?? '',
+      companionKey: InCompanionKey, ideaId: InEntry.id,
     }])
   }, [data?.project])
   // 陪聊回報的目錄條目 → 用手動 🛒 同一份快照放進購物車（只加不切換：已在車上就不動）；帶 companionKey／companionRef 讓拿掉時能回報
@@ -1186,12 +1200,41 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
     window.addEventListener('tc-companion-cart', _onCart)
     return () => window.removeEventListener('tc-companion-cart', _onCart)
   }, [projectId, payload, addIdeaToCart, addRefToCart, flash])
+  // 📝 陪聊整理（少爺 2026-10-08「我預期他幫我理的脈絡，也都是之後聊天室能完善處理」）：陪聊的交接摘要＝購物車裡一個選件，
+  // 跟著摘要版號自動更新；結帳或拿掉後，這一版不再放回（摘要有新版才再出現）。組合 prompt 時排最前。
+  const syncCompanionBrief = useCallback((InState) => {
+    if (!InState?.key || InState.scope !== 'som' || InState.refId !== projectId) return
+    const _key = `${InState.key}:brief`
+    const _active = !!InState.brief && (InState.briefRev ?? 0) > (InState.briefDoneRev ?? 0)
+    if (!_active) { setCart(c => c.some(i => i.key === _key) ? c.filter(i => i.key !== _key) : c); return }
+    // 採納的連帶建議：已用按鈕採納、以想法選件進車的帶自己的理由，這裡只補陪聊口頭採納、沒有獨立選件的
+    const _adopted = (InState.ripples ?? []).filter(r => r.status === 'adopted' && !r.handed
+      && !(InState.cartLog ?? []).some(e => e.id === `x${r.id}` && !e.removed && !e.checkedOut))
+    const _item = {
+      key: _key, project: data?.project, nodeKind: 'companionBrief', companionKey: InState.key, rev: InState.briefRev,
+      summary: InState.brief.summary ?? '', decisions: InState.brief.decisions ?? [], open: InState.brief.open ?? [],
+      ripples: _adopted.map(r => ({ text: r.text, why: r.why ?? '', facets: r.facets ?? [] })), duties: InState.handoffDuties ?? [],
+    }
+    setCart(c => {
+      const _at = c.findIndex(i => i.key === _key)
+      if (_at < 0) return [_item, ...c]
+      const _next = [...c]
+      _next[_at] = _item
+      return _next
+    })
+  }, [projectId, data?.project])
+  useEffect(() => {
+    const _onUpdate = (e) => { if (e.detail?.state?.scope === 'som') syncCompanionBrief(e.detail.state) }
+    window.addEventListener('tc-companion-update', _onUpdate)
+    return () => window.removeEventListener('tc-companion-update', _onUpdate)
+  }, [syncCompanionBrief])
   // 開陪聊面板時補回：伺服器紀錄「還在車上、沒結帳」的陪聊選件，若因漏接事件（頁面重整、面板沒開）不在購物車就補上
   const reconcileCompanionCart = useCallback((InState) => {
     if (!InState?.key) return
     for (const _e of InState.cartLog ?? []) if (!_e.removed && !_e.checkedOut) addIdeaToCart(InState.key, _e)
     for (const _e of InState.cartRefs ?? []) if (!_e.removed && !_e.checkedOut) addRefToCart(InState.key, _e.ref)
-  }, [addIdeaToCart, addRefToCart])
+    syncCompanionBrief(InState)
+  }, [addIdeaToCart, addRefToCart, syncCompanionBrief])
   // 從購物車或陪聊面板拿掉／放回陪聊放的目錄條目 → 同步回陪聊
   const toggleRefCart = useCallback((InCompanionKey, InRef, InPutBack) => {
     if (InPutBack) addRefToCart(InCompanionKey, InRef)
@@ -1221,7 +1264,13 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
       body: JSON.stringify({ key: InCompanionKey, id: InEntry.id, removed: !InPutBack }) }).catch(() => {})
   }, [addIdeaToCart])
   const removeCartItem = (it) => {
-    if (it.nodeKind === 'idea') { toggleIdeaCart(it.companionKey, { id: it.ideaId, text: it.ideaText, anchors: it.anchors }, false); return }
+    if (it.nodeKind === 'companionBrief') {
+      setCart(c => c.filter(x => x.key !== it.key))
+      fetch('/api/companion/cart-sync', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: it.companionKey, brief: true, removed: true }) }).catch(() => {})
+      return
+    }
+    if (it.nodeKind === 'idea') { toggleIdeaCart(it.companionKey, { id: it.ideaId, text: it.ideaText, anchors: it.anchors, facets: it.facets, why: it.why }, false); return }
     if (it.companionRef) { toggleRefCart(it.companionKey, it.companionRef, false); return }
     setCart(c => c.filter(x => x.key !== it.key))
   }
@@ -1640,14 +1689,16 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
                   {cart.map(it => (
                     <div key={it.key} className="flex items-start gap-2 px-2 py-1 rounded border border-[var(--border)]">
                       <span className="text-[9px] text-[var(--text-muted)] w-3 text-center shrink-0">
-                        {it.nodeKind === 'idea' ? '💡' : it.nodeKind === 'archNode' ? '🗺️' : it.nodeKind === 'memoryNote' ? '📓' : it.nodeKind === 'bp' ? '🎨' : it.nodeKind === 'intent' ? '🧭' : (it.nodeKind === 'scenario' || it.nodeKind === 'scenarioNew') ? '🎬' : it.member ? (MEMBER_ICON[it.kind] ?? '·') : (KIND_META[it.kind]?.icon ?? '◆')}
+                        {it.nodeKind === 'companionBrief' ? '📝' : it.nodeKind === 'idea' ? '💡' : it.nodeKind === 'archNode' ? '🗺️' : it.nodeKind === 'memoryNote' ? '📓' : it.nodeKind === 'bp' ? '🎨' : it.nodeKind === 'intent' ? '🧭' : (it.nodeKind === 'scenario' || it.nodeKind === 'scenarioNew') ? '🎬' : it.member ? (MEMBER_ICON[it.kind] ?? '·') : (KIND_META[it.kind]?.icon ?? '◆')}
                       </span>
                       <div className="flex-1 min-w-0">
                         <code className="text-[10px] text-[var(--text)] break-all">
-                          {it.nodeKind === 'idea' ? it.ideaText : it.nodeKind === 'archNode' ? it.nodeTitle : it.nodeKind === 'memoryNote' ? it.noteTitle : it.nodeKind === 'bp' ? it.bpName : it.nodeKind === 'intent' ? it.intentTitle : it.nodeKind === 'scenario' ? it.scenarioTitle : it.nodeKind === 'scenarioNew' ? '新情境（建骨架＋九面向訪談）' : it.member ? `${it.symbol}::${it.member}` : it.symbol}
+                          {it.nodeKind === 'companionBrief' ? '陪聊整理（交接摘要：議題・已定・待定・交接要求）' : it.nodeKind === 'idea' ? it.ideaText : it.nodeKind === 'archNode' ? it.nodeTitle : it.nodeKind === 'memoryNote' ? it.noteTitle : it.nodeKind === 'bp' ? it.bpName : it.nodeKind === 'intent' ? it.intentTitle : it.nodeKind === 'scenario' ? it.scenarioTitle : it.nodeKind === 'scenarioNew' ? '新情境（建骨架＋九面向訪談）' : it.member ? `${it.symbol}::${it.member}` : it.symbol}
                         </code>
-                        {it.nodeKind === 'idea'
-                          ? <div className="text-[9px] text-[var(--text-muted)] truncate">🗣 陪聊放入{it.anchors?.length ? ` · 相關：${it.anchors.join('、')}` : ''}</div>
+                        {it.nodeKind === 'companionBrief'
+                          ? <div className="text-[9px] text-[var(--text-muted)] line-clamp-2">{it.summary || '（摘要整理中）'}{it.open?.length ? ` · 待定 ${it.open.length}` : ''}{it.ripples?.length ? ` · 連帶 ${it.ripples.length}` : ''}</div>
+                          : it.nodeKind === 'idea'
+                          ? <div className="text-[9px] text-[var(--text-muted)] truncate">🗣 陪聊放入{it.facets?.length ? ` · 影響：${it.facets.join('、')}` : ''}{it.anchors?.length ? ` · 相關：${it.anchors.join('、')}` : ''}</div>
                           : it.nodeKind === 'archNode'
                           ? <div className="text-[9px] text-[var(--text-muted)] truncate">{it.canvasTitle}</div>
                           : it.nodeKind === 'memoryNote'

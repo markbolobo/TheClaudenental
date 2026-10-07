@@ -162,6 +162,13 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
     if (keyRef.current) postJson('/api/companion/board', { key: keyRef.current, op: InOp, id: InId, text: InText })
   }, [])
 
+  // 連帶建議：採納＝變成想法（侍酒師另放進購物車）；不要＝收起來。都由少爺按，不交給模型判斷
+  const rippleOp = useCallback(async (InId, InOp) => {
+    if (!keyRef.current) return
+    const d = await postJson('/api/companion/ripple', { key: keyRef.current, id: InId, op: InOp })
+    if (!d.ok) flash('連帶建議操作失敗（TC 伺服器可能還沒重啟到新版）', 6000)
+  }, [flash])
+
   const reset = useCallback(async () => {
     if (!keyRef.current || !confirm('清空這段陪聊（對話與想法板）重新開始？')) return
     cancel()
@@ -186,6 +193,8 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
   const _cartRefs = (state?.cartRefs ?? []).filter(c => !c.checkedOut)
   const _checkedOutCount = [...(state?.cartLog ?? []), ...(state?.cartRefs ?? [])].filter(c => c.checkedOut).length
   const _contextRefs = state?.contextRefs ?? []
+  const _ripplesOpen = (state?.ripples ?? []).filter(r => r.status === 'proposed')
+  const _ripplesDone = (state?.ripples ?? []).filter(r => r.status !== 'proposed')
   const _streamingShown = streaming && !_messages.some(m => m.id === streaming.msgId) ? streaming : null
 
   return (
@@ -195,6 +204,7 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
         {/* 標頭 */}
         <div className="shrink-0 px-3 py-2 border-b border-[var(--border)] flex items-center gap-2 flex-wrap">
           <span className="text-[var(--gold)] text-xs font-semibold">🗣 陪聊</span>
+          <span className="text-[9px] px-1 rounded border border-[var(--gold)]/30 text-[var(--gold)]/80" title="以開發者朋友的角度陪你想：查脈絡與情境、做設計推理，順帶提出其他系統與體驗可以一起完善的地方">開發者朋友</span>
           <span className="text-[11px] text-[var(--text)] truncate max-w-[280px]" title={state?.title ?? ''}>{state?.title ?? subtitle}</span>
           <span className="flex items-center gap-1 text-[10px] text-[var(--text-muted)]" title={state?.model ? `模型：${state.model}` : ''}>
             <span className={`inline-block w-1.5 h-1.5 rounded-full ${_status.dot}`} />{_status.label}
@@ -233,8 +243,8 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
               {!_messages.length && !_streamingShown && (
                 <div className="text-[11px] text-[var(--text-muted)] text-center mt-8 leading-relaxed">
                   {scope === 'qa'
-                    ? <>說說你對這個 QA 的想法——我會邊聊邊整理到右邊的想法板，<br />你確認後按「📤 交付實作」或說「交付」，就送進綁定的聊天室動工。</>
-                    : <>說說你的議題——我會邊查侍酒師的設計脈絡與情境邊跟你對齊，<br />把議題和相關條目放進購物車（跟你手動 🛒 加入的一樣），右邊看得到放了哪些；<br />聊完按「🛒 前往購物車」接著開新聊天室。</>}
+                    ? <>說說你對這個 QA 的想法——我會以開發者朋友的角度查脈絡與情境、一起推理，<br />邊聊邊整理到右邊的想法板，順帶把其他該一起完善的系統列在「🧩 連帶設計」；<br />你確認後按「📤 交付實作」或說「交付」，就送進綁定的聊天室動工。</>
+                    : <>說說你的議題——我會以開發者朋友的角度，邊查侍酒師的設計脈絡與情境邊跟你對齊、一起推理，<br />把議題和相關條目放進購物車（跟你手動 🛒 加入的一樣），其他該一起完善的系統列在「🧩 連帶設計」；<br />聊完按「🛒 前往購物車」接著開新聊天室。</>}
                 </div>
               )}
               {_messages.map(m => (
@@ -282,6 +292,27 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
               💡 想法板（{_ideas.length}）
             </div>
             <div className="flex-1 overflow-y-auto p-2 space-y-2">
+              {/* 📝 交接摘要：之後的聊天室只看得到這份（＋條目），所以讓少爺看得到會交出去的是什麼 */}
+              {state?.brief && (state.brief.summary || state.brief.decisions?.length || state.brief.open?.length) && (
+                <div className="rounded border border-[var(--gold)]/30 bg-[var(--gold)]/5 p-2 space-y-1">
+                  <div className="flex items-center gap-1">
+                    <span className="text-[10px] uppercase tracking-widest text-[var(--gold)]/90">📝 交接摘要</span>
+                    <div className="flex-1" />
+                    <span className="text-[9px] text-[var(--text-muted)]">
+                      {scope === 'som'
+                        ? ((state.briefRev ?? 0) > (state.briefDoneRev ?? 0) ? '✓ 在購物車（結帳帶去）' : '已結帳／已拿掉')
+                        : '交付時附上'}
+                    </span>
+                  </div>
+                  {state.brief.summary && <div className="text-[10px] text-[var(--text)] whitespace-pre-wrap break-words">{state.brief.summary}</div>}
+                  {state.brief.decisions?.length > 0 && (
+                    <div className="text-[9px] text-green-400/90">已定：{state.brief.decisions.join('；')}</div>
+                  )}
+                  {state.brief.open?.length > 0 && (
+                    <div className="text-[9px] text-amber-300/90">待你定：{state.brief.open.join('；')}</div>
+                  )}
+                </div>
+              )}
               {/* QA：陪聊提議交付 */}
               {scope === 'qa' && state?.pendingHandoff && (
                 <div className="rounded border border-amber-400/50 bg-amber-400/5 p-2 space-y-1.5">
@@ -312,6 +343,11 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
                     ) : (
                       <>
                         <div className="text-[11px] text-[var(--text)] break-words">{i.text}</div>
+                        {i.facets?.length > 0 && (
+                          <div className="flex flex-wrap gap-0.5 mt-0.5">
+                            {i.facets.map(f => <span key={f} className="text-[8px] px-1 rounded bg-white/5 text-[var(--text-muted)]">{f}</span>)}
+                          </div>
+                        )}
                         <div className="flex items-center gap-1 mt-1">
                           <span className={`text-[9px] px-1 rounded border ${_meta.cls}`}>{_meta.label}</span>
                           <div className="flex-1" />
@@ -331,6 +367,38 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
                   onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && newIdea.trim()) { boardOp('add', null, newIdea); setNewIdea('') } }}
                   placeholder="自己加一條…" className="flex-1 min-w-0 bg-transparent border border-[var(--border)] rounded px-1.5 py-0.5 text-[10px] text-[var(--text)] outline-none" />
               </div>
+
+              {/* 🧩 連帶設計：開發者朋友的設計推理——其他系統與體驗可以順勢完善的地方（少爺按採納才算數） */}
+              {(_ripplesOpen.length > 0 || _ripplesDone.length > 0) && (
+                <div className="pt-2 mt-2 border-t border-[var(--border)] space-y-1.5">
+                  <div className="text-[10px] uppercase tracking-widest text-purple-300/90">🧩 連帶設計（{_ripplesOpen.length}）</div>
+                  {_ripplesOpen.map(r => (
+                    <div key={r.id} className="rounded border border-purple-400/40 bg-purple-400/5 px-2 py-1.5">
+                      <div className="text-[11px] text-[var(--text)] break-words">{r.text}</div>
+                      {r.why && <div className="text-[9px] text-[var(--text-muted)] mt-0.5 break-words">理由：{r.why}</div>}
+                      {(r.facets?.length > 0 || r.refs?.length > 0) && (
+                        <div className="flex flex-wrap gap-0.5 mt-0.5">
+                          {(r.facets ?? []).map(f => <span key={f} className="text-[8px] px-1 rounded bg-white/5 text-[var(--text-muted)]">{f}</span>)}
+                          {(r.refs ?? []).map(x => <span key={x.ref} title={x.ref} className="text-[8px] px-1 rounded border border-[var(--border)] text-[var(--text-muted)]">{x.icon}{x.title}</span>)}
+                        </div>
+                      )}
+                      <div className="flex gap-1 mt-1">
+                        <button onClick={() => rippleOp(r.id, 'adopt')}
+                          className="flex-1 py-0.5 rounded border border-green-500/50 text-green-400 text-[10px] hover:bg-green-500/10">
+                          {scope === 'som' ? '採納（放進購物車）' : '採納（加進想法板）'}
+                        </button>
+                        <button onClick={() => rippleOp(r.id, 'dismiss')}
+                          className="px-2 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] text-[10px] hover:text-[var(--text)]">不要</button>
+                      </div>
+                    </div>
+                  ))}
+                  {_ripplesDone.length > 0 && (
+                    <div className="text-[9px] text-[var(--text-muted)]">
+                      已採納 {_ripplesDone.filter(r => r.status === 'adopted').length}・不要 {_ripplesDone.filter(r => r.status === 'dismissed').length}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* 侍酒師：放進購物車的清單（看得到加了哪些、可拿掉／放回） */}
               {scope === 'som' && (

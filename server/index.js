@@ -1701,6 +1701,8 @@ app.post('/api/history/tags/run-nightly', async () => {
 const RUN_HIDDEN_DIR = 'C:\\Project\\MasterBrain\\.agent\\scripts\\RunHidden'
 const RUN_HIDDEN_EXE = path.join(RUN_HIDDEN_DIR, 'RunHidden.exe')
 const MARKER_QUIET_RECONCILE_MS = 30 * 60 * 1000
+// QA 分頁版控「⚡ 依規則 Commit」喚起的 Claude 進程（少爺 2026-10-08）；git 狀態查詢與 Commit 腳本輸出都由 TC 接走，一律不配視窗、不設開關
+const QA_AUTO_COMMIT_QUIET_KEY = 'qa.quiet.git-auto-commit'
 
 function markerQuietKey(InMarkerId) { return `marker.quiet.${InMarkerId}` }
 function isQuietSetting(InKey) { return getTcSetting(InKey, false) === true }
@@ -4523,7 +4525,7 @@ app.get('/api/git/projects', async (request, reply) => {
       ...gitProjectPolicy(p),
     }
   })
-  return { ok: true, projects: _projects, drafts: readGitDrafts(), autoResults: readGitAutoResults() }
+  return { ok: true, projects: _projects, drafts: readGitDrafts(), autoResults: readGitAutoResults(), autoCommitQuiet: isQuietSetting(QA_AUTO_COMMIT_QUIET_KEY) }
 })
 
 // 面板現況：分支＋三類檔案清單（staged／已改未 staged／未追蹤）＋最後一筆 commit
@@ -4533,8 +4535,9 @@ app.get('/api/git/status', async (request, reply) => {
   if (!_proj) return { ok: false, error: `專案「${request.query.projectId}」未設 git 規則` }
   const _root = gitRepoRoot(_proj)
   if (!_root || !fs.existsSync(path.join(_root, '.git'))) return { ok: false, error: `不是 git repo：${_root}` }
+  // windowsHide 必加：QA 分頁每次顯示／切專案都會跑這 5～6 次 git，沒加＝每次彈出 4 個空白終端視窗（少爺 2026-10-08 勿擾）
   const _gitRaw = (args) => {
-    const r = spawnSync('git', ['-C', _root, ...args], { encoding: 'utf-8' })
+    const r = spawnSync('git', ['-C', _root, ...args], { encoding: 'utf-8', windowsHide: true })
     return r.status === 0 ? (r.stdout ?? '') : ''
   }
   const _git = (args) => _gitRaw(args).trim()
@@ -4635,7 +4638,8 @@ app.post('/api/git/commit', async (request, reply) => {
   try {
     fs.writeFileSync(_msgFile, message.trim(), 'utf8')
     if (Array.isArray(paths) && paths.length) fs.writeFileSync(_pathsFile, JSON.stringify(paths), 'utf8')
-    const _r = spawnSync('powershell.exe', _args, { encoding: 'utf-8', cwd: gitRepoRoot(_proj) })
+    // 輸出由本端解析、視窗只會是空白一閃 → 一律不配視窗
+    const _r = spawnSync('powershell.exe', _args, { encoding: 'utf-8', cwd: gitRepoRoot(_proj), windowsHide: true })
     const _lines = (_r.stdout ?? '').split(/\r?\n/).filter(l => l.trim())
     try { _result = JSON.parse(_lines[_lines.length - 1] ?? '') } catch {
       _result = { ok: false, error: `腳本輸出無法解析：${(_r.stdout ?? '').trim() || (_r.stderr ?? '').trim() || '無輸出'}` }
@@ -4710,8 +4714,9 @@ app.post('/api/git/auto-commit', async (request, reply) => {
 
   const _policy = gitProjectPolicy(_proj)
   const _prompt = buildAutoCommitPrompt(projectId, _proj, _policy, 'TC 版控面板「一鍵依規則 Commit」')
-  spawnClaude(_root, _prompt, null, 'sonnet', 'low')
-  logEvent('git.autocommit.spawn', { projectId, staging: _policy.staging, lang: _policy.lang })
+  const _quiet = isQuietSetting(QA_AUTO_COMMIT_QUIET_KEY)
+  spawnClaude(_root, _prompt, null, 'sonnet', 'low', null, 0, _quiet)
+  logEvent('git.autocommit.spawn', { projectId, staging: _policy.staging, lang: _policy.lang, quiet: _quiet })
   return { ok: true, spawned: true, message: `已喚起 Claude 依「${_proj.name ?? projectId}」規則提交（${_policy.staging === 'none' ? '只 commit 既有 staged' : _policy.staging === 'all' ? '全部變更' : '指定路徑'}、${_policy.lang === 'en' ? '英文' : '繁中'} message）` }
 })
 
@@ -6642,11 +6647,12 @@ function companionContext(InScope, InRefId) {
     const _run = readQaRuns().runs.find(r => r.id === InRefId)
     if (!_run) return null
     const _proj = findSommelierProject(_run.project ?? 'roman')
+    const _memDirs = String(_proj?.memoryDir ?? '').split(',').map(s => s.trim()).filter(Boolean)
     return {
       title: `QA｜${_run.topic}`,
       projectId: _proj?.id ?? null,
       projectRoot: _run.boundProjectPath ?? _proj?.projectRoot ?? null,
-      dirs: [_proj?.designIntentDir, _proj?.scenarioDir].filter(Boolean),
+      dirs: [_proj?.designIntentDir, _proj?.scenarioDir, ..._memDirs].filter(Boolean),
       brief: [
         `QA run「${_run.topic}」(${_run.id})，狀態 ${_run.status}；${_run.boundSessionId ? `綁定實作聊天室 ${_run.boundSessionId}` : '尚未綁定實作聊天室（交付時會開新聊天室接手）'}`,
         _run.requirement ? `需求：${String(_run.requirement).slice(0, 1500)}` : '',
@@ -6711,9 +6717,16 @@ function companionCatalog(InProjectId) {
   for (const b of _assets?.blueprints ?? [])
     _add(`bp:${b.path}`, '🎨', b.name, [`${b.class ?? ''} 繼承 ${b.parentName ?? '?'}`])
   const _memory = _read('memory_notes.json')
+  const _memDirs = String(_proj.memoryDir ?? '').split(',').map(s => s.trim()).filter(Boolean)
+  // 拼圖的檔案欄多半只有檔名 → 在各拼圖資料夾找到實際位置，陪聊才 Read 得到
+  const _memFile = (InFile) => {
+    if (!InFile || path.isAbsolute(InFile)) return InFile
+    for (const _d of _memDirs) if (fs.existsSync(path.join(_d, InFile))) return `${_d}/${InFile}`
+    return InFile
+  }
   _lines.push('', '## 📓 拼圖（memory）')
   for (const n of _memory?.notes ?? [])
-    _add(`memory:${n.name}`, '📓', _one(n.title, 80), [n.type, _one(n.description, 140), n.file ? `檔案 ${n.file}` : ''])
+    _add(`memory:${n.name}`, '📓', _one(n.title, 80), [n.type, _one(n.description, 140), n.file ? `檔案 ${_memFile(n.file)}` : ''])
   const _arch = _read('arch_canvas.json')
   _lines.push('', '## 🗺️ 架構節點（arch）')
   for (const c of _arch?.canvases ?? [])
@@ -6730,6 +6743,7 @@ function companionCatalog(InProjectId) {
 }
 
 const COMPANION_RULES = [
+  '你是少爺的「開發者朋友」：一起做這款遊戲的資深遊戲開發夥伴（與 TC「遊戲製作人朋友」同一個精神——看得見、感覺得到、一起走下去）。有自己的看法，會說「我覺得…」，誠實指出風險與取捨，但尊重少爺的直覺；品味類拼圖（memory:feedback_… 標「品味」者）已回答的方向直接套用，不再拿來問少爺。',
   '全程繁體中文、口語、短句（一到三句），像坐在旁邊的同事；不念表格、程式碼、路徑、長清單，少爺要細節再說。',
   '你的工作是聽懂少爺的想法、在關鍵處追問一句、把想法整理成條目；不要動手改任何檔案、不要假裝已經做了什麼。',
   '需要佐證時可以用 Read／Grep／Glob 查專案的設計意圖、情境檔與計畫，但回覆仍要短。',
@@ -6748,22 +6762,53 @@ function companionCatalogRules(InCtx) {
   ]
 }
 
+/** 設計推理（少爺 2026-10-08「陪聊要以開發者朋友的角度，在過程中也根據脈絡體驗兼顧設計推理完善遊戲中的其他系統與體驗設計」） */
+function companionDesignRules(InCtx) {
+  return [
+    '・每個議題都在心裡走一輪設計推理，推理寫進想法板，嘴上只說結論與一個問題：',
+    '  ① 從玩家感受倒推：這個改動玩家會看到、聽到、感受到什麼？',
+    '  ② 脈絡：牽動哪幾份設計意圖（intent:），它們的不變量有沒有被碰到、要不要跟著改？',
+    '  ③ 體驗：落在哪幾張情境（scenario:），九個面向——陣型玩法／手感／帶入感／機體操作／運鏡／關卡互動／演出／節奏／主題——哪幾格會變？',
+    '  ④ 橫向：陣型的長處與劣處還成對嗎？這一題是不是其實在回答某個上游關鍵意圖（設計支柱）？',
+    '  ⑤ 連帶：順著意圖檔的「相關脈絡」與情境的連結，找出其他系統或體驗可以順勢完善、或必須跟著調整的地方。',
+    InCtx.catalogFile ? '・推理工具都在目錄裡：設計思路模板（memory:Roman_DesignThinking_Templates，對照各模板的「觸發情境」套思路）、設計支柱（intent:DesignPillars）、陣型職能矩陣（intent:FormationRoleMatrix）——有就用，沒有就照上面五步。' : '',
+    '・連帶建議放進想法板的 ripples：推理走到 ②～⑤ 時，凡是發現「這個改動會讓別的系統或體驗變弱、變得不一致，或順勢可以變更好」，就寫成一條 ripple，附理由（引用哪份意圖、情境或支柱）與牽動的條目——你嘴上說出的每個取捨（例如「但 X 會變得沒那麼特別」）都一定要有對應的 ripple，提出補救或配套。每輪最多新增兩條；口語上只說一句「順帶一提，○○也可以一起調，要嗎？」。少爺同意才算數，不擅自擴大範圍；範圍有蔓延風險時直說。',
+  ].filter(Boolean)
+}
+
+// 交接摘要（少爺 2026-10-08「我預期他幫我理的脈絡，也都是之後聊天室能完善處理」）：實作聊天室只看得到這份摘要＋購物車條目／交付留言
+const COMPANION_BRIEF_FORMAT = '・brief＝這段討論的交接摘要（每次全量）：{"summary":"議題一段話：要做什麼、為什麼、玩家會感受到什麼","decisions":["已經跟少爺說定的事"],"open":["還要少爺定的事"]}——之後實作的聊天室看不到這段對話，只看得到這份摘要與相關條目，所以要寫到它不用重聊就能動工。'
+// 交接要求：侍酒師結帳與 QA 交付共用同一份（client 從公開狀態取，不另寫一份）
+const COMPANION_HANDOFF_DUTIES = [
+  '動工前先讀相關條目的原檔（設計意圖、情境、程式、藍圖、拼圖），確認現況與陪聊整理的一致；不一致以原檔現況為準並告訴少爺。',
+  '「還要少爺定的事」在動工前先問掉；採納的連帶建議若會擴大範圍，先跟少爺確認再做。',
+  '改動後同步維護設計脈絡：牽動的設計意圖補不變量／待定奪，牽動的情境檔補九面向與缺口（依專案既有工作流）。',
+]
+
+const COMPANION_RIPPLE_FORMAT ='・ripples＝目前完整的連帶建議清單（每次全量、id 沿用，如 r1）：{"id":"r1","text":"建議一句話","why":"理由（引用哪份意圖、情境或支柱）","facets":["手感","演出"],"refs":["intent:…"],"status":"proposed|adopted|dismissed"}；facets 只能用九面向的名稱，refs 照抄目錄第一欄。少爺同意就標 adopted 並同時把它加進 ideas，不要就標 dismissed。'
+
 function companionSystemPrompt(InScope, InCtx) {
   if (InScope === 'qa') return [
-    '你是 TheClaudenental 的「陪聊」：少爺（遊戲製作人）的腦力激盪夥伴，現在陪他聊一個 QA run。',
+    '你是 TheClaudenental 的「陪聊」：少爺（遊戲製作人）的開發者朋友，現在陪他聊一個 QA run——一起把這個議題想清楚，也順帶看見遊戲裡其他該跟著完善的系統與體驗。',
     InCtx.brief,
-    '規則：', ...COMPANION_RULES.map(r => `・${r}`), ...companionCatalogRules(InCtx),
-    '<tc-board> 格式：{"ideas":[{"id":"i1","text":"整理後的一句話","status":"draft|confirmed"}],"refs":[],"handoff":null}',
-    '・ideas＝目前完整的想法清單（每次全量給、id 沿用不重編）；少爺明確同意的標 confirmed；被否決的直接移除；已交付的不必再列。',
+    '規則：', ...COMPANION_RULES.map(r => `・${r}`), ...companionCatalogRules(InCtx), ...companionDesignRules(InCtx),
+    '<tc-board> 格式：{"ideas":[{"id":"i1","text":"整理後的一句話","status":"draft|confirmed","facets":["手感"]}],"ripples":[],"brief":{"summary":"","decisions":[],"open":[]},"refs":[],"handoff":null}',
+    '・ideas＝目前完整的想法清單（每次全量給、id 沿用不重編）；少爺明確同意的標 confirmed；被否決的直接移除；已交付的不必再列；facets＝會影響的體驗面向（九面向名稱，可省略）。',
+    COMPANION_RIPPLE_FORMAT,
+    COMPANION_BRIEF_FORMAT,
     '・refs＝跟這個議題相關的目錄條目 ref（照抄目錄第一欄，可累加），交付時會一併附給實作聊天室當脈絡。',
     '・少爺表示要交給實作（例如「就這樣做」「交給它」）時，handoff 填 {"summary":"給實作聊天室的一段完整整理：背景、要做什麼、怎麼驗收"}，口語上問一句「要交付嗎？」——真正送出要等少爺按「交付實作」或說「交付」，你只提議，不要說已送出。',
   ].join('\n')
   return [
-    '你是 TheClaudenental 侍酒師的「陪聊」：陪少爺（遊戲製作人）做前期腦力激盪，從侍酒師的脈絡與情境理解他的議題，把議題本身和相關條目放進侍酒師購物車，之後少爺結帳開新聊天室實作。',
+    '你是 TheClaudenental 侍酒師的「陪聊」：少爺（遊戲製作人）的開發者朋友，陪他做前期腦力激盪——從侍酒師的脈絡與情境理解他的議題，兼顧設計推理、順帶看見其他該跟著完善的系統與體驗，把議題本身和相關條目放進侍酒師購物車，之後少爺結帳開新聊天室實作。',
     InCtx.brief,
-    '規則：', ...COMPANION_RULES.map(r => `・${r}`), ...companionCatalogRules(InCtx),
-    '<tc-board> 格式：{"ideas":[{"id":"i1","text":"整理後的一句話","status":"draft|carted"}],"cart":[{"id":"i1","text":"放進購物車的一句話","anchors":["相關名詞"]}],"uncart":[],"refs":[],"unrefs":[]}',
-    '・ideas＝目前完整的想法清單（每次全量、id 沿用）；已放進購物車的標 carted。',
+    '規則：', ...COMPANION_RULES.map(r => `・${r}`), ...companionCatalogRules(InCtx), ...companionDesignRules(InCtx),
+    '<tc-board> 格式：{"ideas":[{"id":"i1","text":"整理後的一句話","status":"draft|carted","facets":["手感"]}],"ripples":[],"brief":{"summary":"","decisions":[],"open":[]},"cart":[{"id":"i1","text":"放進購物車的一句話","anchors":["相關名詞"]}],"uncart":[],"refs":[],"unrefs":[]}',
+    '・ideas＝目前完整的想法清單（每次全量、id 沿用）；已放進購物車的標 carted；facets＝會影響的體驗面向（九面向名稱，可省略）。',
+    COMPANION_RIPPLE_FORMAT,
+    COMPANION_BRIEF_FORMAT,
+    '・brief 會自動成為購物車裡的「陪聊整理」選件，少爺結帳開新聊天室時一起帶去。',
+    '・連帶建議被採納後，跟一般想法一樣放進 cart，牽動的條目也放進 refs。',
     '・cart＝這一輪「新」放進購物車的想法（只列新的）；少爺說要放，或想法已清楚成形、值得帶去結帳時就放；anchors 填相關名詞（沒有就給空陣列）。',
     '・refs＝這一輪「新」放進購物車的目錄條目（照抄目錄第一欄的 ref，只列新的）——等同少爺手動按 🛒 加入：議題牽涉到的設計脈絡、情境、C++ 符號、藍圖、拼圖、架構節點都要放，結帳開新聊天室的實作者才拿得到完整脈絡。',
     '・放了什麼，口語上用標題簡短說一句讓少爺知道（不要念 ref）。',
@@ -6778,7 +6823,8 @@ function companionPublic(InKey) {
   const _p = companionProcs.get(InKey)
   return {
     key: InKey, scope: _c.scope, refId: _c.refId, title: _c.title,
-    messages: _c.messages.slice(-100), ideas: _c.ideas, cartLog: _c.cartLog, cartRefs: _c.cartRefs ?? [], contextRefs: _c.contextRefs ?? [],
+    messages: _c.messages.slice(-100), ideas: _c.ideas, ripples: _c.ripples ?? [], cartLog: _c.cartLog, cartRefs: _c.cartRefs ?? [], contextRefs: _c.contextRefs ?? [],
+    brief: _c.brief ?? null, briefRev: _c.briefRev ?? 0, briefDoneRev: _c.briefDoneRev ?? 0, handoffDuties: COMPANION_HANDOFF_DUTIES,
     pendingHandoff: _c.pendingHandoff,
     status: _p ? _p.status : 'off', model: _c.model ?? null, updatedAt: _c.updatedAt,
   }
@@ -6817,6 +6863,12 @@ function companionParseBoard(InText) {
   return null
 }
 
+// 情境九面向（Roman_ScenarioExperience_System.md §〇 題目）：想法與連帶建議標「會影響哪幾格」只收這九個名稱
+const COMPANION_FACETS = ['陣型玩法', '手感', '帶入感', '機體操作', '運鏡', '關卡互動', '演出', '節奏', '主題']
+function companionFacets(InList) {
+  return (Array.isArray(InList) ? InList : []).map(String).filter(f => COMPANION_FACETS.includes(f)).slice(0, 9)
+}
+
 /** 套用想法板：ideas 全量覆蓋（已交付的保留為紀錄）；侍酒師的 cart／uncart 轉成購物車事件 */
 function companionApplyBoard(InKey, InBoard) {
   const _c = companionStore[InKey]
@@ -6825,9 +6877,11 @@ function companionApplyBoard(InKey, InBoard) {
     const _handed = _c.ideas.filter(i => i.status === 'handed')
     const _fresh = InBoard.ideas
       .filter(i => i && typeof i.text === 'string' && i.text.trim())
-      .map(i => ({ id: String(i.id ?? `i${Math.random().toString(36).slice(2, 6)}`), text: i.text.trim().slice(0, 400), status: ['draft', 'confirmed', 'carted'].includes(i.status) ? i.status : 'draft', ts: Date.now() }))
+      .map(i => ({ id: String(i.id ?? `i${Math.random().toString(36).slice(2, 6)}`), text: i.text.trim().slice(0, 400), status: ['draft', 'confirmed', 'carted'].includes(i.status) ? i.status : 'draft', facets: companionFacets(i.facets), ts: Date.now() }))
       .filter(i => !_handed.some(h => h.id === i.id))
-    _c.ideas = [..._handed, ..._fresh]
+    // 少爺剛手動加的、或剛採納的連帶建議：陪聊還沒收到通知前，這一輪的全量清單不會有它——先留著不被洗掉
+    const _unacked = _c.ideas.filter(i => i.pendingAck && !_fresh.some(f => f.id === i.id) && !_handed.some(h => h.id === i.id))
+    _c.ideas = [..._handed, ..._fresh, ..._unacked]
   }
   // 目錄條目 ref：只收目錄裡真的有的；查無的告訴陪聊下一句修正（不靜默丟）
   const _catalog = companionCatalog(companionContext(_c.scope, _c.refId)?.projectId)
@@ -6840,6 +6894,34 @@ function companionApplyBoard(InKey, InBoard) {
     }
     if (_bad.length) _c.notes.push(`這些 ref 不在目錄裡、已略過，請用 Grep 查目錄照抄第一欄：${_bad.slice(0, 6).join('、')}`)
     return _ok
+  }
+  // 連帶建議（開發者朋友的設計推理）：全量覆蓋，但少爺在面板按過「採納／不要」的維持少爺的決定
+  if (Array.isArray(InBoard.ripples)) {
+    const _prev = new Map((_c.ripples ?? []).map(r => [r.id, r]))
+    _c.ripples = InBoard.ripples
+      .filter(r => r && typeof r.text === 'string' && r.text.trim())
+      .slice(0, 12)
+      .map(r => {
+        const _id = String(r.id ?? `r${Math.random().toString(36).slice(2, 6)}`)
+        const _old = _prev.get(_id)
+        return {
+          id: _id, text: r.text.trim().slice(0, 300), why: String(r.why ?? '').trim().slice(0, 400), facets: companionFacets(r.facets),
+          refs: _validRefs(r.refs).map(ref => ({ ref, title: _catalog.refs.get(ref).title, icon: _catalog.refs.get(ref).icon })),
+          status: _old?.userDecided ? _old.status : (['proposed', 'adopted', 'dismissed'].includes(r.status) ? r.status : 'proposed'),
+          userDecided: !!_old?.userDecided, ts: _old?.ts ?? Date.now(),
+        }
+      })
+    // 少爺決定過、但這輪陪聊沒再列的，保留紀錄
+    for (const [_id, _old] of _prev) if (_old.userDecided && !_c.ripples.some(r => r.id === _id)) _c.ripples.push(_old)
+  }
+  // 交接摘要：內容有變才升版號（侍酒師的「陪聊整理」選件與結帳標記都看版號）
+  if (InBoard.brief && typeof InBoard.brief === 'object') {
+    const _list = (InList) => (Array.isArray(InList) ? InList : []).map(x => String(x ?? '').trim()).filter(Boolean).slice(0, 12).map(x => x.slice(0, 300))
+    const _brief = { summary: String(InBoard.brief.summary ?? '').trim().slice(0, 1500), decisions: _list(InBoard.brief.decisions), open: _list(InBoard.brief.open) }
+    if ((_brief.summary || _brief.decisions.length || _brief.open.length) && JSON.stringify(_brief) !== JSON.stringify(_c.brief ?? null)) {
+      _c.brief = _brief
+      _c.briefRev = (_c.briefRev ?? 0) + 1
+    }
   }
   if (_c.scope === 'qa') {
     if (InBoard.handoff && typeof InBoard.handoff.summary === 'string' && InBoard.handoff.summary.trim()) {
@@ -6874,7 +6956,8 @@ function companionApplyBoard(InKey, InBoard) {
       const _id = String(_it.id ?? `i${Math.random().toString(36).slice(2, 6)}`)
       const _existing = _c.cartLog.find(x => x.id === _id)
       if (_existing && !_existing.removed) continue
-      const _entry = { id: _id, text: _it.text.trim().slice(0, 400), anchors: Array.isArray(_it.anchors) ? _it.anchors.map(String).slice(0, 8) : [], ts: Date.now(), removed: false }
+      const _facets = companionFacets(_it.facets).length ? companionFacets(_it.facets) : (_c.ideas.find(i => i.id === _id)?.facets ?? [])
+      const _entry = { id: _id, text: _it.text.trim().slice(0, 400), anchors: Array.isArray(_it.anchors) ? _it.anchors.map(String).slice(0, 8) : [], facets: _facets, ts: Date.now(), removed: false }
       if (_existing) Object.assign(_existing, _entry); else _c.cartLog.push(_entry)
       _added.push(_entry)
     }
@@ -7052,7 +7135,7 @@ function companionEnsure(InScope, InRefId) {
   if (!companionStore[_key]) {
     const _ctx = companionContext(InScope, InRefId)
     if (!_ctx) return null
-    companionStore[_key] = { scope: InScope, refId: InRefId, title: _ctx.title, messages: [], ideas: [], cartLog: [], cartRefs: [], contextRefs: [], pendingHandoff: null, notes: [], claudeSid: null, createdAt: Date.now(), updatedAt: Date.now() }
+    companionStore[_key] = { scope: InScope, refId: InRefId, title: _ctx.title, messages: [], ideas: [], ripples: [], cartLog: [], cartRefs: [], contextRefs: [], pendingHandoff: null, notes: [], claudeSid: null, createdAt: Date.now(), updatedAt: Date.now() }
     persistCompanions()
   }
   return _key
@@ -7069,7 +7152,11 @@ function companionSay(InKey, InText, InVia) {
   if (!_p) { companionBroadcast(InKey); return { ok: false, error: '找不到陪聊對象（run 或專案已不存在）' } }
   const _prefix = []
   if (_p.recapDue) { _prefix.push(companionRecap(InKey)); _p.recapDue = false }
-  if (_c.notes?.length) { _prefix.push(..._c.notes.map(n => `（系統：${n}）`)); _c.notes = [] }
+  if (_c.notes?.length) {
+    _prefix.push(..._c.notes.map(n => `（系統：${n}）`))
+    _c.notes = []
+    for (const _i of _c.ideas) if (_i.pendingAck) delete _i.pendingAck
+  }
   const _payload = [..._prefix, _text].join('\n')
   if (_p.status === 'thinking' || _p.status === 'tool') _p.pending.push(_payload)
   else companionWrite(InKey, _payload)
@@ -7104,7 +7191,7 @@ app.post('/api/companion/board', async (request) => {
   else if (op === 'confirm' && _idea) { _idea.status = 'confirmed'; _c.notes.push(`少爺確認了 ${_idea.id}「${_idea.text}」`) }
   else if (op === 'edit' && _idea && String(text ?? '').trim()) { _idea.text = String(text).trim().slice(0, 400); _c.notes.push(`少爺把 ${_idea.id} 改成「${_idea.text}」`) }
   else if (op === 'add' && String(text ?? '').trim()) {
-    const _new = { id: `u${Date.now().toString(36)}`, text: String(text).trim().slice(0, 400), status: 'confirmed', ts: Date.now() }
+    const _new = { id: `u${Date.now().toString(36)}`, text: String(text).trim().slice(0, 400), status: 'confirmed', ts: Date.now(), pendingAck: true }
     _c.ideas.push(_new)
     _c.notes.push(`少爺自己加了想法 ${_new.id}「${_new.text}」`)
   } else return { ok: false, error: 'bad op' }
@@ -7113,11 +7200,51 @@ app.post('/api/companion/board', async (request) => {
   companionBroadcast(key)
   return { ok: true }
 })
+// 連帶建議：少爺按「採納／不要」（程式判定，不交給模型）。採納＝變成想法；侍酒師另外放進購物車（含牽動的條目）
+app.post('/api/companion/ripple', async (request) => {
+  const { key, id, op } = request.body ?? {}
+  const _c = companionStore[key]
+  const _r = (_c?.ripples ?? []).find(x => x.id === id)
+  if (!_c || !_r || !['adopt', 'dismiss'].includes(op)) return { ok: false }
+  _r.status = op === 'adopt' ? 'adopted' : 'dismissed'
+  _r.userDecided = true
+  if (op === 'adopt') {
+    const _ideaId = `x${_r.id}`
+    if (!_c.ideas.some(i => i.id === _ideaId))
+      _c.ideas.push({ id: _ideaId, text: _r.text, status: _c.scope === 'som' ? 'carted' : 'confirmed', facets: _r.facets ?? [], fromRipple: _r.id, ts: Date.now(), pendingAck: true })
+    if (_c.scope === 'som') {
+      const _entry = { id: _ideaId, text: _r.text, why: _r.why ?? '', anchors: [], facets: _r.facets ?? [], ts: Date.now(), removed: false }
+      _c.cartLog = [..._c.cartLog.filter(x => x.id !== _ideaId), _entry]
+      _c.cartRefs = _c.cartRefs ?? []
+      const _addRefs = []
+      for (const _ref of _r.refs ?? []) {
+        if (_c.cartRefs.some(x => x.ref === _ref.ref && !x.removed && !x.checkedOut)) continue
+        const _e = { ref: _ref.ref, title: _ref.title, icon: _ref.icon, ts: Date.now(), removed: false, checkedOut: false }
+        _c.cartRefs = [..._c.cartRefs.filter(x => x.ref !== _ref.ref), _e]
+        _addRefs.push(_e)
+      }
+      broadcast({ type: 'companion_cart', key, projectId: _c.refId, add: [_entry], remove: [], addRefs: _addRefs, removeRefs: [] })
+    }
+    _c.notes.push(`少爺採納了連帶建議 ${_r.id}「${_r.text}」，已加進想法板（想法 id ${_ideaId}）${_c.scope === 'som' ? '並放進購物車' : ''}`)
+  } else _c.notes.push(`少爺不要連帶建議 ${_r.id}「${_r.text}」`)
+  _c.updatedAt = Date.now()
+  persistCompanions()
+  companionBroadcast(key)
+  logEvent('tc.companion.ripple', { key, id, op })
+  return { ok: true }
+})
 // 侍酒師：少爺在購物車手動移除／放回陪聊加的想法（id）或目錄條目（ref）→ 記下來並告訴陪聊
 app.post('/api/companion/cart-sync', async (request) => {
-  const { key, id, ref, removed } = request.body ?? {}
+  const { key, id, ref, brief, removed } = request.body ?? {}
   const _c = companionStore[key]
   if (!_c) return { ok: false }
+  // 「陪聊整理」選件：拿掉＝這一版摘要不再自動放回（摘要有新版才會再出現）；放回＝回到未處理
+  if (brief) {
+    _c.briefDoneRev = removed ? (_c.briefRev ?? 0) : Math.max(0, (_c.briefRev ?? 0) - 1)
+    persistCompanions()
+    companionBroadcast(key)
+    return { ok: true }
+  }
   const _e = ref ? (_c.cartRefs ?? []).find(x => x.ref === ref) : _c.cartLog.find(x => x.id === id)
   if (!_e) return { ok: false }
   _e.removed = !!removed
@@ -7134,6 +7261,8 @@ app.post('/api/companion/cart-checkout', async (request) => {
   if (!_c) return { ok: false }
   let _n = 0
   for (const _e of [..._c.cartLog, ...(_c.cartRefs ?? [])]) if (!_e.removed && !_e.checkedOut) { _e.checkedOut = true; _n++ }
+  _c.briefDoneRev = _c.briefRev ?? 0
+  for (const _r of _c.ripples ?? []) if (_r.status === 'adopted') _r.handed = true
   if (_n) _c.notes.push(reason === 'cleared' ? '少爺清空了購物車；之後的新想法是新一輪' : '少爺已結帳，把購物車帶去新聊天室實作；之後的新想法是新一輪')
   persistCompanions()
   companionBroadcast(key)
@@ -7149,11 +7278,20 @@ app.post('/api/companion/handoff', async (request, reply) => {
   const _summary = String(summary ?? _c.pendingHandoff?.summary ?? '').trim()
   if (!_summary && !_ideas.length) return { ok: false, error: '想法板是空的，沒有可交付的內容' }
   const _ctxRefs = _c.contextRefs ?? []
+  const _brief = _c.brief ?? null
   const _text = [
     '🗣 陪聊交付（少爺在 TC 陪聊中整理並確認要實作的想法）',
     _summary,
+    _brief?.summary && _brief.summary !== _summary ? `議題摘要：${_brief.summary}` : '',
+    _brief?.decisions?.length ? `已跟少爺說定：\n${_brief.decisions.map(x => `- ${x}`).join('\n')}` : '',
+    _brief?.open?.length ? `還要少爺定（動工前先問）：\n${_brief.open.map(x => `- ${x}`).join('\n')}` : '',
     _ideas.length ? `想法清單：\n${_ideas.map(i => `- ${i.status === 'confirmed' ? '［已確認］' : '［草稿］'}${i.text}`).join('\n')}` : '',
     _ctxRefs.length ? `相關脈絡（侍酒師目錄條目，可在侍酒師或原檔查）：\n${_ctxRefs.map(r => `- ${r.icon ?? ''}${r.title}（${r.ref}）`).join('\n')}` : '',
+    (() => {
+      const _adopted = (_c.ripples ?? []).filter(r => r.status === 'adopted' && !r.handed)
+      return _adopted.length ? `少爺採納的連帶建議（陪聊的設計推理，連同理由）：\n${_adopted.map(r => `- ${r.text}${r.why ? `——${r.why}` : ''}${r.facets?.length ? `〔影響：${r.facets.join('、')}〕` : ''}`).join('\n')}` : ''
+    })(),
+    `交接要求：\n${COMPANION_HANDOFF_DUTIES.map(x => `- ${x}`).join('\n')}`,
     '請照 Mode C 流程處理：先列計畫給少爺在 QA 分頁審，少爺放行前不動工。',
   ].filter(Boolean).join('\n\n')
   const _res = await app.inject({ method: 'POST', url: `/api/qa/runs/${_c.refId}/control`, payload: { action: 'comment', text: _text, inPlaceLink: true } })
@@ -7161,6 +7299,7 @@ app.post('/api/companion/handoff', async (request, reply) => {
   try { _body = _res.json() } catch {}
   if (_res.statusCode >= 400 || !_body?.ok) return { ok: false, error: _body?.error ?? `HTTP ${_res.statusCode}` }
   for (const _i of _ideas) _i.status = 'handed'
+  for (const _r of _c.ripples ?? []) if (_r.status === 'adopted') _r.handed = true
   _c.pendingHandoff = null
   _c.notes.push('少爺已把目前的想法交付給實作聊天室；之後的新想法另外整理')
   companionPushMessage(key, 'system', `已交付給實作聊天室（${_ideas.length} 個想法${via === 'voice' ? '，語音口令觸發' : ''}）。實作聊天室會先列計畫，請到 QA 分頁審查。`)
@@ -7186,7 +7325,7 @@ app.post('/api/companion/reset', async (request) => {
   const _c = companionStore[_key]
   if (!_c) return { ok: false }
   companionStop(_key, 'reset')
-  Object.assign(_c, { messages: [], ideas: [], cartLog: [], cartRefs: [], contextRefs: [], pendingHandoff: null, notes: [], claudeSid: null, updatedAt: Date.now() })
+  Object.assign(_c, { messages: [], ideas: [], ripples: [], cartLog: [], cartRefs: [], contextRefs: [], brief: null, briefRev: 0, briefDoneRev: 0, pendingHandoff: null, notes: [], claudeSid: null, updatedAt: Date.now() })
   persistCompanions()
   companionBroadcast(_key)
   return { ok: true }

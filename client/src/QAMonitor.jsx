@@ -8,6 +8,7 @@ import { confirmIfLiveInteractive } from './liveSessionGuard.js'
 import { reloginSession } from './relogin.js'
 import { WorkflowLauncher } from './WorkflowLauncher.jsx'
 import { CompanionPanel } from './CompanionPanel.jsx'
+import QuietToggle, { QUIET_HINT } from './QuietToggle'
 
 const STATUS_META = {
   announced: { label: '待放行', cls: 'text-yellow-400 border-yellow-500/50' },
@@ -284,6 +285,9 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
   const [gitRuleOpen, setGitRuleOpen] = useState(false)       // 規則編輯（⚙）展開中
   const [gitAutoResults, setGitAutoResults] = useState([])    // 依規則 Commit 的回寫紀錄（當前專案，新→舊）
   const [gitAutoOpen, setGitAutoOpen] = useState(false)       // 紀錄展開中
+  // 勿擾（少爺 2026-10-08）：「⚡ 依規則 Commit」喚起的 Claude 進程不跳終端視窗；偏好鍵 qa.quiet.git-auto-commit
+  const [gitAutoQuiet, setGitAutoQuiet] = useState(false)
+  const [gitAutoQuietBusy, setGitAutoQuietBusy] = useState(false)
   // 逐筆推送（少爺 2026-08-29）：server 全域一次只跑一個，所以這裡也只存一個 job
   const [gitPushJob, setGitPushJob] = useState(null)
 
@@ -303,6 +307,7 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
     const _res = await fetch('/api/git/projects').then(r => r.json()).catch(() => ({ ok: false }))
     if (!_res.ok) return
     setGitProjects(_res.projects ?? [])
+    setGitAutoQuiet(!!_res.autoCommitQuiet)
     if (gitProjectId) applyGitDraft((_res.drafts ?? {})[gitProjectId], true)
     setGitAutoResults(gitProjectId ? ((_res.autoResults ?? {})[gitProjectId] ?? []) : [])
   }, [gitProjectId, applyGitDraft])
@@ -313,6 +318,17 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
       .then(r => r.json()).catch(e => ({ ok: false, error: e.message }))
     setGitStatus(_res.ok ? _res : null)
     setGitHint(_res.ok ? '' : '')      // 未設規則的專案不算錯誤，區塊自己會說明
+  }, [])
+
+  const toggleGitAutoQuiet = useCallback(async (InQuiet) => {
+    setGitAutoQuietBusy(true)
+    const _res = await fetch('/api/settings', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 'qa.quiet.git-auto-commit': InQuiet }),
+    }).then(r => r.json()).catch(e => ({ ok: false, error: e.message }))
+    setGitAutoQuietBusy(false)
+    if (_res.ok) setGitAutoQuiet(_res.settings?.['qa.quiet.git-auto-commit'] === true)
+    setGitHint(_res.ok ? `${InQuiet ? '🔕 已開啟' : '🔔 已關閉'}勿擾：⚡ 依規則 Commit` : `⚠️ 勿擾設定失敗：${_res.error ?? '未知原因'}`)
   }, [])
 
   useEffect(() => { loadGitProjects() }, [loadGitProjects])
@@ -932,6 +948,8 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
           <div className="flex items-center gap-2 mt-1.5">
             {gitDraftAt && <span className="text-[9px] text-[var(--gold)]">Claude 草稿 {fmtTime(gitDraftAt)}</span>}
             <div className="flex-1" />
+            <QuietToggle on={gitAutoQuiet} busy={gitAutoQuietBusy} onToggle={toggleGitAutoQuiet}
+              title={`${QUIET_HINT}\n適用：「⚡ 依規則 Commit」喚起的 Claude 進程（git 狀態查詢與 Commit 腳本一律不跳視窗）`} />
             {/* 逐筆推送（少爺 2026-08-29）：與 commit 分開的動作——commit 只進本地，這顆才會動到遠端。
                 刻意不用金色：金色是「Commit」那顆主動作的顏色，別讓兩顆看起來像同一件事 */}
             <button onClick={runPushOneByOne}
