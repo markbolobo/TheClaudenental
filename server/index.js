@@ -4,14 +4,21 @@ import multipart from '@fastify/multipart'
 import * as OpenCC from 'opencc-js'
 import fs from 'fs'
 import path from 'path'
-import { spawnSync, spawn } from 'child_process'
+import { spawnSync, spawn, execFile } from 'child_process'
 import net from 'net'
 import os from 'os'
 import crypto from 'crypto'
+import { pathToFileURL } from 'url'
 import { buildCatalog, getCatalog, priceFor, catalogFingerprint } from './modelCatalog.js'
 import { claudeVersionFromPath, compareClaudeVersion } from './modelPushSource.js'
 import { createLaneRegistry, createRefCountSet } from './claudeLanes.js'
 import { commentIntendsClose, transitionCancelsArm, canArmInStatus } from './qaCloseArm.js'
+import { parseMotionSpec, simulateMotion } from '../client/src/motionSpec.js'
+import { QA_DECISION_SECTION_RE, decisionBlockEnd, decisionSectionFreeLines, decisionDeclarationRefs, decisionLinkRefs, normalizeDecisionSource, legacyQuestionCount } from './qaDecisions.js'
+import { ASK_TOOL, askQuestionsOf, askKeyOf, askSummary, buildAskAnswer, asciiJson, findOpenAsk, askHasResult } from './askRelay.js'
+import { classifyApiError, isWeeklyLimit, parseResetText, resolveAutoResumeSettings, decideAction, pickBatch, resumePrompt, recoverAuthFailedRecord, isAutoSwitchThrashing, recordsToReattribute, AUTO_RESUME_DEFAULTS } from './usageInterrupts.js'
+import { readTranscriptLines, transcriptLineEnd, heatEntryFromLine, newScanSummary, accumulateScanSummary } from './transcriptReader.js'
+import { AUTO_SWITCH_DEFAULTS, resolveAutoSwitchSettings, accountStatus, decideSwitch, decideRevert, detectExternalSwitch, raiseCooling, rollbackCoolingSince, mergeCredentials, matchAccountByCredentials, liveOrganizationUuid, accountRecordFrom, accountPublicView, parseLoginUrl } from './accountVault.js'
 
 const PORT = 3001
 const CLAUDIA_URL = 'http://localhost:48901'
@@ -23,7 +30,19 @@ const CLAUDIA_URL = 'http://localhost:48901'
 // 有換版就立刻重建——少爺升級 Claude Code 後最慢一小時內，新模型就會出現在下拉裡（2026-09-24）。
 const MODEL_REFRESH_MS = 24 * 60 * 60 * 1000
 const MODEL_FINGERPRINT_MS = 60 * 60 * 1000
-function priceOf(InModelId) { return priceFor(InModelId, getClaudeExe()) }
+// 價格快取（少爺 2026-10-12「TC 載入過慢」實測）：priceFor 每次都要重掃 VS Code 擴充套件資料夾找 claude.exe 並取模型目錄
+// （約 0.3ms），用量熱度／聊天室花費逐筆呼叫＝數萬次累積成十幾秒，是 server 卡住的主因。
+// 同一模型 30 秒內沿用；模型目錄重建時清空（refreshModelCatalog）
+const priceCache = new Map()   // model → { pricing, at }
+const PRICE_CACHE_MS = 30_000
+function priceOf(InModelId) {
+  const _now = Date.now()
+  const _hit = priceCache.get(InModelId)
+  if (_hit && _now - _hit.at < PRICE_CACHE_MS) return _hit.pricing
+  const _pricing = priceFor(InModelId, getClaudeExe())
+  priceCache.set(InModelId, { pricing: _pricing, at: _now })
+  return _pricing
+}
 
 const app = Fastify({ logger: false, bodyLimit: 50 * 1024 * 1024 }) // 50MB — supports large image base64 payloads
 await app.register(wsPlugin)
@@ -99,6 +118,8 @@ function readLiveSessions(InFresh = false) {
         const _o = JSON.parse(fs.readFileSync(path.join(CLAUDE_SESSIONS_DIR, _f), 'utf-8'))
         if (!_o?.sessionId || !_o?.pid) continue
         try { process.kill(_o.pid, 0) } catch { continue }   // 進程已死＝分頁關了
+        // 同一個 session 同時有開著的分頁與 TC 無頭續接時，以開著的分頁為準（直投位址、互動判定都要分頁那一筆）
+        if (_map.get(_o.sessionId)?.kind === 'interactive' && _o.kind !== 'interactive') continue
         _map.set(_o.sessionId, _o)
       } catch {}
     }
@@ -109,9 +130,44 @@ function readLiveSessions(InFresh = false) {
 
 /** 該 session 是不是「少爺開著的活互動分頁」——TC 自己 spawn 的無頭子進程不算 */
 function isLiveInteractiveSession(sessionId) {
-  if (!sessionId || subprocessSids.has(sessionId)) return false
+  if (!sessionId) return false
+  // 只看本機註冊表此刻有沒有活的互動進程。不能用 subprocessSids 排除：某室只要曾被 TC 無頭續接過就會永久留在那張名單，
+  // 2026-10-10 實查 26 個開著的 VS Code 分頁全被誤判「不是活分頁」→ 直投登記提醒從未注入、續接訊息誤寫成無頭。
   const _s = readLiveSessions().get(sessionId)
   return !!_s && _s.kind === 'interactive'
+}
+
+// ─── 自動化總開關（少爺 2026-10-15「先停止監看PIE…在TC做開關」→「TC直接做總開關就好」）───
+// 暫停中（全部聊天室）：監看心跳回 paused → 監看自行結束；UserPromptSubmitSync 不再注入「補掛監看」；
+// Invoke-RomanEditorPython.py 查本開關、擋下會開 PIE 的腳本。
+// 恢復：清節流＋直投通知所有開著的分頁重掛監看。TC 直投（ccmsg）不受影響，聊天室訊息照樣送得進分頁。
+const AUTOMATION_PAUSE_FILE = path.join(os.homedir(), '.claude', 'tc_automation_paused.json')
+function readAutomationPause() {
+  try { return JSON.parse(fs.readFileSync(AUTOMATION_PAUSE_FILE, 'utf8')) } catch { return {} }
+}
+function isMonitorPaused() {
+  return !!readAutomationPause().paused
+}
+
+// 總開關暫停中要攔的自動回合：①監看／背景任務的監看事件通知 ②同一聊天室 24 小時內重複送進來的同一句長指令（＝排程／迴圈）
+// 少爺親手打的話不會逐字重複，所以不受影響；TC 自己的「(TC 恢復自動化)」通知不攔
+// 指紋落檔（server 重啟後第一次排程也認得出是重複）
+const PROMPT_SEEN_FILE = path.join(os.homedir(), '.claude', 'tc_prompt_seen.json')
+let _promptSeen = null   // { [sessionId]: { [sha1]: 最後時間 } }
+function automationBlockReason(InSid, InPrompt) {
+  const _text = InPrompt.trim()
+  if (!_promptSeen) { try { _promptSeen = JSON.parse(fs.readFileSync(PROMPT_SEEN_FILE, 'utf8')) } catch { _promptSeen = {} } }
+  const _seen = _promptSeen[InSid] ?? (_promptSeen[InSid] = {})
+  const _now = Date.now()
+  for (const _k of Object.keys(_seen)) if (_now - _seen[_k] > 24 * 3600 * 1000) delete _seen[_k]
+  const _key = crypto.createHash('sha1').update(_text).digest('hex')
+  const _repeated = _text.length >= 30 && _key in _seen
+  if (_text.length >= 30) { _seen[_key] = _now; try { atomicWriteJson(PROMPT_SEEN_FILE, _promptSeen) } catch {} }
+  if (!isMonitorPaused() || _text.startsWith('(TC')) return ''
+  if (_text.startsWith('<task-notification>') && /Monitor event|監看/.test(_text)) return '監看事件通知'
+  if (_text.includes('<<autonomous-loop')) return '自主迴圈'
+  if (_repeated) return '排程重複指令'
+  return ''
 }
 
 /** 原地聯動監看的掛載指令（給 Claude 端直接丟進 Monitor 工具，persistent=true） */
@@ -191,8 +247,15 @@ function ccmsgRegister(InSessionId, InSocket, InToken, InSource) {
 function ccmsgRegisterFromHook(InSessionId, InRequest) {
   const _socket = InRequest?.headers?.['x-cc-msg-socket']
   const _token = InRequest?.headers?.['x-cc-msg-token']
-  if (_socket && _token) ccmsgRegister(InSessionId, String(_socket), String(_token), 'hook')
+  const _had = InRequest?.headers && ('x-cc-msg-socket' in InRequest.headers)
+  const _ok = (_socket && _token) ? ccmsgRegister(InSessionId, String(_socket), String(_token), 'hook') : false
+  // 診斷：hook 有帶標頭欄位卻沒登記成功（值是空的＝hook 子程序拿不到環境變數；有值＝位址與註冊表不符）——只記布林，不記權杖
+  if (_had && !_ok && !ccmsgTarget(InSessionId)) {
+    const _k = `${InSessionId}:${!!_socket}:${!!_token}`
+    if (!_ccmsgHookMissLogged.has(_k)) { _ccmsgHookMissLogged.add(_k); logEvent('tc.ccmsg.hook_register_miss', { sessionId: InSessionId, socket: !!_socket, token: !!_token }) }
+  }
 }
+const _ccmsgHookMissLogged = new Set()
 
 /** 能不能直投：已登記＋分頁活著＋收件位址沒換（/clear、resume 換對話、PID 回收都會換位址） */
 function ccmsgTarget(InSessionId) {
@@ -645,6 +708,7 @@ app.post('/hook/Stop', async (request) => {
   const e = request.body
   forwardToClaudia(e, 'Stop')
   ccmsgRegisterFromHook(e?.session_id, request)
+  askRelease(e?.session_id, 'turn_end')
   if (subprocessSids.has(e.session_id) && !sessions.has(e.session_id)) return { ok: true }
   const reason = e.stop_reason ?? ''
   const isSleeping = reason === 'max_tokens'
@@ -678,6 +742,7 @@ app.post('/hook/Stop', async (request) => {
 app.post('/hook/SessionEnd', async (request) => {
   const e = request.body
   forwardToClaudia(e, 'SessionEnd')
+  askRelease(e?.session_id, 'session_end')
   // TC 出身的 sid 永久標記不刪（少爺 2026-07-14）：同 sid 可能有多顆進程（喚醒＋孤兒），
   // 一顆 SessionEnd 就除名會讓另一顆還活著的事件被誤註冊成互動 session；有正式條目者放行更新
   if (subprocessSids.has(e.session_id) && !sessions.has(e.session_id)) return { ok: true }
@@ -724,14 +789,19 @@ app.post('/hook/PreToolUse', async (request) => {
 app.post('/hook/PostToolUse', async (request) => {
   const e = request.body
   forwardToClaudia(e, 'PostToolUse')
+  // 提問在分頁那邊答完了：放掉 TC 扣著的 hook 連線、面板改顯示已作答
+  if (e?.tool_name === ASK_TOOL) askRelease(e.session_id, 'answered_elsewhere', e.tool_input)
   // no status change
   return { ok: true }
 })
 
 // PermissionRequest — long-poll: hold connection until user approves/blocks in dashboard
-app.post('/hook/PermissionRequest', async (request) => {
+app.post('/hook/PermissionRequest', async (request, reply) => {
   const e = request.body
   forwardToClaudia(e, 'PermissionRequest')
+  // 提問（AskUserQuestion）另走提問中繼：扣住連線等少爺在 TC 或分頁作答——不受「TC 子進程」過濾，
+  // 曾由 TC 起跑、後來在 VS Code 開著的聊天室（例如 C2 批）一樣要能從 TC 回答
+  if (e?.tool_name === ASK_TOOL) return askHold(request, reply, e)
   // TC 子進程（含 👁 cli 視窗喚醒）的權限詢問不走 TC 卡片（少爺 2026-07-15：此入口原本無過濾，
   // cli 視窗的 PermissionRequest 把 136dd7dd 憑空註冊成無名條目）——回 ok 讓它退回自己視窗內詢問
   if (subprocessSids.has(e.session_id)) return { ok: true }
@@ -771,6 +841,12 @@ app.post('/hook/UserPromptSubmitSync', async (request, reply) => {
   if (!_sid) return ''
   ccmsgRegisterFromHook(_sid, request)
   const _prompt = String(e.prompt ?? '')
+  // 自動化總開關暫停中：自動觸發的回合（排程重複送的同一句、監看事件通知）在送進模型前擋掉＝不耗用量
+  const _autoBlock = automationBlockReason(_sid, _prompt)
+  if (_autoBlock) {
+    logEvent('tc.automation.blocked', { sid: _sid, kind: _autoBlock, preview: _prompt.slice(0, 60) })
+    return { decision: 'block', reason: `TC 自動化總開關暫停中，已攔下自動觸發的回合（${_autoBlock}），未消耗用量。要恢復請到 TC 標題列按「⏸ 自動化暫停」。` }
+  }
   if (_prompt.startsWith('(TC')) return ''   // TC 自己的喚醒/通知 prompt 不注入
   // TC 自家無頭進程正在跑這個 session ＝ 這句不是少爺在互動介面打的
   if (claudeLanes.runningEntry(_sid)) return ''
@@ -789,6 +865,8 @@ app.post('/hook/UserPromptSubmitSync', async (request, reply) => {
   const _asContext = (InText) => InText ? { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: InText } } : ''
   // 監看心跳還在＝已原地聯動、不重掛（避免每句注入）；心跳斷才注入（涵蓋兩種：spawn run 首掛 + monitor 死掉重掛）
   if (isMonitorAlive(_sid)) return _asContext(_ccmsgNote())
+  // 少爺在 TC 總開關暫停了自動化＝不補掛
+  if (isMonitorPaused()) return _asContext(_ccmsgNote())
   // 少爺 2026-09-08「全部都要聯動」：原本要求「綁著未結案 QA run」才注入 → 沒開 run 的分頁永遠不會
   // 掛監看，TC 聊天室／侍酒師送進來的訊息就只能走無頭、分頁不動。改成活的互動分頁一律補掛（節流 10 分鐘）。
   if (!isLiveInteractiveSession(_sid)) return ''
@@ -816,8 +894,42 @@ app.post('/hook/UserPromptSubmitSync', async (request, reply) => {
 app.post('/hook/monitor-heartbeat', async (request) => {
   const _sid = request.body?.session
   const _pid = Number(request.body?.pid) || null
+  // 暫停中不記心跳（監看收到 paused 會自行結束，server 立刻判定監看已停）
+  if (isMonitorPaused()) { monitorHeartbeats.delete(_sid); return { ok: true, paused: true } }
   if (_sid) monitorHeartbeats.set(_sid, { ts: Date.now(), pid: _pid })
-  return { ok: true }
+  return { ok: true, paused: false }
+})
+
+// 自動化總開關：查詢
+app.get('/api/automation-pause', async () => {
+  const _e = readAutomationPause()
+  return { ok: true, paused: !!_e.paused, updatedAt: _e.updatedAt ?? null }
+})
+// 自動化總開關：設定。暫停時記下當下監看還活著的聊天室；恢復時只直投通知這些聊天室重掛（不吵醒原本沒掛監看的室）
+app.post('/api/automation-pause', async (request) => {
+  const _paused = !!request.body?.paused
+  const _prev = readAutomationPause()
+  if (_paused) {
+    const _alive = [...monitorHeartbeats.keys()].filter(sid => isMonitorAlive(sid))
+    atomicWriteJson(AUTOMATION_PAUSE_FILE, { paused: true, updatedAt: Date.now(), monitoredSessions: [...new Set([...(_prev.monitoredSessions ?? []), ..._alive])] })
+    monitorHeartbeats.clear()
+    logEvent('tc.automation.pause', { paused: true, monitoredSessions: _alive.length })
+    broadcast({ type: 'automation_pause', paused: true })
+    return { ok: true, paused: true, monitoredSessions: _alive.length }
+  }
+  atomicWriteJson(AUTOMATION_PAUSE_FILE, { paused: false, updatedAt: Date.now() })
+  logEvent('tc.automation.pause', { paused: false })
+  broadcast({ type: 'automation_pause', paused: false })
+  const _targets = (_prev.monitoredSessions ?? []).filter(sid => isLiveInteractiveSession(sid))
+  let _notified = 0
+  for (const _sid of _targets) {
+    _autoMountInjectedAt.delete(_sid)
+    const _report = await ccmsgPost(_sid,
+      `(TC 恢復自動化) 少爺在 TC 總開關恢復了監看與自動 PIE。請用 Monitor 工具掛上（persistent=true）：command='${monitorMountCommand(_sid)}'，掛好後簡短告知少爺已恢復。`,
+      { kind: 'automation-resume' }).catch(() => ({ ok: false }))
+    if (_report.ok) _notified++
+  }
+  return { ok: true, paused: false, targets: _targets.length, notified: _notified }
 })
 
 // 監看存活狀態（少爺 2026-07-17：讓「原地聯動有沒有掛上」變成可觀察）——驗證用 + QA 面板顯示
@@ -868,6 +980,7 @@ app.post('/hook/UserPromptSubmit', async (request) => {
   const e = request.body
   forwardToClaudia(e, 'UserPromptSubmit')
   ccmsgRegisterFromHook(e?.session_id, request)
+  askRelease(e?.session_id, 'new_prompt')
   if (subprocessSids.has(e.session_id) && !sessions.has(e.session_id)) return { ok: true }
   const raw = e.prompt ?? ''
   // Strip leading XML system tags (e.g. <task-notification>, <system-reminder>)
@@ -1000,7 +1113,19 @@ app.post('/api/sessions/clear-inactive', async () => {
 })
 
 // ── Activity Heat — time-windowed cost from JSONL files ──────────────────────
+// 少爺 2026-10-12「TC 載入過慢」：原本每次請求整批重讀 7 天內全部逐字稿（76 份 703MB）、每筆用量再各查一次價格，
+// 前端每 30 秒打一次＝server 每 30 秒卡死 8 秒以上，所有分頁的請求都排在後面。
+// 改為增量快取：每份逐字稿記住讀到的位置，只讀新增的行；開機第一次補讀分段讓出；價格每個模型只查一次。
+const usageHeatCache = new Map()   // filePath → { byteOffset, entries: [[ts, model, usage]] }
+const USAGE_HEAT_YIELD_BYTES = 16 * 1024 * 1024   // 每讀這麼多讓出一次事件迴圈
+let usageHeatPending = null        // 同時多個請求共用同一次計算
+
 app.get('/api/usage/heat', async () => {
+  if (!usageHeatPending) usageHeatPending = computeUsageHeat().finally(() => { usageHeatPending = null })
+  return usageHeatPending
+})
+
+async function computeUsageHeat() {
   const now    = Date.now()
   const WIN_5H = 5  * 60 * 60 * 1000
   const WIN_7D = 7  * 24 * 60 * 60 * 1000
@@ -1021,6 +1146,8 @@ app.get('/api/usage/heat', async () => {
     )
   }
 
+  const _seen = new Set()
+  let _sinceYield = 0
   try {
     for (const proj of fs.readdirSync(claudeDir)) {
       const projDir = path.join(claudeDir, proj)
@@ -1031,38 +1158,79 @@ app.get('/api/usage/heat', async () => {
         try {
           // Quick pre-filter: skip files not touched in 7d
           if (now - fs.statSync(fullPath).mtimeMs > WIN_7D) continue
-          for (const line of fs.readFileSync(fullPath, 'utf-8').split('\n')) {
-            try {
-              const obj = JSON.parse(line)
-              if (obj.type !== 'assistant') continue
-              const msg = obj.message
-              if (!msg?.usage?.output_tokens) continue   // skip non-generating turns
-              const ts = obj.timestamp ? new Date(obj.timestamp).getTime() : null
-              if (!ts) continue
-              const age = now - ts
-              if (age > WIN_7D) continue
-              const cost = computeCost(msg.model ?? '', msg.usage)
-              if (cost <= 0) continue
-              cost7d += cost; count7d++
-              if (age <= WIN_5H) { cost5h += cost; count5h++ }
-            } catch {}
+          _seen.add(fullPath)
+          let _c = usageHeatCache.get(fullPath)
+          if (!_c) { _c = { byteOffset: 0, entries: [] }; usageHeatCache.set(fullPath, _c) }
+          for (;;) {
+            const _prev = _c.byteOffset
+            const _r = readTranscriptLines(fullPath, _c.byteOffset, USAGE_HEAT_YIELD_BYTES)
+            if (_r.reset) _c.entries = []
+            for (const line of _r.lines) {
+              const _e = heatEntryFromLine(line)
+              if (_e) _c.entries.push(_e)
+            }
+            _c.byteOffset = _r.nextByte
+            _sinceYield += _r.reset ? _r.nextByte : _r.nextByte - _prev
+            if (_sinceYield >= USAGE_HEAT_YIELD_BYTES) { _sinceYield = 0; await new Promise(setImmediate) }
+            if (!_r.more) break
+          }
+          _c.entries = _c.entries.filter(([ts]) => now - ts <= WIN_7D)
+          for (const [ts, model, usage] of _c.entries) {
+            const age = now - ts
+            const cost = computeCost(model, usage)
+            if (cost <= 0) continue
+            cost7d += cost; count7d++
+            if (age <= WIN_5H) { cost5h += cost; count5h++ }
           }
         } catch {}
       }
     }
   } catch {}
+  for (const _p of usageHeatCache.keys()) if (!_seen.has(_p)) usageHeatCache.delete(_p)
 
   return {
     session5h: { cost: cost5h, count: count5h },
     weekly7d:  { cost: cost7d, count: count7d },
     updatedAt: now,
   }
-})
+}
 
 
 // ─── Session History API ──────────────────────────────────────────────────────
 
 const CLAUDE_DIR = path.join(os.homedir(), '.claude')
+
+// 聊天室標題快取：sid → { mtimeMs, title }（逐字稿改動才重讀）
+const sessionTitleCache = new Map()
+
+/** 聊天室給人看的標題：手動改名 > 自動標題 > 第一句提問；找不到回 null */
+function getSessionDisplayTitle(sessionId) {
+  if (!sessionId) return null
+  const projectsDir = path.join(CLAUDE_DIR, 'projects')
+  try {
+    for (const proj of fs.readdirSync(projectsDir)) {
+      const candidate = path.join(projectsDir, proj, `${sessionId}.jsonl`)
+      if (!fs.existsSync(candidate)) continue
+      const _mtime = fs.statSync(candidate).mtimeMs
+      const _cached = sessionTitleCache.get(sessionId)
+      if (_cached && _cached.mtimeMs === _mtime) return _cached.title
+      let _custom = null
+      let _ai = null
+      for (const l of fs.readFileSync(candidate, 'utf-8').split('\n')) {
+        if (!l.includes('-title"')) continue
+        try {
+          const obj = JSON.parse(l)
+          if (obj.type === 'custom-title' && obj.customTitle) _custom = obj.customTitle
+          else if (obj.type === 'ai-title' && obj.aiTitle) _ai = obj.aiTitle
+        } catch {}
+      }
+      const _title = _custom ?? _ai ?? getSessionTopic(sessionId)
+      sessionTitleCache.set(sessionId, { mtimeMs: _mtime, title: _title })
+      return _title
+    }
+  } catch {}
+  return null
+}
 
 /** Read first user message or ai-title from a session's JSONL as display name */
 function getSessionTopic(sessionId) {
@@ -1601,26 +1769,45 @@ function refreshHistoryIndex() {
   return idx
 }
 
+// 例行工項出身（少爺 2026-10-08：History 要能隱藏純工項的聊天室）。
+// 判準＝聊天室第一句話（＝開室來源送出的固定指令），不看標題、不看內容——標題是 AI 取的、內容會變，第一句話才是出身。
+// 新增一種會開室的例行工具時在這裡登記一條；test 吃索引裡的 firstMsg（只存開頭 60 字）。
+const HISTORY_ROUTINE_ORIGINS = [
+  { id: 'commit',    label: '一鍵提交',     test: (InFirst) => AUTO_COMMIT_PROMPT_RE.test(InFirst) },                     // 版控面板／酒窖 TC Commit（buildAutoCommitPrompt）
+  { id: 'package',   label: '打包失敗分析', test: (InFirst) => InFirst.startsWith(PACKAGE_FAILURE_PROMPT_TAG) },        // triggerPackageFailureAnalysis
+  { id: 'topicNote', label: '話題筆記',     test: (InFirst) => InFirst.startsWith('更新話題筆記') },                      // 排程 RomanPrototype_話題筆記_自動更新（AI_Utils/canvas_auto_update.ps1）
+  { id: 'knowledgeSub', label: '知識訂閱',  test: (InFirst) => InFirst.startsWith('知識訂閱自動吸收（TC Marker 誓約') },     // 誓約 Claude_知識訂閱_*（MasterBrain/.agent/scripts/Watch-KnowledgeSubscriptions.py）
+]
+/** 聊天室的例行工項出身；不是例行工項回 null */
+function routineOriginOf(InEntry) {
+  const _first = InEntry.firstMsg ?? ''
+  const _hit = _first ? HISTORY_ROUTINE_ORIGINS.find(o => o.test(_first)) : null
+  return _hit ? { id: _hit.id, label: _hit.label } : null
+}
+
 // List all past sessions across all projects（純顯示——不再即時觸發 LLM 標籤，改由每晚 23:30 定時批次）
+/** History 一列（History 分頁與 CHAT 陪聊脈絡檔共用同一份標籤／摘要／花費判讀） */
+function historyRowOf(sessionId, entry) {
+  const aiTags = entry.aiTags ?? null
+  const cleanTexts = [...(entry.cleanHead ?? []), ...(entry.cleanTail ?? [])]
+  let tags = null, summary = null, knowledge = []
+  // manual（少爺校正過）即使清空也是權威；有 LLM tag 用 LLM；都沒有才詞頻墊檔
+  if (aiTags && (aiTags.tags?.length || aiTags.manual)) {
+    tags = aiTags.tags ?? []; summary = aiTags.summary ?? null; knowledge = aiTags.knowledge ?? []
+  }
+  if (!tags) tags = extractSessionTags(cleanTexts)
+  const costUsd = entry.resultUsd ?? ((entry.estUsd ?? 0) > 0 ? entry.estUsd : null)
+  return { sessionId, project: entry.project, cwd: entry.cwd ?? null,
+    title: entry.title ?? entry.firstMsg ?? sessionId.slice(0, 8),
+    mtime: entry.mtime, size: entry.size, costUsd, routine: routineOriginOf(entry),
+    tags, summary, llm: !!(aiTags?.tags?.length || aiTags?.manual), knowledge: resolveKnowledgeDocs(knowledge) }
+}
+
+// 全部回傳不設筆數上限：對話紀錄保留期已拉長（cleanupPeriodDays），上限會讓舊聊天室再次「看不到」
 app.get('/api/history', async () => {
   const idx = refreshHistoryIndex()
-  const result = []
-  for (const [sessionId, entry] of Object.entries(idx.sessions)) {
-    const aiTags = entry.aiTags ?? null
-    const cleanTexts = [...(entry.cleanHead ?? []), ...(entry.cleanTail ?? [])]
-    let tags = null, summary = null, knowledge = []
-    // manual（少爺校正過）即使清空也是權威；有 LLM tag 用 LLM；都沒有才詞頻墊檔
-    if (aiTags && (aiTags.tags?.length || aiTags.manual)) {
-      tags = aiTags.tags ?? []; summary = aiTags.summary ?? null; knowledge = aiTags.knowledge ?? []
-    }
-    if (!tags) tags = extractSessionTags(cleanTexts)
-    const costUsd = entry.resultUsd ?? ((entry.estUsd ?? 0) > 0 ? entry.estUsd : null)
-    result.push({ sessionId, project: entry.project, cwd: entry.cwd ?? null,
-      title: entry.title ?? entry.firstMsg ?? sessionId.slice(0, 8),
-      mtime: entry.mtime, size: entry.size, costUsd,
-      tags, summary, llm: !!(aiTags?.tags?.length || aiTags?.manual), knowledge: resolveKnowledgeDocs(knowledge) })
-  }
-  return { sessions: result.sort((a,b) => b.mtime - a.mtime).slice(0, 100) }
+  const result = Object.entries(idx.sessions).map(([sessionId, entry]) => historyRowOf(sessionId, entry))
+  return { sessions: result.sort((a,b) => b.mtime - a.mtime) }
 })
 
 // ── 每晚 23:30 定時批次標籤（少爺 2026-07-16）───────────────────────────────────
@@ -2045,7 +2232,7 @@ app.get('/api/history/:sessionId', async (request) => {
 
 // ─── VS Code session live tail ────────────────────────────────────────────────
 
-const watchedSessions = new Map() // sessionId → { watcher, filePath, lineCount }
+const watchedSessions = new Map() // sessionId → { watcher, filePath, byteOffset }
 
 function findJsonlPath(sessionId) {
   const projectsDir = path.join(CLAUDE_DIR, 'projects')
@@ -2058,12 +2245,14 @@ function findJsonlPath(sessionId) {
   return null
 }
 
-function parseNewLines(filePath, fromLine) {
+// 只讀 fromByte 之後新增的完整行（少爺 2026-10-12「TC 載入過慢」：原本每次變動都整份重讀，大逐字稿動輒數十 MB）
+function parseNewLines(filePath, fromByte) {
   try {
-    const lines = fs.readFileSync(filePath, 'utf-8').split('\n').filter(Boolean)
-    const newLines = lines.slice(fromLine)
+    const { lines, nextByte, reset } = readTranscriptLines(filePath, fromByte)
+    // 檔案變短＝被改寫：不把整份當成新內容直播，從目前結尾重新接著讀
+    if (reset) return { nextByte: transcriptLineEnd(filePath), messages: [] }
     const messages = []
-    for (const l of newLines) {
+    for (const l of lines) {
       try {
         const obj = JSON.parse(l)
         if (obj.type === 'user') {
@@ -2112,9 +2301,24 @@ function parseNewLines(filePath, fromLine) {
         }
       } catch {}
     }
-    return { lineCount: lines.length, messages }
+    return { nextByte, messages }
   } catch {}
   return null
+}
+
+/** 開始監看聊天室逐字稿：從目前結尾接著讀，之後每次變動只讀新增的部分並發 session_live */
+function startTranscriptWatch(InSessionId, InFilePath) {
+  let _byteOffset = 0
+  try { _byteOffset = transcriptLineEnd(InFilePath) } catch {}
+  const watcher = fs.watchFile(InFilePath, { interval: 500 }, () => {
+    const entry = watchedSessions.get(InSessionId)
+    if (!entry) return
+    const result = parseNewLines(InFilePath, entry.byteOffset)
+    if (!result) return
+    entry.byteOffset = result.nextByte
+    if (result.messages.length) emitSessionLive(InSessionId, result.messages)
+  })
+  watchedSessions.set(InSessionId, { watcher, filePath: InFilePath, byteOffset: _byteOffset })
 }
 
 // session_live 單一出口（少爺 2026-07-15 修 Chat 重複：4 處 broadcast 收斂到這）——
@@ -2131,10 +2335,10 @@ function emitSessionLive(sessionId, messages) {
 function flushSessionLive(sessionId) {
   const entry = watchedSessions.get(sessionId)
   if (!entry) return
-  const result = parseNewLines(entry.filePath, entry.lineCount)
-  if (!result || !result.messages.length) return
-  entry.lineCount = result.lineCount
-  emitSessionLive(sessionId, result.messages)
+  const result = parseNewLines(entry.filePath, entry.byteOffset)
+  if (!result) return
+  entry.byteOffset = result.nextByte
+  if (result.messages.length) emitSessionLive(sessionId, result.messages)
 }
 
 app.post('/api/session/watch', async (request) => {
@@ -2180,17 +2384,7 @@ app.post('/api/session/watch', async (request) => {
   const filePath = findJsonlPath(sessionId)
   if (!filePath) return { ok: false, error: 'not found' }
   // Start from current position — only broadcast NEW lines written after this point
-  const initial = parseNewLines(filePath, 0)
-  const lineCount = initial?.lineCount ?? 0
-  const watcher = fs.watchFile(filePath, { interval: 500 }, () => {
-    const entry = watchedSessions.get(sessionId)
-    if (!entry) return
-    const result = parseNewLines(filePath, entry.lineCount)
-    if (!result || !result.messages.length) return
-    entry.lineCount = result.lineCount
-    emitSessionLive(sessionId, result.messages)
-  })
-  watchedSessions.set(sessionId, { watcher, filePath, lineCount })
+  startTranscriptWatch(sessionId, filePath)
   return { ok: true }
 })
 
@@ -2707,6 +2901,7 @@ app.post('/api/debug/client', async (request) => {
  */
 function refreshModelCatalog(InReason) {
   const _cat = buildCatalog(getClaudeExe())
+  priceCache.clear()   // 價目可能變了，下次查價重取
   broadcast({ type: 'model_catalog', catalog: _cat })
   console.log(`[models] ${_cat.models.length} 筆（官方表 ${_cat.officialSource}／掃描 ${_cat.source}／${InReason}）`
     + (_cat.newlyDiscovered.length ? ` · 新模型 ${_cat.newlyDiscovered.join(', ')}` : '')
@@ -2736,10 +2931,31 @@ app.post('/api/models/refresh', async () => refreshModelCatalog('manual'))
 
 const SCAN_WINDOW_MS   = 30 * 60 * 1000   // look at files touched in last 30 min
 const SCAN_INTERVAL_MS = 8_000
+// 每輪最多讀這麼多新內容；讀不完的檔下一輪接著讀（開機第一次補讀不會一口氣卡住 server）
+const SCAN_READ_BUDGET = 64 * 1024 * 1024
+
+// 逐字稿摘要增量快取（少爺 2026-10-12「TC 載入過慢」：原本每 8 秒把 30 分鐘內有變動的非活躍逐字稿整份重讀，
+// 開著的 VS Code 分頁一多就每輪卡 0.7 秒）——filePath → 讀到的位置＋累積摘要，只讀新增的行
+const scanTranscriptCache = new Map()
+
+/** 逐字稿摘要（cwd／標題／首句提問／有無回覆／最後真實對話時間／最後一行類型）；complete=false＝本輪額度用完、下一輪接著讀 */
+function scanTranscriptSummary(InFilePath, InSize, InBudget) {
+  let _c = scanTranscriptCache.get(InFilePath)
+  if (!_c || InSize < _c.byteOffset) { _c = newScanSummary(); scanTranscriptCache.set(InFilePath, _c) }
+  if (InSize <= _c.byteOffset) return { summary: _c, complete: true, bytesRead: 0 }
+  if (InBudget <= 0) return { summary: _c, complete: false, bytesRead: 0 }
+  const _prev = _c.byteOffset
+  const _r = readTranscriptLines(InFilePath, _c.byteOffset, InBudget)
+  if (_r.reset) { _c = newScanSummary(); scanTranscriptCache.set(InFilePath, _c) }
+  accumulateScanSummary(_c, _r.lines)
+  _c.byteOffset = _r.nextByte
+  return { summary: _c, complete: !_r.more, bytesRead: _r.reset ? _r.nextByte : _r.nextByte - _prev }
+}
 
 function scanJsonlSessions() {
   const projectsDir = path.join(CLAUDE_DIR, 'projects')
   const now = Date.now()
+  let _budget = SCAN_READ_BUDGET
   try {
     for (const proj of fs.readdirSync(projectsDir)) {
       const pd = path.join(projectsDir, proj)
@@ -2750,7 +2966,7 @@ function scanJsonlSessions() {
         const fp  = path.join(pd, file)
         const st  = fs.statSync(fp)
         // Only consider recently-modified files
-        if (now - st.mtimeMs > SCAN_WINDOW_MS) continue
+        if (now - st.mtimeMs > SCAN_WINDOW_MS) { scanTranscriptCache.delete(fp); continue }
         const sid = file.replace('.jsonl', '')
         // Skip sessions we already know about and are still active
         const existing = sessions.get(sid)
@@ -2758,48 +2974,16 @@ function scanJsonlSessions() {
           // Still active — auto-watch if not already watching
           if (!watchedSessions.has(sid)) {
             const fp2 = findJsonlPath(sid)
-            if (fp2) {
-              const initial   = parseNewLines(fp2, 0)
-              const lineCount = initial?.lineCount ?? 0
-              const watcher   = fs.watchFile(fp2, { interval: 500 }, () => {
-                const entry = watchedSessions.get(sid)
-                if (!entry) return
-                const result = parseNewLines(fp2, entry.lineCount)
-                if (!result || !result.messages.length) return
-                entry.lineCount = result.lineCount
-                emitSessionLive(sid, result.messages)
-              })
-              watchedSessions.set(sid, { watcher, filePath: fp2, lineCount })
-            }
+            if (fp2) startTranscriptWatch(sid, fp2)
           }
           continue
         }
         // Read minimal info from JSONL to build/refresh the session
         try {
-          const lines = fs.readFileSync(fp, 'utf-8').split('\n').filter(Boolean)
-          let cwd = null, aiTitle = null, firstUser = null, lastStatus = 'done'
-          let hasActivity = false
-          let lastMsgTs = 0   // 最後一句「真實對話」（user/assistant）的時間——metadata 行（last-prompt 等）不算
-          for (const l of lines) {
-            try {
-              const o = JSON.parse(l)
-              if (!cwd && o.cwd) cwd = o.cwd
-              if (o.type === 'ai-title' && o.aiTitle) aiTitle = o.aiTitle
-              if (o.type === 'user' && !firstUser) {
-                const c = o.message?.content
-                const t = typeof c === 'string' ? c : (Array.isArray(c) ? c.filter(x=>x.type==='text').map(x=>x.text).join('') : '')
-                const clean = t.replace(/^(\s*<[^>]+>[\s\S]*?<\/[^>]+>\s*)+/, '').trim()
-                if (clean) firstUser = clean.slice(0, 60)
-              }
-              if (o.type === 'assistant') hasActivity = true
-              if ((o.type === 'user' || o.type === 'assistant') && o.timestamp) {
-                const _t = Date.parse(o.timestamp)
-                if (_t > lastMsgTs) lastMsgTs = _t
-              }
-              // Most recent result/stop tells us status
-              if (o.type === 'result') lastStatus = 'done'
-            } catch {}
-          }
+          const _scan = scanTranscriptSummary(fp, st.size, _budget)
+          _budget -= _scan.bytesRead
+          if (!_scan.complete) continue   // 還沒讀完，下一輪再判斷
+          const { cwd, aiTitle, firstUser, hasActivity, lastMsgTs, lastType } = _scan.summary
           if (!hasActivity) continue   // skip empty/init-only files
           // TC 出身 sid：掃描器只可更新既有條目、不可建檔（2026-07-15 對齊 hook 同款政策——
           // 全跳過會讓 tc 條目狀態凍結、孤兒守護者工作時 session_live 不掛監看、TC Chat 看不到直播）
@@ -2810,9 +2994,6 @@ function scanJsonlSessions() {
           if (!sessions.has(sid) && (!lastMsgTs || now - lastMsgTs > SESSION_RETIRE_MS)) continue
           // Determine if session looks "active" (file modified < 3 min ago and no result event at end)
           const recentlyWritten = now - st.mtimeMs < 3 * 60 * 1000
-          const lastLine = lines[lines.length - 1] ?? ''
-          let lastType = null
-          try { lastType = JSON.parse(lastLine).type } catch {}
           // active 判定也看真實對話時間（metadata 觸碰不該讓舊 session 亮綠燈）
           const looksActive = recentlyWritten && lastType !== 'result' && (now - lastMsgTs < 3 * 60 * 1000)
           const status = looksActive ? 'active' : 'done'
@@ -2822,25 +3003,17 @@ function scanJsonlSessions() {
           // recentlyWritten = < 3 min; if older, allow downgrade.
           const cur = sessions.get(sid)
           if (cur && cur.status === 'active' && status === 'done' && recentlyWritten) continue
+          // 沒變就不廣播（少爺 2026-10-12「TC 載入過慢」）：原本每 8 秒把每個已完成聊天室都廣播一次，
+          // 前端每收到一則「已完成」就重抓整份 /api/history 算花費＝每 8 秒整份重讀十幾份逐字稿
+          const _scanKey = (InS) => InS ? [InS.displayName, InS.cwd, InS.status, InS.startedAt, InS.lastSeenAt].join('|') : null
+          const _before = _scanKey(cur)
           const s = upsertSession(sid, { displayName, cwd: cwd ?? cur?.cwd, status, startedAt: st.birthtimeMs ?? st.mtimeMs, ...(lastMsgTs ? { lastSeenAt: Math.max(cur?.lastSeenAt ?? 0, lastMsgTs) } : {}) }, false)
-          broadcast({ type: 'session', session: s })
+          if (_scanKey(s) !== _before) broadcast({ type: 'session', session: s })
           schedulePersist()
           // Auto-watch newly-discovered active sessions
           if (status === 'active' && !watchedSessions.has(sid)) {
             const fp2 = findJsonlPath(sid)
-            if (fp2) {
-              const initial   = parseNewLines(fp2, 0)
-              const lineCount = initial?.lineCount ?? 0
-              const watcher   = fs.watchFile(fp2, { interval: 500 }, () => {
-                const entry = watchedSessions.get(sid)
-                if (!entry) return
-                const result = parseNewLines(fp2, entry.lineCount)
-                if (!result || !result.messages.length) return
-                entry.lineCount = result.lineCount
-                emitSessionLive(sid, result.messages)
-              })
-              watchedSessions.set(sid, { watcher, filePath: fp2, lineCount })
-            }
+            if (fp2) startTranscriptWatch(sid, fp2)
           }
         } catch {}
       }
@@ -4207,6 +4380,9 @@ function finalizePackageJob(InExitCode) {
   broadcastPackage(true)
 }
 
+// 打包失敗分析聊天室的第一句開頭（History 依此辨識例行工項出身）
+const PACKAGE_FAILURE_PROMPT_TAG = '(TC 打包失敗自動通知)'
+
 // 打包失敗 → 喚 Claude 分析根因＋建立修復 QA Run（少爺 2026-08-04）
 function triggerPackageFailureAnalysis(job) {
   try {
@@ -4219,7 +4395,7 @@ function triggerPackageFailureAnalysis(job) {
     const _tail = job.tail.slice(-25).join('\n')
 
     const _prompt = [
-      `(TC 打包失敗自動通知) 羅馬打包失敗，請分析並建立修復 QA Run。`,
+      `${PACKAGE_FAILURE_PROMPT_TAG} 羅馬打包失敗，請分析並建立修復 QA Run。`,
       ``,
       `失敗組態：${_failed}`,
       `打包設定：config=${job.config}、suffix=${job.suffix}、日期=${job.dateStamp}`,
@@ -4536,15 +4712,24 @@ app.get('/api/git/status', async (request, reply) => {
   const _root = gitRepoRoot(_proj)
   if (!_root || !fs.existsSync(path.join(_root, '.git'))) return { ok: false, error: `不是 git repo：${_root}` }
   // windowsHide 必加：QA 分頁每次顯示／切專案都會跑這 5～6 次 git，沒加＝每次彈出 4 個空白終端視窗（少爺 2026-10-08 勿擾）
-  const _gitRaw = (args) => {
-    const r = spawnSync('git', ['-C', _root, ...args], { encoding: 'utf-8', windowsHide: true })
-    return r.status === 0 ? (r.stdout ?? '') : ''
-  }
-  const _git = (args) => _gitRaw(args).trim()
+  // 非同步並行（少爺 2026-10-12「QA 載入過慢」）：原本 spawnSync 逐一執行約 0.55 秒，期間整個 server 停住，
+  // 同時發出的 QA 清單也被擋在後面
+  const _gitRaw = (args) => new Promise(resolve => {
+    execFile('git', ['-C', _root, ...args], { encoding: 'utf-8', windowsHide: true, maxBuffer: 64 * 1024 * 1024 },
+      (err, stdout) => resolve(err ? '' : (stdout ?? '')))
+  })
+  const _git = async (args) => (await _gitRaw(args)).trim()
+  const [_porcelain, _aheadOut, _behindOut, _branchOut, _lastCommit] = await Promise.all([
+    _gitRaw(['status', '--porcelain']),
+    _git(['rev-list', '--count', '@{u}..HEAD']),
+    _git(['rev-list', '--count', 'HEAD..@{u}']),
+    _git(['branch', '--show-current']),
+    _git(['log', '-1', '--format=%h %s']),
+  ])
   // porcelain v1：XY <path>，X=index 狀態、Y=工作區狀態、?? =未追蹤
   // ⚠️ 這裡不能對整段輸出 trim：未 staged 的行開頭就是空白（" M path"），trim 掉第一行的空白會讓整行位移一格
   const _staged = [], _unstaged = [], _untracked = []
-  for (const _line of _gitRaw(['status', '--porcelain']).split(/\r?\n/)) {
+  for (const _line of _porcelain.split(/\r?\n/)) {
     if (!_line.trim()) continue
     const _x = _line[0], _y = _line[1], _file = _line.slice(3).trim()
     if (_x === '?') { _untracked.push(_file); continue }
@@ -4552,14 +4737,14 @@ app.get('/api/git/status', async (request, reply) => {
     if (_y !== ' ') _unstaged.push({ file: _file, code: _y })
   }
   // 領先／落後上游幾筆（少爺 2026-08-29）：逐筆推送要先知道會推幾筆；沒設上游時 rev-list 會失敗＝回空字串
-  const _ahead = Number(_git(['rev-list', '--count', '@{u}..HEAD'])) || 0
-  const _behind = Number(_git(['rev-list', '--count', 'HEAD..@{u}'])) || 0
+  const _ahead = Number(_aheadOut) || 0
+  const _behind = Number(_behindOut) || 0
   return {
     ok: true,
     projectId: _proj.id, repoRoot: _root, ...gitProjectPolicy(_proj),
     // --show-current 在 unborn branch 也答得出來；空字串時退回 rev-parse（detached HEAD 之類）
-    branch: _git(['branch', '--show-current']) || _git(['rev-parse', '--abbrev-ref', 'HEAD']),
-    lastCommit: _git(['log', '-1', '--format=%h %s']),
+    branch: _branchOut || await _git(['rev-parse', '--abbrev-ref', 'HEAD']),
+    lastCommit: _lastCommit,
     ahead: _ahead, behind: _behind,
     staged: _staged, unstaged: _unstaged, untracked: _untracked,
   }
@@ -4667,6 +4852,9 @@ app.post('/api/git/commit', async (request, reply) => {
 // 一鍵 Commit 的 prompt 依「該專案的 git 規則」動態產生（少爺 2026-08-14：
 // 「設定完規則後直接按 Commit，就像我在 VS Code 那樣自動照規則根據專案處理」「我很少手動輸入 commit 內容」）。
 // ⚠️ 單一產生點：酒窖 tc-commit 與版控面板的自動 Commit 共用本函式 —— prompt 只有一份，規則改了兩邊同步。
+// buildAutoCommitPrompt 第一句的樣式（History 依此辨識例行工項出身；改第一句時兩邊一起改）
+const AUTO_COMMIT_PROMPT_RE = /^\(TC [^)]*\) 請把「[^」]*」目前的變更提交/
+
 function buildAutoCommitPrompt(projectId, proj, policy, entry) {
   const _root = gitRepoRoot(proj)
   const _name = proj.name ?? projectId
@@ -5460,9 +5648,23 @@ function findSommelierProject(InProjectId) {
   return (readSommelierConfig().projects ?? []).find(p => p.id === InProjectId) ?? null
 }
 
-/** 待定奪來源檔的絕對路徑：檔名白名單＋必須落在該層目錄內（intent＝designIntentDir、scenario＝scenarioDir） */
+// 三種待定奪來源（少爺 2026-10-08「QA Run 待我定奪的互動方式與侍酒師的待定奪一樣的形式，統一設計」）：
+// intent＝設計脈絡、scenario＝情境體驗、qa＝QA 計畫書（QAPC）只屬於該 run 的題（實作時機、修法、範圍）。三者同一套 OPEN-n 格式與寫回。
+const DECISION_LAYERS = ['intent', 'scenario', 'qa']
+const decisionLayerIcon = (InLayer) => ({ intent: '🧭', scenario: '🎬', qa: '🧪' })[InLayer] ?? '⬜'
+const decisionLayerLabel = (InLayer) => ({ intent: '設計脈絡', scenario: '情境體驗', qa: 'QA 計畫書' })[InLayer] ?? InLayer
+const decisionSectionRe = (InLayer) => (InLayer === 'qa' ? QA_DECISION_SECTION_RE : /待定奪/)
+
+/** QA 計畫書目錄：專案設定 qaPlansDir，未設＝<專案根>/QA/plans */
+function qaPlansDirOf(InProj) {
+  if (InProj?.qaPlansDir) return InProj.qaPlansDir
+  const _root = InProj?.projectRoot ?? InProj?.projectPath
+  return _root ? path.join(_root, 'QA', 'plans') : null
+}
+
+/** 待定奪來源檔的絕對路徑：檔名白名單＋必須落在該層目錄內（intent＝designIntentDir、scenario＝scenarioDir、qa＝QA 計畫書目錄） */
 function decisionSourcePath(InProj, InLayer, InFile) {
-  const _dir = InLayer === 'intent' ? InProj?.designIntentDir : InLayer === 'scenario' ? InProj?.scenarioDir : null
+  const _dir = InLayer === 'intent' ? InProj?.designIntentDir : InLayer === 'scenario' ? InProj?.scenarioDir : InLayer === 'qa' ? qaPlansDirOf(InProj) : null
   if (!_dir || !/^[\w.-]+\.md$/.test(String(InFile ?? ''))) return null
   const _root = path.resolve(_dir)
   const _fp = path.resolve(_root, InFile)
@@ -5507,14 +5709,13 @@ function mdFrontmatter(InLines) {
 }
 
 /** 待定奪段內的某個 OPEN 條目：標題行＋子項範圍（子項＝緊接著、有縮排、不是下一個條目的行） */
-function findOpenBlock(InLines, InOpenId) {
-  const _sec = mdSectionRange(InLines, /待定奪/)
+function findOpenBlock(InLines, InOpenId, InSectionRe = /待定奪/) {
+  const _sec = mdSectionRange(InLines, InSectionRe)
   if (!_sec) return null
   for (let i = _sec[0]; i < _sec[1]; i++) {
     const _m = InLines[i].match(DECISION_HEAD_RE)
     if (!_m || _m[4] !== InOpenId) continue
-    let _end = i + 1
-    while (_end < _sec[1] && /^\s+\S/.test(InLines[_end]) && !DECISION_HEAD_RE.test(InLines[_end])) _end++
+    const _end = decisionBlockEnd(InLines, i, _sec[1], DECISION_HEAD_RE)
     return { head: i, end: _end, match: _m, raw: InLines.slice(i, _end).join('\n') }
   }
   return null
@@ -5531,7 +5732,7 @@ const decisionHash = (InRaw) => crypto.createHash('sha1').update(String(InRaw ??
 
 /** 一筆回答寫進 doc（記憶體中）；回傳寫入結果與送子任務要用的快照 */
 function applyDecisionAnswer(InDoc, InLayer, InAnswer, InStamp) {
-  const _blk = findOpenBlock(InDoc.lines, InAnswer.openId)
+  const _blk = findOpenBlock(InDoc.lines, InAnswer.openId, decisionSectionRe(InLayer))
   if (!_blk) return { ok: false, error: `找不到 ${InAnswer.openId}（檔案可能剛被改過）`, stale: true }
   const _m = _blk.match
   if (_m[2] !== ' ') return { ok: false, error: `${InAnswer.openId} 已經定案`, stale: true }
@@ -5571,6 +5772,165 @@ function bumpFrontmatterUpdated(InLines, InDate) {
     if (/^updated:\s*/.test(InLines[i])) { InLines[i] = `updated: ${InDate}`; return }
 }
 
+// ── QA Run 的待定奪（少爺 2026-10-08 統一設計）──────────────────────────────────────────────
+// 一個 run 的待定奪＝計畫書「待定奪」段的 OPEN-n＋段內引用的意圖／情境題＋run.decisionSources（規則與拆段在 qaDecisions.js）。
+// 設計題的單一來源仍是意圖檔／情境檔：侍酒師與 QA 分頁答的是同一筆、寫回同一行，送出後交給負責該 run 的聊天室。
+
+const OPEN_DECISIONS_MJS = 'C:/Project/MasterBrain/.agent/scripts/open_decisions.mjs'
+let _openDecisionsCache = null   // { mtime, mod }：解析器改版（mtime 變）就重新載入
+async function loadOpenDecisionsParser() {
+  const _mtime = fs.statSync(OPEN_DECISIONS_MJS).mtimeMs
+  if (_openDecisionsCache?.mtime !== _mtime) _openDecisionsCache = { mtime: _mtime, mod: await import(`${pathToFileURL(OPEN_DECISIONS_MJS).href}?v=${_mtime}`) }
+  return _openDecisionsCache.mod
+}
+
+const decisionKeyOf = (InPid, InLayer, InSourceId, InOpenId) => `${InPid}|${InLayer}|${InSourceId}|${InOpenId}`
+const QA_RUN_ACTIVE = (InRun) => !InRun.archivedAt && !['closed', 'aborted'].includes(InRun.status)
+
+/** run 所屬的侍酒師專案 id（早期 run 沒帶＝roman；更早的存專案名稱） */
+function qaRunProjectId(InRun) {
+  const _p = InRun?.project
+  if (!_p) return 'roman'
+  if (findSommelierProject(_p)) return _p
+  return (readSommelierConfig().projects ?? []).find(x => x.name === _p)?.id ?? _p
+}
+
+/** run 的計畫書（必須在 QA 計畫書目錄內；qapPath 取檔名） */
+function qaRunPlanFile(InProj, InRun) {
+  const _raw = String(InRun?.qapPath ?? '').trim()
+  if (!_raw) return null
+  const _file = path.basename(_raw.replace(/\\/g, '/'))
+  const _fp = decisionSourcePath(InProj, 'qa', _file)
+  return _fp ? { file: _file, fp: _fp } : null
+}
+
+/** 文字裡引用的意圖檔／情境檔 → [{ layer, sourceId, openId }]（只留真的存在的檔） */
+function parseDecisionLinks(InProj, InText) {
+  return resolveDecisionRefs(InProj, decisionLinkRefs(InText))
+}
+function resolveDecisionRefs(InProj, InRefs) {
+  return InRefs.map(r => {
+    const _layer = decisionSourcePath(InProj, 'scenario', `${r.id}.md`) ? 'scenario' : decisionSourcePath(InProj, 'intent', `${r.id}.md`) ? 'intent' : null
+    return _layer ? { layer: _layer, sourceId: r.id, openId: r.openId } : null
+  }).filter(Boolean)
+}
+
+/** run 的待定奪來源：計畫書段內條目＋引用的設計題＋run.decisionSources */
+async function qaRunDecisionSources(InProj, InRun) {
+  const out = { plan: null, heading: '', local: [], links: [], legacy: 0, planState: 'ok' }
+  const _plan = qaRunPlanFile(InProj, InRun)
+  if (!_plan) out.planState = String(InRun?.qapPath ?? '').trim() ? 'notFound' : 'unset'
+  else {
+    out.plan = _plan
+    const _doc = readMdKeepFormat(_plan.fp)
+    const _range = mdSectionRange(_doc.lines, decisionSectionRe('qa'))
+    if (!_range) out.planState = 'noSection'
+    else {
+      out.heading = _doc.lines[_range[0] - 1].replace(/^##\s+/, '').trim()
+      const _sec = _doc.lines.slice(_range[0], _range[1])
+      out.local = (await loadOpenDecisionsParser()).parseOpenDecisions(_sec.join('\n'))
+      const _free = decisionSectionFreeLines(out.heading, _sec)
+      out.links = resolveDecisionRefs(InProj, decisionDeclarationRefs(_free))
+      out.legacy = legacyQuestionCount(_free, out.links.length > 0)
+    }
+  }
+  for (const s of Array.isArray(InRun?.decisionSources) ? InRun.decisionSources : []) {
+    for (const ln of parseDecisionLinks(InProj, normalizeDecisionSource(s)))
+      if (!out.links.some(x => x.layer === ln.layer && x.sourceId === ln.sourceId && x.openId === ln.openId)) out.links.push(ln)
+  }
+  return out
+}
+
+/** run 的全部待定奪條目（面板格式 { key, layer, sourceId, sourceTitle, file, d }，未定／推導定／已定都在）。
+ *  設計題直接讀意圖檔／情境檔（不等侍酒師重萃取：送出後立刻看得到已定）；id／標題取法同萃取器（frontmatter，否則檔名／一級標題） */
+async function qaRunDecisionItems(InProj, InPid, InRun) {
+  const src = await qaRunDecisionSources(InProj, InRun)
+  const { parseOpenDecisions } = await loadOpenDecisionsParser()
+  const _docs = new Map()
+  const _source = (InLayer, InId) => {
+    const _k = `${InLayer}|${InId}`
+    if (_docs.has(_k)) return _docs.get(_k)
+    let _s = null
+    const _fp = decisionSourcePath(InProj, InLayer, `${InId}.md`)
+    if (_fp) {
+      const _doc = readMdKeepFormat(_fp)
+      const _fm = mdFrontmatter(_doc.lines)
+      const _range = mdSectionRange(_doc.lines, /待定奪/)
+      const _h1 = InLayer === 'intent' ? _doc.lines.find(l => /^\s{0,3}#\s+/.test(l)) : null
+      _s = {
+        id: _fm.id || InId, file: `${InId}.md`, title: _fm.title || (_h1 ? _h1.replace(/^\s{0,3}#\s+/, '').trim() : InId),
+        openDecisions: _range ? parseOpenDecisions(_doc.lines.slice(_range[0], _range[1]).join('\n')) : [],
+      }
+    }
+    _docs.set(_k, _s)
+    return _s
+  }
+  const all = []
+  const _seen = new Set()
+  if (src.plan) {
+    const _base = src.plan.file.replace(/\.md$/, '')
+    for (const d of src.local) {
+      const key = decisionKeyOf(InPid, 'qa', _base, d.id)
+      if (_seen.has(key)) continue
+      _seen.add(key)
+      all.push({ key, layer: 'qa', sourceId: _base, sourceTitle: `計畫書 ${_base}`, file: src.plan.file, d })
+    }
+  }
+  for (const ln of src.links) {
+    const _s = _source(ln.layer, ln.sourceId)
+    if (!_s) continue
+    for (const d of _s.openDecisions ?? []) {
+      if (ln.openId && d.id !== ln.openId) continue
+      const key = decisionKeyOf(InPid, ln.layer, _s.id, d.id)
+      if (_seen.has(key)) continue
+      _seen.add(key)
+      all.push({ key, layer: ln.layer, sourceId: _s.id, sourceTitle: _s.title, file: _s.file, d })
+    }
+  }
+  return { src, all }
+}
+
+/** 連動圖補上 run 計畫書的題（qa 層節點＋它們對意圖檔／情境檔的引用、取決於、解鎖） */
+function addQaNodesToGraph(InGraph, InPid, InItems) {
+  for (const it of InItems.filter(x => x.layer === 'qa')) {
+    InGraph.nodes[it.key] = {
+      key: it.key, layer: 'qa', sourceId: it.sourceId, sourceTitle: it.sourceTitle, file: it.file, openId: it.d.id,
+      question: it.d.question ?? it.d.title, resolved: !!it.d.resolved, resolvedBy: it.d.resolvedBy ?? (it.d.resolved ? 'owner' : null),
+      resolution: it.d.resolution ?? '', basis: it.d.basis ?? '',
+    }
+  }
+  const _keyOf = (InFrom, InRef) => {
+    const _k = InRef.target
+      ? decisionKeyOf(InPid, /^S\d{2}_/.test(InRef.target) ? 'scenario' : 'intent', InRef.target, InRef.openId)
+      : decisionKeyOf(InPid, 'qa', InFrom.sourceId, InRef.openId)
+    return InGraph.nodes[_k] ? _k : null
+  }
+  const _link = (InA, InB, InKind) => {
+    if (!InA || !InB || InA === InB) return
+    for (const [a, b, dir] of [[InA, InB, 'out'], [InB, InA, 'in']]) {
+      const _list = (InGraph.edges[a] ??= [])
+      if (!_list.some(e => e.key === b && e.kind === InKind && e.dir === dir)) _list.push({ key: b, kind: InKind, dir })
+    }
+  }
+  for (const it of InItems.filter(x => x.layer === 'qa')) {
+    for (const r of it.d.refs ?? []) _link(it.key, _keyOf(it, r), 'ref')
+    for (const r of it.d.dependsOn ?? []) _link(it.key, _keyOf(it, r), 'depends')
+    for (const r of it.d.unlocks ?? []) _link(it.key, _keyOf(it, r), 'unlocks')
+  }
+  return InGraph
+}
+
+/** 進行中 run 掛的設計題索引：題目 key → [{ runId, topic, boundSessionId }]（侍酒師送出時把答案送交負責的 run） */
+async function activeQaDecisionIndex(InProj, InPid) {
+  const out = {}
+  for (const _run of readQaRuns().runs.filter(r => QA_RUN_ACTIVE(r) && qaRunProjectId(r) === InPid)) {
+    let _all = []
+    try { _all = (await qaRunDecisionItems(InProj, InPid, _run)).all } catch { continue }
+    for (const x of _all) if (x.layer !== 'qa' && !x.d.resolved) (out[x.key] ??= []).push({ runId: _run.id, topic: _run.topic, boundSessionId: _run.boundSessionId ?? null })
+  }
+  return out
+}
+
 /** 侍酒師重萃取（非同步、同專案合併成一次）：完成後廣播 sommelier_refreshed，開著的面板就地重抓 */
 function scheduleSommelierRefresh(InProj) {
   if (!InProj?.extractCommand) return false
@@ -5605,41 +5965,68 @@ function updateDecisionDispatch(InId, InPatch) {
 }
 
 /** 送子任務的 prompt：無頭出身的聊天室不知道本面板的任何脈絡，所以條目原文、檔案絕對路徑、流程指針全寫進來 */
-function composeDecisionPrompt(InProj, InDone, InOpts) {
-  const _root = InProj.projectRoot ?? InProj.projectPath ?? ''
+/** 定奪清單（每筆：來源檔、條目原文子項、少爺的決定／回覆）——侍酒師子任務與 QA run 通知共用 */
+function decisionListLines(InDone) {
   const _l = []
-  _l.push(`(TC 待定奪) 少爺在 TC 侍酒師的待定奪面板送出 ${InDone.length} 筆定奪／回覆（${InOpts.stamp.date} ${InOpts.stamp.time}，專案 ${InProj.name}${_root ? `，${_root}` : ''}）。`)
-  _l.push('TC 已經把「決定」本身寫回原檔（harness 層，不必重寫）：選項定奪＝`- [x] OPEN-n …（日期 少爺定：…）`；回覆＝該 OPEN 條目下的 `**少爺回覆**` 子項；情境檔另記進「討論紀錄」。你負責之後的判斷與落實。')
-  _l.push('', '【定奪清單】')
   InDone.forEach((d, i) => {
-    _l.push(`${i + 1}. ${d.layer === 'intent' ? '🧭 設計脈絡' : '🎬 情境體驗'}｜${d.sourceTitle || d.sourceId}（${d.fp.replace(/\\/g, '/')}）${d.openId} ${d.question}`)
+    _l.push(`${i + 1}. ${decisionLayerIcon(d.layer)} ${decisionLayerLabel(d.layer)}｜${d.sourceTitle || d.sourceId}（${d.fp.replace(/\\/g, '/')}）${d.openId} ${d.question}`)
     for (const _sub of d.raw.split('\n').slice(1)) if (_sub.trim()) _l.push(`   ${_sub.trim()}`)
     _l.push(d.kind === 'choose' ? `   ✅ 少爺定：${d.decision}` : `   💬 少爺回覆（尚未定案）：「${d.reply}」`)
   })
-  _l.push('', '【請依序處理】', 'A. 資料維護（每一筆都要做）')
+  return _l
+}
+
+/** A. 資料維護（落實、回覆判斷、約束傳播、機檢）——侍酒師子任務與 QA run 通知共用 */
+function decisionMaintenanceLines(InProj, InDone, InGraph) {
+  const _l = ['A. 資料維護（每一筆都要做）']
   _l.push('  1. 動工前先跑 task_kickoff_check：讀原檔全文，以及「牽動」列出的意圖檔／情境檔（§B 首列與「情境」列）。')
   _l.push('  2. 選項定奪 → 把決定落成事實：意圖檔寫成不變量 `INV-n`（寫前查該檔最大編號、寫後查重複），情境檔把被採用的提案 💡→📐、被否決的標 ❌ 並留原話；再到該 OPEN 行尾的定案括號內補「→ 落為 INV-n」「→ 無需實作」或「→ 待實作」。「牽動」列到的其他檔一併同步。')
-  _l.push('  3. 回覆（尚未定案）→ 先判斷少爺的回覆夠不夠定案：夠 → 由你把該條改成 `- [x]`（定案括號寫你整理出的決定；原話已在 `**少爺回覆**`），再照 2. 落實；不夠、或少爺是在發問 → 在該 OPEN 條目最後加一行 `  - **Claude 回覆**（YYYY-MM-DD HH:mm）：…` 說明或追問（必要時改寫「選項」讓他能直接點選），保持 `- [ ]`——TC 面板會把一問一答顯示成對話串。')
+  if (InDone.some(d => d.layer === 'qa')) _l.push('     QA 計畫書（🧪）的題：把決定落進計畫書的實作計畫／驗收項（需要時 PATCH run 的 addItems／criteria），定案括號補「→ 落為計畫書 §…」。')
+  _l.push('  3. 回覆（尚未定案）→ 先判斷少爺的回覆夠不夠定案：夠 → 由你把該條改成 `- [x]`（定案括號寫你整理出的決定；原話已在 `**少爺回覆**`），再照 2. 落實；不夠、或少爺是在發問 → 在該 OPEN 條目最後加一行 `  - **Claude 回覆**（YYYY-MM-DD HH:mm）：…` 說明或追問（必要時改寫「選項」讓他能直接點選；選項差在畫面、位置、路徑、時序時，每個選項補一張 `  - **示意 A**：` 接 ``` 等寬字元圖，面板會像 VS Code 提問那樣在選項旁顯示；差在速度、延遲、加減速、節奏時改用 ```motion 動態示意規格（格式見 TheClaudenental/client/src/motionSpec.js 檔頭），面板會畫成會動的曲線＋畫面模擬），保持 `- [ ]`——TC 面板會把一問一答顯示成對話串。')
   // 約束傳播（少爺 2026-09-30「遊戲是環環相扣的，就像解數獨的技巧一樣」）：每筆定奪都順著連動題往下推
-  const _nbBlocks = InOpts.graph ? InDone.map((d, i) => ({ i, lines: decisionNeighborLines(InOpts.graph, d.key) })).filter(x => x.lines.length) : []
+  const _nbBlocks = InGraph ? InDone.map((d, i) => ({ i, lines: decisionNeighborLines(InGraph, d.key) })).filter(x => x.lines.length) : []
   _l.push('  3.5 約束傳播（數獨）：定了一題就順著連動往下推——連動題已被這個決定（加上品味／現況）**完全決定** → 改成 `- [x] OPEN-n …（YYYY-MM-DD 推導定：<決定>；依據：由 [[X]] OPEN-n 少爺定推導…）`；只被縮小 → 加 `  - **推導**：<選項> 已排除（依據）`；互相衝突 → 在該題寫 `**Claude 回覆**` 指出衝突請少爺裁決。定的若是 🔑 關鍵意圖（有「解鎖」），它解鎖的每一題都要處理。除了下列明示的連動，也要想「還有哪些題因此被回答」（同一機制、同一情境、同一個玩家體驗）。推導只寫真的被決定的，傾向寫成 `**建議**`。')
   if (_nbBlocks.length) {
     _l.push('  【連動題】（程式從 md 的引用／取決於／解鎖建出）')
     for (const b of _nbBlocks) { _l.push(`   第 ${b.i + 1} 筆：`); for (const x of b.lines) _l.push(`   - ${x}`) }
   }
   _l.push(`  4. 機檢：\`python C:/Project/MasterBrain/.agent/scripts/Check-DesignIntent.py\` 與 \`Check-ScenarioExperience.py\`（後者只報不擋）；最後 POST http://127.0.0.1:3001/api/sommelier/refresh/${InProj.id} 讓侍酒師吃到最新。`)
+  return _l
+}
+
+/** 送交 QA run 綁定聊天室的定奪通知（寫成 run 的一則留言，Claude 用 ackComments 讀全文） */
+function composeQaDecisionPrompt(InProj, InRun, InDone, InOpts) {
+  const _via = InOpts.via === 'sommelier' ? '侍酒師' : 'QA 分頁'
+  const _l = [`(TC QA 待定奪) 少爺在 TC ${_via}的待定奪面板，對 QA Run「${InRun.topic}」(${InRun.id}) 送出 ${InDone.length} 筆定奪／回覆（${InOpts.stamp.date} ${InOpts.stamp.time}）。`]
+  _l.push('TC 已經把「決定」本身寫回原檔（harness 層，不必重寫）：選項定奪＝`- [x] OPEN-n …（日期 少爺定：…）`；回覆＝該 OPEN 條目下的 `**少爺回覆**` 子項；情境檔另記進「討論紀錄」。你負責之後的判斷與落實。')
+  _l.push('', '【定奪清單】', ...decisionListLines(InDone))
+  _l.push('', '【請依序處理】', ...decisionMaintenanceLines(InProj, InDone, InOpts.graph))
+  _l.push('B. 推進本 run（Mode C）')
+  _l.push(`  - 依定案更新計畫書${InRun.qapPath ? `（${InRun.qapPath}）` : ''}：實作計畫、預期 LOG、驗收項；計畫書若有這些題的摘要表，同步改成已定。`)
+  _l.push('  - ⭐ 少爺送出定奪＝確認計畫＋開工指令（少爺 2026-10-13：「我預期我送出定奪的那次就代表要處理好」）：定完的部分**直接照階段二推進**（向總控登記共用件→埋 LOG→排雙編譯），不要再另等「可以開工」「計畫 OK」。只有仍是 💬 回覆（尚未定案）或實作中新冒出的真正設計取捨才停下來問；回覆時講清楚「已開工哪些、還剩哪題要他定」。')
+  _l.push(`C. 回報：PATCH http://127.0.0.1:3001/api/qa/runs/${InRun.id} 用 commentReply${Number.isInteger(InOpts.commentIndex) ? `（index＝${InOpts.commentIndex}）` : ''}回覆這則留言（每筆的落點、連帶推導了哪些題、還要少爺再答哪些），並用 guidance 寫少爺下一步要做什麼。`)
+  return _l.join('\n')
+}
+
+function composeDecisionPrompt(InProj, InDone, InOpts) {
+  const _root = InProj.projectRoot ?? InProj.projectPath ?? ''
+  const _l = []
+  _l.push(`(TC 待定奪) 少爺在 TC 侍酒師的待定奪面板送出 ${InDone.length} 筆定奪／回覆（${InOpts.stamp.date} ${InOpts.stamp.time}，專案 ${InProj.name}${_root ? `，${_root}` : ''}）。`)
+  _l.push('TC 已經把「決定」本身寫回原檔（harness 層，不必重寫）：選項定奪＝`- [x] OPEN-n …（日期 少爺定：…）`；回覆＝該 OPEN 條目下的 `**少爺回覆**` 子項；情境檔另記進「討論紀錄」。你負責之後的判斷與落實。')
+  _l.push('', '【定奪清單】', ...decisionListLines(InDone))
+  _l.push('', '【請依序處理】', ...decisionMaintenanceLines(InProj, InDone, InOpts.graph))
   _l.push('B. 後續實作（有需要才做）')
   _l.push('  - 定案要改程式／資產／設定時，照 task_kickoff_check 與 `.agent/workflows/z_sub_scenario_experience.md` §5 落實表走既有流程（新機制 `z_sub_add_new_mechanism.md`、新 UI、文案 StringTable…）；不需要實作的明寫「無需實作」。')
   _l.push(InOpts.qaForImpl
-    ? '  - 有實作的項目走 Mode C QA：照 theclaudenental_operator skill「QA Run 操作 SOP」開 QA Run（必綁 boundSessionId＝本 session id、boundProjectPath、project；wakeMode 由 server 決定，回應帶 mountCommand 就在同一個 response 掛起），列計畫等少爺確認後才編譯；純資料維護不開 QA Run。'
-    : '  - 少爺這次沒勾「實作走 QA」：動 C++／資產之前先把實作計畫回報在聊天室，等少爺確認再做。')
+    ? '  - 有實作的項目走 Mode C QA：照 theclaudenental_operator skill「QA Run 操作 SOP」開 QA Run（必綁 boundSessionId＝本 session id、boundProjectPath、project；wakeMode 由 server 決定，回應帶 mountCommand 就在同一個 response 掛起）；⭐ 少爺送出定奪＝開工指令（2026-10-13），計畫寫好就直接推進（登記共用件→埋 LOG→排雙編譯），只有真正的新設計取捨才回頭問；純資料維護不開 QA Run。'
+    : '  - 少爺這次沒勾「實作走 QA」：定奪本身就是開工指令（2026-10-13），把實作計畫回報在聊天室後直接動手；只有真正的新設計取捨才停下來問。')
   if (InOpts.cardId) _l.push(`C. 進度：TC 待辦卡 ${InOpts.cardId} 已建立（欄位 doing）。每完成一個階段就 PATCH http://127.0.0.1:3001/api/todos/${InOpts.cardId}（noteAppend 寫進度；全部完成推 done，需要少爺回答推 discussing）。`)
   _l.push('完成時回報：每一筆的落點（檔案＋INV 編號或情境標記）、連帶推導了哪些題（推導定／縮小）、需不需要實作、還有哪些題要少爺再回答。')
   return _l.join('\n')
 }
 
 /** 進一步說明的 prompt：題目原文＋來源檔脈絡＋牽動的意圖檔／情境（全部內嵌，不讓模型自己翻檔） */
-function buildDecisionExplainPrompt(InProj, InLayer, InDoc, InBlock, InFile, InGraph = null, InKey = null) {
+function buildDecisionExplainPrompt(InProj, InLayer, InDoc, InBlock, InFile, InGraph = null, InKey = null, InRun = null) {
   const _fm = mdFrontmatter(InDoc.lines)
   const _title = _fm.title ?? InFile
   let _thesis = ''
@@ -5670,6 +6057,13 @@ function buildDecisionExplainPrompt(InProj, InLayer, InDoc, InBlock, InFile, InG
       }
     } catch {}
     if (_hits.length) _parts.push(`【這個機制出現在這些情境（玩家體驗）】\n${_hits.join('\n')}`)
+  } else if (InLayer === 'qa') {
+    // QA 計畫書的題（實作時機、修法、範圍…）：脈絡＝這個 run 的需求原話＋計畫書開頭＋待定奪段（含掛的設計題）
+    const _sec = mdSectionText(InDoc.lines, decisionSectionRe('qa'), 1800)
+    _parts.push(`【來源檔：QA 計畫書「${InFile}」】`)
+    if (InRun) _parts.push(`QA Run：${InRun.topic}\n需求原話：${String(InRun.requirement ?? '').slice(0, 1500)}`)
+    _parts.push(`計畫書開頭：\n${InDoc.lines.slice(0, 80).join('\n').slice(0, 2500)}`, `待定奪段（含本 run 掛的設計題）：\n${_sec}`)
+    for (const ln of parseDecisionLinks(InProj, _sec)) if (ln.layer === 'intent' && !_links.includes(ln.sourceId)) _links.push(ln.sourceId)
   } else {
     const _gapIds = [...new Set([...InBlock.raw.matchAll(/\bG-\d+\b/g)].map(m => m[0]))]
     const _gaps = mdSectionText(InDoc.lines, /缺口/, 20000)
@@ -5705,7 +6099,7 @@ function buildDecisionExplainPrompt(InProj, InLayer, InDoc, InBlock, InFile, InG
   return `你是這個遊戲專案的設計顧問。少爺（遊戲製作人）在待定奪面板上看不懂下面這一題，按了「進一步說明」。請用白話把完整的情境與脈絡講清楚，讓他能自己做決定。只輸出一個 JSON 物件，不要任何其他文字，也不要呼叫任何工具（需要的內容都在下方）。
 
 JSON 格式：
-{"scene":"玩家此刻的情境：遊戲的哪一段、看到／聽到／能做什麼（2~4 句）","question":"這題白話在問什麼（1~2 句，不用術語）","whyNow":"為什麼需要少爺決定、不決定會卡住什麼（1~2 句）","options":[{"key":"A","label":"短標題（12 字內）","experience":"選了之後玩家會感受到什麼","cost":"開發成本與要動到哪些機制","risk":"代價或風險"}],"recommend":{"key":"A","reason":"一句話理由（只是建議，決定權在少爺）"},"context":["相關機制、不變量或情境的短句"],"glossary":[{"term":"術語","meaning":"白話解釋"}]}
+{"scene":"玩家此刻的情境：遊戲的哪一段、看到／聽到／能做什麼（2~4 句）","question":"這題白話在問什麼（1~2 句，不用術語）","whyNow":"為什麼需要少爺決定、不決定會卡住什麼（1~2 句）","options":[{"key":"A","label":"短標題（12 字內）","experience":"選了之後玩家會感受到什麼","cost":"開發成本與要動到哪些機制","risk":"代價或風險","preview":"示意（等寬字元畫，見規則）","motion":"動態示意規格（只在速度／時序題給，見規則）"}],"recommend":{"key":"A","reason":"一句話理由（只是建議，決定權在少爺）"},"context":["相關機制、不變量或情境的短句"],"glossary":[{"term":"術語","meaning":"白話解釋"}]}
 
 規則：
 - 全部繁體中文（台灣用語）；程式識別字（類別、函式、檔名、資產名）保留原文。
@@ -5713,13 +6107,30 @@ JSON 格式：
 - options：題目有列選項就逐一對應同樣的 key；題目沒列選項就整理 2~4 個可行方案（key 用 A、B、C…）。
 - 以玩家體驗為主軸說明後果${_thesis ? `（這個專案的題目是：「${_thesis}」）` : ''}。
 - glossary 收 2~6 個少爺可能不熟的術語，沒有就給空陣列；recommend 沒把握就給 null。
+- preview：每個選項一張示意，用等寬字元畫出選了之後玩家在畫面上看到或感受到的差異（位置、路徑、時序、介面配置、數值手感的對照都可以），像 VS Code 提問選項的預覽框；最多 10 行、每行最多 20 個全形字寬，可用 ● ▶ ─ │ ┌ ┐ └ ┘ ≈ ░ ▓ 這類符號，JSON 字串裡換行寫成 \\n；畫不出有意義的差異就給空字串，不要硬畫。
+- motion：題目在問速度、延遲、加減速、平滑、時序、節奏、頓幀這類「隨時間變化」的手感時，每個選項另給一段動態示意規格（TC 會畫成會動的曲線圖＋畫面模擬；其他題給空字串）。規格一行一項、換行寫成 \\n：
+  「標題 <曲線代表什麼，0＝起點、1＝目標>」、「秒 <時間軸長度>」（選填）、「畫面 旋轉 <角度>｜移動｜縮放 <倍率>｜淡入」（選填，預設移動）、
+  軌道「名稱: 曲線」，曲線＝即時｜線性 秒｜緩入 秒｜緩出 秒｜緩入緩出 秒｜階梯 秒｜半衰期 秒（指數追隨）｜彈簧 半衰期 過衝比例（0～0.8）｜關鍵格 秒:值 秒:值…；
+  可加「@秒」延遲開始、「跟 <另一軌>」（只限半衰期／彈簧：追的是那一軌當下的位置＝連鎖延遲）、「形狀 視野｜方陣｜箭頭｜點｜框」。
+  數值照題目裡的實際參數換算（例：「90% 到位 0.17 秒」≈ 半衰期 0.05）；各選項用同樣的軌道名稱與時間軸，少爺才比得出差別。例：「標題 甩鏡頭 90°\\n畫面 旋轉 90\\n鏡頭: 即時\\n陣型: 半衰期 0.05 跟 鏡頭」。
 - 遊戲是環環相扣的：若這題其實已被【連動題】的定案、品味或現況回答，或只要先答某個上游關鍵題就能推出來，whyNow 第一句就明說（例「這題可能已有答案：…」「先答 X，這題就能推出來」）。
 
-【這一題】（${InLayer === 'intent' ? '設計脈絡' : '情境體驗'}「${_title}」，檔案 ${InFile}）
+【這一題】（${decisionLayerLabel(InLayer)}「${_title}」，檔案 ${InFile}）
 ${InBlock.raw}
 
 ${_parts.filter(Boolean).join('\n\n')}`
 }
+
+/** 說明裡的選項動態示意：用前端同一份規格解析器驗證，畫不出來（規格有錯）就丟掉，不讓面板出現錯誤框 */
+const explainMotionOf = (InText) => {
+  const _t = String(InText ?? '').trim().slice(0, 800)
+  if (!_t) return ''
+  const _spec = parseMotionSpec(_t)
+  return !_spec.errors.length && simulateMotion(_spec) ? _t : ''
+}
+
+/** 說明裡的選項示意：最多 12 行、600 字（模型偶爾會畫過頭） */
+const explainPreviewOf = (InText) => String(InText ?? '').split(/\r?\n/).slice(0, 12).join('\n').slice(0, 600).replace(/\s+$/, '')
 
 function parseDecisionExplain(InText) {
   try {
@@ -5729,7 +6140,7 @@ function parseDecisionExplain(InText) {
     const _tw = (s) => { try { return s == null ? '' : s2tw(String(s)) } catch { return String(s ?? '') } }
     const _key = (k) => { const _k = String(k ?? '').trim().toUpperCase(); return /^[A-H]$/.test(_k) ? _k : null }
     const options = (Array.isArray(_p.options) ? _p.options : []).slice(0, 6)
-      .map(o => ({ key: _key(o?.key), label: _tw(o?.label), experience: _tw(o?.experience), cost: _tw(o?.cost), risk: _tw(o?.risk) }))
+      .map(o => ({ key: _key(o?.key), label: _tw(o?.label), experience: _tw(o?.experience), cost: _tw(o?.cost), risk: _tw(o?.risk), preview: explainPreviewOf(_tw(o?.preview)), motion: explainMotionOf(o?.motion) }))
       .filter(o => o.key)
     if (!_p.scene && !_p.question && !options.length) return null
     const _rk = _key(_p.recommend?.key)
@@ -5762,7 +6173,7 @@ app.get('/api/decisions/state/:projectId', async (request, reply) => {
     const _fp = decisionSourcePath(_proj, InLayer, InFile)
     if (!_fp) return null
     if (!_docs.has(_fp)) { try { _docs.set(_fp, readMdKeepFormat(_fp)) } catch { _docs.set(_fp, null) } }
-    const _blk = _docs.get(_fp) ? findOpenBlock(_docs.get(_fp).lines, InOpenId) : null
+    const _blk = _docs.get(_fp) ? findOpenBlock(_docs.get(_fp).lines, InOpenId, decisionSectionRe(InLayer)) : null
     return _blk ? decisionHash(_blk.raw) : null
   }
   const explanations = {}
@@ -5775,22 +6186,31 @@ app.get('/api/decisions/state/:projectId', async (request, reply) => {
   for (const _rec of readDecisionDispatch().items) {
     if (_rec.projectId !== _pid) continue
     const _running = !!_rec.sessionId && !!claudeLanes.runningEntry(_rec.sessionId)
-    for (const k of _rec.keys ?? []) dispatches[k] = { id: _rec.id, ts: _rec.ts, cardId: _rec.cardId ?? null, sessionId: _rec.sessionId ?? null, target: _rec.target, kind: _rec.kinds?.[k] ?? null, running: _running }
+    for (const k of _rec.keys ?? []) dispatches[k] = { id: _rec.id, ts: _rec.ts, cardId: _rec.cardId ?? null, sessionId: _rec.sessionId ?? null, target: _rec.target, runId: _rec.runId ?? null, kind: _rec.kinds?.[k] ?? null, running: _running }
   }
-  return { ok: true, explanations, dispatches, explainModel: getTcSetting('decision.explainModel', DECISION_EXPLAIN_DEFAULT_MODEL), graph: buildDecisionGraph(_proj, _pid) }
+  // ?qaRun＝QA 分頁的面板：連動圖補上該 run 計畫書的題；qaLinks＝設計題 → 掛著它的進行中 run（侍酒師送出時改送交該 run）
+  const graph = buildDecisionGraph(_proj, _pid)
+  const _qaRun = request.query?.qaRun ? readQaRuns().runs.find(r => r.id === request.query.qaRun) : null
+  if (_qaRun) { try { addQaNodesToGraph(graph, _pid, (await qaRunDecisionItems(_proj, _pid, _qaRun)).all) } catch {} }
+  let qaLinks = {}
+  try { qaLinks = await activeQaDecisionIndex(_proj, _pid) } catch {}
+  return { ok: true, explanations, dispatches, explainModel: getTcSetting('decision.explainModel', DECISION_EXPLAIN_DEFAULT_MODEL), graph, qaLinks }
 })
 
 // 進一步說明：讀原檔＋牽動檔，一次性無頭 Claude 產白話說明（快取；題目內容變了才重算，force＝強制重算）
 app.post('/api/decisions/explain', async (request, reply) => {
   if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
-  const { projectId, layer, sourceId, file, openId, force } = request.body ?? {}
+  const { projectId, layer, sourceId, file, openId, force, runId } = request.body ?? {}
   const _proj = findSommelierProject(projectId)
   if (!_proj) { reply.code(404); return { ok: false, error: 'unknown project' } }
   const _fp = decisionSourcePath(_proj, layer, file)
   if (!_fp || !/^OPEN-\d+$/.test(String(openId ?? ''))) { reply.code(400); return { ok: false, error: '找不到來源檔或題號不對' } }
   const _doc = readMdKeepFormat(_fp)
-  const _blk = findOpenBlock(_doc.lines, openId)
+  const _blk = findOpenBlock(_doc.lines, openId, decisionSectionRe(layer))
   if (!_blk) { reply.code(404); return { ok: false, error: `${file} 裡找不到 ${openId}` } }
+  // 計畫書的題：說明要帶 run 的需求原話（runId 沒給就找計畫書是這份的進行中 run）
+  const _run = layer === 'qa' ? (readQaRuns().runs.find(r => r.id === runId)
+    ?? readQaRuns().runs.filter(r => QA_RUN_ACTIVE(r) && path.basename(String(r.qapPath ?? '').replace(/\\/g, '/')) === file).sort((a, b) => b.createdAt - a.createdAt)[0] ?? null) : null
   const _key = `${projectId}|${layer}|${sourceId}|${openId}`
   const _hash = decisionHash(_blk.raw)
   const _hit = readDecisionExplainCache().items?.[_key]
@@ -5799,7 +6219,9 @@ app.post('/api/decisions/explain', async (request, reply) => {
   const _job = (async () => {
     const _model = getTcSetting('decision.explainModel', DECISION_EXPLAIN_DEFAULT_MODEL)
     const _t0 = Date.now()
-    const _text = await runOneShotClaude(buildDecisionExplainPrompt(_proj, layer, _doc, _blk, file, buildDecisionGraph(_proj, projectId), _key), { model: _model, timeoutMs: DECISION_EXPLAIN_TIMEOUT_MS })
+    const _graph = buildDecisionGraph(_proj, projectId)
+    if (_run) { try { addQaNodesToGraph(_graph, projectId, (await qaRunDecisionItems(_proj, projectId, _run)).all) } catch {} }
+    const _text = await runOneShotClaude(buildDecisionExplainPrompt(_proj, layer, _doc, _blk, file, _graph, _key, _run), { model: _model, timeoutMs: DECISION_EXPLAIN_TIMEOUT_MS })
     const _parsed = parseDecisionExplain(_text)
     logEvent('decision.explain', { key: _key, model: _model, ok: !!_parsed, ms: Date.now() - _t0 })
     if (!_parsed) return { ok: false, error: '說明產生失敗（模型沒有回傳可解析的內容），可以再按一次' }
@@ -5821,10 +6243,17 @@ app.post('/api/decisions/submit', async (request, reply) => {
   const _proj = findSommelierProject(projectId)
   if (!_proj) { reply.code(404); return { ok: false, error: 'unknown project' } }
   const _answers = (Array.isArray(answers) ? answers : []).filter(a => a
-    && ['intent', 'scenario'].includes(a.layer) && /^OPEN-\d+$/.test(String(a.openId ?? '')) && a.file
+    && DECISION_LAYERS.includes(a.layer) && /^OPEN-\d+$/.test(String(a.openId ?? '')) && a.file
     && ((a.kind === 'choose' && /^[A-H]$/.test(String(a.choiceKey ?? '')) && String(a.choiceText ?? '').trim())
       || (a.kind === 'reply' && String(a.text ?? '').trim())))
   if (!_answers.length) { reply.code(400); return { ok: false, error: '沒有可送出的定奪（選一個選項，或在「其他」寫下想法）' } }
+  // 送交對象（少爺 2026-10-08 統一設計）：target 'qa'＝QA 分頁送出，全部交給該 run 的綁定聊天室；
+  // 侍酒師送出時，掛在進行中 run 的設計題預設也改交給那個 run（routeQa:false 才照舊開子任務）——同一題在哪答都送到負責它的聊天室
+  const _qaTarget = dispatch.target === 'qa'
+  const _qaRun = _qaTarget ? readQaRuns().runs.find(r => r.id === dispatch.runId) ?? null : null
+  if (_qaTarget && !_qaRun) { reply.code(404); return { ok: false, error: '找不到要送交的 QA Run' } }
+  let _qaIdx = {}
+  if (!_qaTarget && dispatch.enabled !== false && dispatch.routeQa !== false) { try { _qaIdx = await activeQaDecisionIndex(_proj, projectId) } catch {} }
   const _stamp = { date: todayStamp(), time: nowHHMM() }
   const _groups = new Map()
   for (const a of _answers) {
@@ -5854,24 +6283,85 @@ app.post('/api/decisions/submit', async (request, reply) => {
   }
   if (!_done.length) return { ok: false, error: results.find(r => r.error)?.error ?? '沒有寫入任何定奪', results }
   const _qaForImpl = dispatch.qaForImpl !== false
-  if (dryRun) return { ok: true, dryRun: true, results, preview, prompt: composeDecisionPrompt(_proj, _done, { stamp: _stamp, qaForImpl: _qaForImpl, cardId: '(卡片 id)' }) }
+  // 分流：交給哪個 QA run（runId → 條目）、其餘照舊派子任務
+  const _toRun = new Map()
+  const _rest = []
+  for (const d of _done) {
+    const _rid = _qaTarget ? _qaRun.id : (_qaIdx[d.key] ?? []).sort((a, b) => b.runId.localeCompare(a.runId))[0]?.runId ?? null
+    if (_rid) { if (!_toRun.has(_rid)) _toRun.set(_rid, []); _toRun.get(_rid).push(d) }
+    else _rest.push(d)
+  }
+  const _via = _qaTarget ? 'qa' : 'sommelier'
+  if (dryRun) {
+    const _runs = readQaRuns().runs
+    return {
+      ok: true, dryRun: true, results, preview,
+      prompt: _rest.length ? composeDecisionPrompt(_proj, _rest, { stamp: _stamp, qaForImpl: _qaForImpl, cardId: '(卡片 id)' }) : null,
+      qaPrompts: [..._toRun].map(([_rid, _arr]) => ({ runId: _rid, prompt: composeQaDecisionPrompt(_proj, _runs.find(r => r.id === _rid), _arr, { stamp: _stamp, via: _via }) })),
+    }
+  }
 
   for (const d of _done) logEvent('decision.submit', { projectId, layer: d.layer, file: d.file, openId: d.openId, kind: d.kind, choiceKey: d.choiceKey ?? null })
-  const refresh = scheduleSommelierRefresh(_proj)
+  // 計畫書（qa 層）不在侍酒師萃取範圍：只有動到意圖檔／情境檔才重萃取
+  const refresh = _done.some(d => d.layer !== 'qa') ? scheduleSommelierRefresh(_proj) : false
   if (dispatch.enabled === false) return { ok: true, results, written: _done.length, refresh, dispatched: false }
   const _graph = buildDecisionGraph(_proj, projectId)
-  const _short = (s) => { const _t = String(s ?? '').replace(/（.*$/, '').trim(); return _t.length > 18 ? `${_t.slice(0, 18)}…` : _t }
-  const _first = _done[0]
-  const _sent = await dispatchDecisionTask(_proj, projectId, {
-    title: `定奪落實：${_short(_first.sourceTitle || _first.sourceId)} ${_first.openId}${_done.length > 1 ? ` 等 ${_done.length} 筆` : ''}`,
-    note: `TC 待定奪面板 ${_stamp.date} ${_stamp.time} 送出（已寫回原檔，子任務處理後續＋連動題約束傳播）\n\n${_done.map(d => `- ${d.layer === 'intent' ? '🧭' : '🎬'} ${_short(d.sourceTitle || d.sourceId)} ${d.openId}：${d.kind === 'choose' ? `✅ ${d.decision}` : `💬 回覆「${d.reply.slice(0, 80)}」`}`).join('\n')}`,
-    promptOf: (InCardId) => composeDecisionPrompt(_proj, _done, { stamp: _stamp, qaForImpl: _qaForImpl, cardId: InCardId, graph: _graph }),
-    keys: _done.map(d => d.key).filter(Boolean),
-    kinds: Object.fromEntries(_done.filter(d => d.key).map(d => [d.key, d.kind])),
-    dispatch,
-  })
-  return { ok: true, results, written: _done.length, refresh, ..._sent }
+  const qaDelivered = []
+  for (const [_rid, _arr] of _toRun) {
+    const _r = qaRunProjectId(readQaRuns().runs.find(r => r.id === _rid) ?? {}) === projectId ? _rid : null
+    if (!_r) { _rest.push(..._arr); continue }
+    const _g = buildDecisionGraph(_proj, projectId)
+    try { addQaNodesToGraph(_g, projectId, (await qaRunDecisionItems(_proj, projectId, readQaRuns().runs.find(r => r.id === _rid))).all) } catch {}
+    qaDelivered.push(deliverDecisionsToQaRun(_proj, projectId, _rid, _arr, { stamp: _stamp, via: _via, graph: _g, model: dispatch.model, effort: dispatch.effort, inPlaceLink: dispatch.inPlaceLink }))
+  }
+  let _sent = null
+  if (_rest.length) {
+    const _short = (s) => { const _t = String(s ?? '').replace(/（.*$/, '').trim(); return _t.length > 18 ? `${_t.slice(0, 18)}…` : _t }
+    const _first = _rest[0]
+    _sent = await dispatchDecisionTask(_proj, projectId, {
+      title: `定奪落實：${_short(_first.sourceTitle || _first.sourceId)} ${_first.openId}${_rest.length > 1 ? ` 等 ${_rest.length} 筆` : ''}`,
+      note: `TC 待定奪面板 ${_stamp.date} ${_stamp.time} 送出（已寫回原檔，子任務處理後續＋連動題約束傳播）\n\n${_rest.map(d => `- ${decisionLayerIcon(d.layer)} ${_short(d.sourceTitle || d.sourceId)} ${d.openId}：${d.kind === 'choose' ? `✅ ${d.decision}` : `💬 回覆「${d.reply.slice(0, 80)}」`}`).join('\n')}`,
+      promptOf: (InCardId) => composeDecisionPrompt(_proj, _rest, { stamp: _stamp, qaForImpl: _qaForImpl, cardId: InCardId, graph: _graph }),
+      keys: _rest.map(d => d.key).filter(Boolean),
+      kinds: Object.fromEntries(_rest.filter(d => d.key).map(d => [d.key, d.kind])),
+      dispatch,
+    })
+  }
+  return { ok: true, results, written: _done.length, refresh, ...(_sent ?? {}), dispatched: !!_sent?.dispatched || qaDelivered.some(x => x.ok), qaDelivered }
 })
+
+/** 定奪送交 QA run：寫成 run 的一則留言（全文＝處理指令，Claude 用 ackComments 讀）→ 走 QA 喚醒鏈（監看原地／直投／無頭）→ 記派工紀錄 */
+function deliverDecisionsToQaRun(InProj, InPid, InRunId, InDone, InOpts) {
+  const data = readQaRuns()
+  const run = data.runs.find(r => r.id === InRunId)
+  if (!run) return { runId: InRunId, ok: false, error: 'run 不存在' }
+  const _q = (s) => { const _t = String(s ?? '').trim(); return _t.length > 30 ? `${_t.slice(0, 30)}…` : _t }
+  const _model = (typeof InOpts.model === 'string' && InOpts.model.trim()) ? InOpts.model.trim() : null
+  const _effort = EFFORT_LEVELS.includes(InOpts.effort) ? InOpts.effort : null
+  run.comments.push({
+    t: Date.now(), itemId: null, kind: 'decision', seenByClaude: false, reply: null,
+    text: composeQaDecisionPrompt(InProj, run, InDone, { ...InOpts, commentIndex: run.comments.length }),
+    summary: InDone.map(d => `${decisionLayerIcon(d.layer)} ${d.openId} ${_q(d.question)} → ${d.kind === 'choose' ? `✅ ${d.decision}` : `💬「${d.reply}」`}`),
+    via: InOpts.via,
+  })
+  run.claudeAck = { action: 'decision', t: Date.now(), state: 'pending' }
+  run.guidance = { text: '定奪已送出，等待 Claude 讀取處理…', t: Date.now() }
+  run.updatedAt = Date.now()
+  writeQaRuns(data)
+  qaBroadcast(run)
+  const _recId = `dd${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+  const _store = readDecisionDispatch()
+  _store.items = [..._store.items, {
+    id: _recId, ts: Date.now(), projectId: InPid, keys: InDone.map(d => d.key).filter(Boolean),
+    kinds: Object.fromEntries(InDone.filter(d => d.key).map(d => [d.key, d.kind])),
+    cardId: null, sessionId: run.boundSessionId ?? null, target: 'qa', runId: run.id, model: _model, effort: _effort,
+  }].slice(-DECISION_DISPATCH_MAX)
+  atomicWriteJson(DECISION_DISPATCH_FILE, _store)
+  broadcast({ type: 'decision_dispatch_update', projectId: InPid })
+  logEvent('decision.qa_deliver', { projectId: InPid, runId: run.id, count: InDone.length, via: InOpts.via })
+  qaWakeBoundSession(run, 'decision', `${InDone.length} 筆`, [], _model, _effort, InOpts.inPlaceLink !== false)
+  return { ok: true, runId: run.id, topic: run.topic, sessionId: run.boundSessionId ?? null, projectPath: run.boundProjectPath ?? null, count: InDone.length }
+}
 
 /** 派子任務（定奪落實／數獨推導共用）：建待辦卡 → 以卡片 id 組 prompt → 聊天室
  *  開新＝直接 spawnClaude（init 後把 session id 綁回卡片與派工紀錄）；送入既有＝走 /api/claude/run（原地聯動／排隊照舊） */
@@ -6024,7 +6514,7 @@ app.post('/api/decisions/review', async (request, reply) => {
   const results = []
   const _groups = new Map()
   for (const it of Array.isArray(items) ? items : []) {
-    if (!['intent', 'scenario'].includes(it?.layer) || !['confirm', 'reject'].includes(it?.action) || !/^OPEN-\d+$/.test(String(it?.openId ?? ''))) continue
+    if (!DECISION_LAYERS.includes(it?.layer) || !['confirm', 'reject'].includes(it?.action) || !/^OPEN-\d+$/.test(String(it?.openId ?? ''))) continue
     const _k = `${it.layer}|${it.file}`
     if (!_groups.has(_k)) _groups.set(_k, [])
     _groups.get(_k).push(it)
@@ -6036,7 +6526,7 @@ app.post('/api/decisions/review', async (request, reply) => {
     const _doc = readMdKeepFormat(_fp)
     let _changed = false
     for (const it of _arr) {
-      const _blk = findOpenBlock(_doc.lines, it.openId)
+      const _blk = findOpenBlock(_doc.lines, it.openId, decisionSectionRe(_layer))
       const _m = _blk ? _doc.lines[_blk.head].match(_derivedRe) : null
       if (!_blk || !_m) { results.push({ key: it.key ?? null, ok: false, error: `${it.openId} 不是推導定（可能已被確認或改過）`, stale: true }); continue }
       const [_decision, ..._basis] = _m[2].split(/[；;]\s*依據[：:]\s*/)
@@ -6139,6 +6629,8 @@ app.post('/api/qa/runs', async (request) => {
     archivedAt: null,
     requirement: body.requirement ?? '',
     qapPath: body.qapPath ?? '',
+    // 待定奪（少爺 2026-10-08 統一設計）：計畫書「待定奪」段＝本 run 的題；decisionSources＝額外掛的意圖／情境（`X`、`X OPEN-n`、`[[X]] OPEN-n`）
+    decisionSources: Array.isArray(body.decisionSources) ? body.decisionSources.map(String) : [],
     sessionDir: body.sessionDir ?? '',   // 絕對路徑；artifact 路由以此為根
     criteria: Array.isArray(body.criteria) ? body.criteria : [],
     // C 區塊（少爺 2026-09-09）：設計說明。每筆 = 一顆可展開的按鈕，內容用結構化 blocks 排版
@@ -6170,7 +6662,17 @@ app.post('/api/qa/runs', async (request) => {
   return { ok: true, run, ...(run.wakeMode === 'monitor' ? { mountCommand: monitorMountCommand(run.boundSessionId) } : {}) }
 })
 
-// 歷史列表（新到舊；?limit=N 預設 50；封存的預設隱藏 ?includeArchived=1 全看）
+// QA 分頁清單摘要（少爺 2026-10-12「QA 載入過慢」：90 筆含已結案全文＝1.9MB 且每 10 秒重抓）——
+// 清單只帶左欄用得到的欄位＋判斷「選中 run 要不要重抓」的欄位；完整內容由選中時 GET /api/qa/runs/:id 取
+const QA_RUN_SUMMARY_FIELDS = ['id', 'topic', 'status', 'outcome', 'project', 'boundSessionId', 'boundProjectPath', 'wakeMode',
+  'createdAt', 'updatedAt', 'startedAt', 'finishedAt', 'archivedAt', 'claudeAck']
+function qaRunSummary(InRun) {
+  const _s = {}
+  for (const _k of QA_RUN_SUMMARY_FIELDS) if (InRun[_k] !== undefined) _s[_k] = InRun[_k]
+  return _s
+}
+
+// 歷史列表（新到舊；?limit=N 預設 50；封存的預設隱藏 ?includeArchived=1 全看；?summary=1 只回清單摘要）
 // 封存＝介面層移除；run 資料與 sessionDir 內容層永久保留（三層鐵律）
 app.get('/api/qa/runs', async (request) => {
   const limit = Number(request.query?.limit ?? 50)
@@ -6179,7 +6681,7 @@ app.get('/api/qa/runs', async (request) => {
   const runs = [...data.runs]
     .filter(r => includeArchived || !r.archivedAt)
     .sort((a, b) => b.createdAt - a.createdAt).slice(0, limit)
-  return { ok: true, runs }
+  return { ok: true, runs: request.query?.summary === '1' ? runs.map(qaRunSummary) : runs }
 })
 
 // 單一 run；?ackComments=1 = Claude 讀走未讀留言（標 seen）
@@ -6196,6 +6698,42 @@ app.get('/api/qa/runs/:id', async (request, reply) => {
     if (dirty) { writeQaRuns(data); qaBroadcast(run) }
   }
   return { ok: true, run }
+})
+
+// ⬜ run 的待定奪（少爺 2026-10-08「QA Run 待我定奪的互動方式與侍酒師的待定奪一樣的形式」）：
+// 面板條目＝計畫書待定奪段的 OPEN-n＋段內引用的意圖／情境題＋decisionSources；格式與侍酒師面板相同（DecisionDeck 直接吃）
+app.get('/api/qa/runs/:id/decisions', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const run = readQaRuns().runs.find(r => r.id === request.params.id)
+  if (!run) { reply.code(404); return { ok: false, error: 'not found' } }
+  const projectId = qaRunProjectId(run)
+  const _proj = findSommelierProject(projectId)
+  if (!_proj) return { ok: false, error: `找不到專案 ${projectId}` }
+  const { src, all } = await qaRunDecisionItems(_proj, projectId, run)
+  const _derived = (x) => x.d.resolved && x.d.resolvedBy === 'derived'
+  return {
+    ok: true, projectId, plan: src.plan ? { file: src.plan.file, heading: src.heading } : null, planState: src.planState,
+    legacy: src.legacy, links: src.links,
+    items: all.filter(x => !x.d.resolved), derived: all.filter(_derived),
+    decided: all.filter(x => x.d.resolved && !_derived(x)).map(x => ({ key: x.key, layer: x.layer, sourceTitle: x.sourceTitle, openId: x.d.id, question: x.d.question ?? x.d.title, resolution: x.d.resolution, resolvedAt: x.d.resolvedAt ?? '' })),
+  }
+})
+
+// 各 run 還有幾題待你定（QA 清單的徽章）：只算進行中的 run
+app.get('/api/qa/decision-counts', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const counts = {}
+  for (const run of readQaRuns().runs.filter(QA_RUN_ACTIVE)) {
+    const _pid = qaRunProjectId(run)
+    const _proj = findSommelierProject(_pid)
+    if (!_proj) continue
+    try {
+      const { all } = await qaRunDecisionItems(_proj, _pid, run)
+      const _open = all.filter(x => !x.d.resolved || x.d.resolvedBy === 'derived').length
+      if (_open) counts[run.id] = _open
+    } catch {}
+  }
+  return { ok: true, counts }
 })
 
 // Claude 推進：狀態 / item 結果 / anomaly / 留言回覆 / pause-abort ack（項目邊界生效）
@@ -6215,6 +6753,8 @@ app.patch('/api/qa/runs/:id', async (request, reply) => {
   if (body.closeArmed === false) qaDisarmClose(run, 'claude')
   if (typeof body.outcome === 'string') run.outcome = body.outcome
   if (typeof body.sessionDir === 'string') run.sessionDir = body.sessionDir
+  if (typeof body.qapPath === 'string') run.qapPath = body.qapPath
+  if (Array.isArray(body.decisionSources)) run.decisionSources = body.decisionSources.map(String)
   if (typeof body.boundSessionId === 'string') run.boundSessionId = body.boundSessionId
   if (typeof body.boundProjectPath === 'string') run.boundProjectPath = body.boundProjectPath
   if (typeof body.project === 'string') run.project = body.project
@@ -6370,7 +6910,7 @@ function markWakeUndelivered(sessionId) {
   } catch (e) { logEvent('qa.wake.undelivered.error', { sessionId, error: String(e?.message ?? e) }) }
 }
 
-const QA_WAKE_ACTIONS = { 'start-now': '按了「▶ 立即開跑」→ 請進入階段二（埋 LOG + 雙編譯 + 重啟 Editor）', pause: '要求暫停', resume: '要求繼續', abort: '要求中止', comment: '留言', close: '按了「✔ 結案」→ 階段五（清 QAC LOG + 雙編譯 + 重啟 Editor；無頭啟動 Editor 用 Start-Process detached）＋維護侍酒師閉環：把本 run 需求「實作驗證後的收斂」沉澱回四種血肉（C++ code / 架構 canvas / 拼圖 memory；藍圖 md 暫跳過），Editor 開著時跑 extract_asset_graph.py 更新藍圖資產層，最後 POST /api/sommelier/refresh/roman 重萃取讓侍酒師吃到最新拼圖＋設計思路模板維護（增量）：分析本 run「需求原話→設計決策/取捨→驗證結果」軌跡，萃取少爺這輪怎麼設計體驗，增量併入 .agent/knowledge/Roman_DesignThinking_Templates.md（基線 2026-07-31 全量、此後僅以 run 為單位增量），有更新列入 knowledgeUpdated 回寫＋情境體驗層維護（少爺 2026-09-15 立）：本 run 動到的意圖檔所涵蓋的情境檔 scenario/S##_*.md 推進狀態標記（💡→📐→🔬→✅）、補討論紀錄與素材清單（qa_finalize_check.py B8 機檢；SOP .agent/workflows/z_sub_scenario_experience.md §6）' }
+const QA_WAKE_ACTIONS = { 'start-now': '按了「▶ 立即開跑」→ 請進入階段二（埋 LOG + 雙編譯 + 重啟 Editor）', pause: '要求暫停', resume: '要求繼續', abort: '要求中止', comment: '留言', decision: '在待定奪面板送出定奪（TC 已把決定寫回原檔；定奪清單與處理步驟在最新一則留言）', close: '按了「✔ 結案」→ 階段五（清 QAC LOG + 雙編譯 + 重啟 Editor；無頭啟動 Editor 用 Start-Process detached）＋維護侍酒師閉環：把本 run 需求「實作驗證後的收斂」沉澱回四種血肉（C++ code / 架構 canvas / 拼圖 memory；藍圖 md 暫跳過），Editor 開著時跑 extract_asset_graph.py 更新藍圖資產層，最後 POST /api/sommelier/refresh/roman 重萃取讓侍酒師吃到最新拼圖＋設計思路模板維護（增量）：分析本 run「需求原話→設計決策/取捨→驗證結果」軌跡，萃取少爺這輪怎麼設計體驗，增量併入 .agent/knowledge/Roman_DesignThinking_Templates.md（基線 2026-07-31 全量、此後僅以 run 為單位增量），有更新列入 knowledgeUpdated 回寫＋情境體驗層維護（少爺 2026-09-15 立）：本 run 動到的意圖檔所涵蓋的情境檔 scenario/S##_*.md 推進狀態標記（💡→📐→🔬→✅）、補討論紀錄與素材清單（qa_finalize_check.py B8 機檢；SOP .agent/workflows/z_sub_scenario_experience.md §6）' }
 function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, effort = null, inPlaceLink = true) {
   try {
     // 預約結案中的留言喚醒：讓 Claude 知道推 finished 時 TC 會代按 ✔ 結案（少爺 2026-10-05）
@@ -6641,8 +7181,283 @@ function persistCompanions() {
   }, 500)
 }
 
+// ─── 陪聊附件（少爺 2026-10-08「陪聊先處理圖片支援」）：貼上／上傳的圖片與檔案存在 att/<陪聊鍵>/；
+//     圖片以內容區塊直接給常駐陪聊（實測 stream-json 輸入收 base64 圖片、2 秒回覆、不必繞 Read），
+//     其他檔案與太大的圖片給路徑讓陪聊用 Read 看；交出去時附路徑——與 /api/claude/run 的附件同一做法（存檔＋路徑進 prompt）。
+const COMPANION_ATT_DIR = path.join(COMPANION_CWD, 'att')
+const COMPANION_ATT_MAX_BYTES = 20 * 1024 * 1024
+const COMPANION_ATT_INLINE_MAX_BYTES = 3.5 * 1024 * 1024   // 單張圖片 base64 後上限 5MB
+const COMPANION_ATT_INLINE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp']
+const COMPANION_ATT_KEEP_DAYS = 30
+
+function companionAttDir(InKey) { return path.join(COMPANION_ATT_DIR, String(InKey).replace(/[^\w.-]/g, '_')) }
+
+/** dataUrl → { type, b64 }；格式不對回 null */
+function companionParseDataUrl(InDataUrl) {
+  const _s = String(InDataUrl ?? '')
+  const _comma = _s.indexOf(',')
+  if (!_s.startsWith('data:') || _comma < 0 || !_s.slice(0, _comma).endsWith(';base64')) return null
+  return { type: _s.slice(5, _comma).split(';')[0] || 'application/octet-stream', b64: _s.slice(_comma + 1) }
+}
+
+/** 存下附件：回傳 { saved:[{ id, name, type, file, size, ts, handed, inlineB64?, inlineType? }], bad:[說明] }。
+ *  inlineDataUrl＝client 縮過的預覽圖（給陪聊看）；原圖照樣存檔（交出去給實作的聊天室看細節） */
+function companionSaveAttachments(InKey, InAtts) {
+  const _saved = [], _bad = []
+  const _list = Array.isArray(InAtts) ? InAtts : []
+  if (_list.length > 8) _bad.push(`一次最多 8 個附件，多的 ${_list.length - 8} 個略過`)
+  for (const _a of _list.slice(0, 8)) {
+    const _name = String(_a?.name || 'file').replace(/[\\/:*?"<>|\s]+/g, '_').slice(-80)
+    const _orig = companionParseDataUrl(_a?.dataUrl)
+    if (!_orig) { _bad.push(`${_name}：讀不到內容`); continue }
+    const _buf = Buffer.from(_orig.b64, 'base64')
+    if (_buf.length > COMPANION_ATT_MAX_BYTES) { _bad.push(`${_name}：超過 20MB`); continue }
+    const _type = String(_a?.type || _orig.type)
+    const _id = `a${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+    const _file = path.join(companionAttDir(InKey), `${_id}_${_name}`)
+    try { fs.mkdirSync(path.dirname(_file), { recursive: true }); fs.writeFileSync(_file, _buf) }
+    catch (e) { _bad.push(`${_name}：存檔失敗（${e.message}）`); continue }
+    const _entry = { id: _id, name: _name, type: _type, file: _file, size: _buf.length, ts: Date.now(), handed: false }
+    const _preview = companionParseDataUrl(_a?.inlineDataUrl)
+    if (_preview && COMPANION_ATT_INLINE_TYPES.includes(_preview.type) && _preview.b64.length * 0.75 <= COMPANION_ATT_INLINE_MAX_BYTES) {
+      _entry.inlineB64 = _preview.b64; _entry.inlineType = _preview.type
+    } else if (COMPANION_ATT_INLINE_TYPES.includes(_type) && _buf.length <= COMPANION_ATT_INLINE_MAX_BYTES) {
+      _entry.inlineB64 = _orig.b64; _entry.inlineType = _type
+    }
+    _saved.push(_entry)
+  }
+  return { saved: _saved, bad: _bad }
+}
+
+/** 附給陪聊的說明：哪些已附在訊息裡、哪些要用 Read 看 */
+function companionAttNote(InSaved) {
+  return `（少爺附了 ${InSaved.length} 個附件，已存檔：\n${InSaved.map(a => `- ${a.name}：${a.file}${a.inlineB64 ? '（圖片已附在這則訊息裡）' : '（請用 Read 看）'}`).join('\n')}\n）`
+}
+
+/** 交出去時的附件段（還沒交出去的） */
+function companionAttHandoffText(InC) {
+  const _list = (InC.attachments ?? []).filter(a => !a.handed)
+  return _list.length ? `附件（少爺在陪聊時給的圖片／檔案，請用 Read 打開看）：\n${_list.map(a => `- ${a.name}：${a.file}`).join('\n')}` : ''
+}
+
+/** 清掉超過保留天數的附件檔（開機時跑一次） */
+function companionPruneAttachments() {
+  const _cutoff = Date.now() - COMPANION_ATT_KEEP_DAYS * 24 * 60 * 60 * 1000
+  let _n = 0
+  try {
+    for (const _d of fs.readdirSync(COMPANION_ATT_DIR)) {
+      const _dir = path.join(COMPANION_ATT_DIR, _d)
+      for (const _f of fs.readdirSync(_dir)) {
+        const _fp = path.join(_dir, _f)
+        try { if (fs.statSync(_fp).mtimeMs < _cutoff) { fs.unlinkSync(_fp); _n++ } } catch {}
+      }
+    }
+  } catch {}
+  if (_n) logEvent('tc.companion.att_prune', { files: _n })
+}
+setTimeout(companionPruneAttachments, 30 * 1000)
+
+// ─── CHAT 陪聊（少爺 2026-10-08「CHAT介面也要有陪聊…直接從Tag了解我陪聊的脈絡推理」「一樣是獨立的(非聊天室本身的)，
+//     類似顧問能夠快速切入我的思考點，與考量的因素，完善推理」「目的之一是…減少聊天室內因為沒有提前思考脈絡完善好，
+//     而為了修正產生的Prompt次數」）：陪聊另起進程、不在聊天室本身裡跑，靠一份脈絡檔快速切入——最近對話、
+//     History 的標籤與摘要（TC 既有 SSOT）、同標籤的相關聊天室、綁定的 QA run／卡片、其他陪聊的交接摘要、最近的糾正訊號。
+const COMPANION_CHAT_CTX_TTL_MS = 60 * 1000
+const COMPANION_CORRECTION_RE = /不是|不對|錯了|又[^\s]{0,6}(錯|忘|漏)|你沒有|我說的是|我要的是|為什麼又|沒照|不要再|搞錯|誤會/
+const companionChatCtxStamp = new Map()   // sessionId → { ts, size }
+
+/** 聊天室的標題與工作路徑（History 索引的 AI 標題 → 側欄名稱 → 第一句話；只讀記憶體，每輪都會叫） */
+function companionChatInfo(InSessionId) {
+  const _s = sessions.get(InSessionId)
+  const _h = loadHistoryIndex()?.sessions?.[InSessionId] ?? null
+  // 原始專案路徑優先（索引記第一個 cwd）：分頁執行中可能切到子目錄，但續聊與侍酒師專案比對都要看對話紀錄所屬的專案
+  const _cwd = _h?.cwd ?? _s?.cwd ?? null
+  const _title = _h?.title ?? (_s?.displayName && _s.displayName !== 'Session' ? _s.displayName : null) ?? _h?.firstMsg ?? InSessionId.slice(0, 8)
+  const _norm = (InPath) => String(InPath ?? '').replace(/\\/g, '/').toLowerCase().replace(/\/$/, '')
+  const _proj = _cwd ? (readSommelierConfig().projects ?? []).find(p => p.projectRoot && _norm(p.projectRoot) === _norm(_cwd)) ?? null : null
+  return { title: String(_title).slice(0, 80), cwd: _cwd, proj: _proj }
+}
+
+/** 聊天室最近的回合：每回合＝一則使用者訊息＋該回合助理的最後一段文字（中途進度句略過）。
+ *  使用者訊息經 filterUserTexts 判斷是不是少爺親手打的（TC 注入／喚醒探針另標「系統」） */
+function companionRecentTurns(InSessionId) {
+  const _fp = findJsonlPath(InSessionId)
+  if (!_fp) return { turns: [], compact: null }
+  let _text = ''
+  try {
+    const _size = fs.statSync(_fp).size
+    const _len = Math.min(_size, 2 * 1024 * 1024)
+    const _fd = fs.openSync(_fp, 'r')
+    const _buf = Buffer.alloc(_len)
+    fs.readSync(_fd, _buf, 0, _len, _size - _len)
+    fs.closeSync(_fd)
+    _text = _buf.toString('utf8')
+  } catch { return { turns: [], compact: null } }
+  const _strip =(InText) => String(InText ?? '').replace(/<([a-z][\w-]*)[^>]*>[\s\S]*?<\/\1>/g, '').trim()
+  const _turns = []
+  let _cur = null
+  let _compact = null
+  for (const _line of _text.split('\n')) {
+    if (!_line.includes('"type":"user"') && !_line.includes('"type":"assistant"') && !_line.includes('"queued_command"')) continue
+    let _o
+    try { _o = JSON.parse(_line) } catch { continue }
+    if (_o.isSidechain || _o.isMeta) continue
+    // 壓縮後的前情摘要：只留最近一份（另存檔給陪聊需要時讀），不當成一個回合
+    if (_o.isCompactSummary) { if (typeof _o.message?.content === 'string') _compact = { text: _o.message.content, ts: _o.timestamp }; continue }
+    // 少爺在回合中途追加的話（官方收件匣 queued_command，來源 human；peer＝別的工作階段送來的，略過）
+    if (_o.type === 'attachment') {
+      const _a = _o.attachment
+      if (_a?.type !== 'queued_command' || _a.origin?.kind !== 'human') continue
+      const _t = _strip(typeof _a.prompt === 'string' ? _a.prompt : (Array.isArray(_a.prompt) ? _a.prompt.filter(b => b?.type === 'text').map(b => b.text).join('\n') : ''))
+      if (!_t) continue
+      _cur = { who: '少爺', user: `（回合中追加）${_t.replace(/\s+/g, ' ')}`, reply: '', ts: _o.timestamp }
+      _turns.push(_cur)
+      continue
+    }
+    const _content = _o.message?.content
+    if (_o.type === 'user') {
+      let _t = ''
+      if (typeof _content === 'string') _t = _content
+      else if (Array.isArray(_content) && !_content.some(b => b?.type === 'tool_result')) _t = _content.filter(b => b?.type === 'text').map(b => b.text).join('\n')
+      _t = _strip(_t)
+      if (!_t) continue
+      _cur = { who: filterUserTexts([_t]).length ? '少爺' : '系統', user: _t.replace(/\s+/g, ' '), reply: '', ts: _o.timestamp }
+      _turns.push(_cur)
+    } else if (_cur && Array.isArray(_content)) {
+      const _t = _strip(_content.filter(b => b?.type === 'text').map(b => b.text).join('\n'))
+      if (_t) _cur.reply = _t.replace(/\s+/g, ' ')
+    }
+  }
+  return { turns: _turns, compact: _compact }
+}
+
+/** 寫 CHAT 陪聊的脈絡檔；transcript 有變或超過 TTL 才重寫。回傳 { file, changed } */
+async function companionRefreshChatContext(InSessionId, InForce = false) {
+  const _file = `chatctx_${InSessionId.slice(0, 8)}.md`
+  const _fp = findJsonlPath(InSessionId)
+  let _size = 0
+  try { _size = _fp ? fs.statSync(_fp).size : 0 } catch {}
+  const _prev = companionChatCtxStamp.get(InSessionId)
+  const _changed = !_prev || _prev.size !== _size
+  if (!InForce && _prev && !_changed && Date.now() - _prev.ts < COMPANION_CHAT_CTX_TTL_MS && fs.existsSync(path.join(COMPANION_CWD, _file))) return { file: _file, changed: false }
+  const _info = companionChatInfo(InSessionId)
+  let _hist = []
+  try { _hist = Object.entries(refreshHistoryIndex().sessions).map(([_sid, _e]) => historyRowOf(_sid, _e)) } catch {}
+  const _me = _hist.find(h => h.sessionId === InSessionId) ?? null
+  const _myTags = new Set(_me?.tags ?? [])
+  const _related = _hist.filter(h => h.sessionId !== InSessionId && !h.routine && (h.tags ?? []).some(t => _myTags.has(t)))
+    .map(h => ({ h, n: h.tags.filter(t => _myTags.has(t)).length })).sort((a, b) => b.n - a.n || b.h.mtime - a.h.mtime).slice(0, 8)
+  const { turns: _turns, compact: _compact } = companionRecentTurns(InSessionId)
+  const _recent = _turns.slice(-8)
+  // 壓縮前情摘要（含少爺歷來原話、待辦、目前進度）全文另存；脈絡檔只放指標，陪聊需要時 Read
+  const _compactFile = `chatctx_${InSessionId.slice(0, 8)}_前情.md`
+  if (_compact) try { fs.writeFileSync(path.join(COMPANION_CWD, _compactFile), _compact.text, 'utf8') } catch {}
+  const _corrections = _turns.slice(-40).filter(x => x.who === '少爺' && COMPANION_CORRECTION_RE.test(x.user)).slice(-6)
+  const _runs = readQaRuns().runs.filter(r => r.boundSessionId === InSessionId && !r.archivedAt).slice(-5)
+  const _cards = (readTodos().cards ?? []).filter(c => c.sessionId === InSessionId && !c.deletedAt).slice(-6)
+  // 其他陪聊的交接摘要：只取同一個侍酒師專案的（別的專案是雜訊）
+  const _briefs = Object.entries(companionStore)
+    .filter(([k, c]) => k !== `chat:${InSessionId}` && (c.brief?.summary || (c.ideas ?? []).length))
+    .filter(([, c]) => !_info.proj || (c.scope === 'chat' ? companionChatInfo(c.refId).proj?.id : companionContext(c.scope, c.refId)?.projectId) === _info.proj.id)
+    .sort((a, b) => (b[1].updatedAt ?? 0) - (a[1].updatedAt ?? 0)).slice(0, 8)
+  const _one = (InText, InMax) => String(InText ?? '').replace(/\s+/g, ' ').trim().slice(0, InMax)
+  const _lines = [
+    `# CHAT 陪聊脈絡：${_info.title}（${InSessionId}）`,
+    `更新：${new Date().toLocaleString('zh-TW')}｜專案路徑：${_info.cwd ?? '不明'}${_info.proj ? `｜侍酒師專案：${_info.proj.name}` : ''}`,
+    '',
+    '## 這個聊天室（History）',
+    `- 標籤：${_me?.tags?.length ? _me.tags.map(t => `#${t}`).join(' ') : '（還沒有標籤：每晚 23:30 批次標）'}`,
+    _me?.summary ? `- 摘要：${_one(_me.summary, 600)}` : '',
+    _me?.knowledge?.some(k => k.docs?.length) ? `- 標籤連到的知識文件：${_me.knowledge.filter(k => k.docs?.length).map(k => `${k.term}→${k.docs.slice(0, 3).join('、')}`).join('；').slice(0, 500)}` : '',
+    _me?.costUsd ? `- 已花費：$${Number(_me.costUsd).toFixed(2)}（每多一則修正 prompt，都要再讀一次整段脈絡）` : '',
+    _compact ? `- 這個聊天室被壓縮過（${new Date(_compact.ts).toLocaleString('zh-TW')}）：壓縮前的前情摘要全文在 ${_compactFile}（少爺歷來原話、待辦、當時進度），下面「最近的回合」只涵蓋壓縮之後——需要更早的脈絡就 Read 它` : '',
+    '',
+    '## 最近的回合（由舊到新；每回合＝少爺的話＋聊天室最後的回覆）',
+    ...(_recent.length ? _recent.flatMap(x => [`- 【${x.who}】${x.user.slice(0, x.who === '少爺' ? 600 : 200)}`, x.reply ? `  →【聊天室】${x.reply.slice(0, 450)}` : '  →（聊天室還沒回完）']) : ['（讀不到對話紀錄）']),
+    '',
+    '## 最近的糾正訊號（少爺在這個聊天室說過「不是／不對／我要的是…」——容易被誤解的地方）',
+    ...(_corrections.length ? _corrections.map(x => `- ${x.user.slice(0, 300)}`) : ['（最近沒有）']),
+    '',
+    '## 同標籤的相關聊天室',
+    ...(_related.length ? _related.map(({ h, n }) => `- ${h.title}（${String(h.sessionId).slice(0, 8)}，共同標籤 ${n}）${h.tags?.length ? ` ${h.tags.slice(0, 8).map(t => `#${t}`).join(' ')}` : ''}${h.summary ? `：${_one(h.summary, 200)}` : ''}`) : ['（沒有）']),
+    '',
+    '## 綁定這個聊天室的 QA run 與卡片',
+    ...(_runs.length ? _runs.map(r => `- QA「${r.topic}」(${r.id}) 狀態 ${r.status}${r.requirement ? `：${_one(r.requirement, 200)}` : ''}`) : ['（沒有 QA run）']),
+    ...(_cards.length ? _cards.map(c => `- 卡片「${c.title}」（${c.column}）${c.lastSummary ? `：${_one(c.lastSummary, 200)}` : ''}`) : ['（沒有卡片）']),
+    '',
+    '## 其他陪聊的交接摘要（最近的思考脈絡）',
+    ...(_briefs.length ? _briefs.map(([k, c]) => `- ${c.title ?? k}：${_one(c.brief?.summary || (c.ideas ?? []).map(i => i.text).join('；'), 260)}${c.brief?.open?.length ? `｜待定：${_one(c.brief.open.join('；'), 160)}` : ''}`) : ['（沒有）']),
+  ].filter(x => x !== '')
+  try {
+    fs.mkdirSync(COMPANION_CWD, { recursive: true })
+    fs.writeFileSync(path.join(COMPANION_CWD, _file), _lines.join('\n'), 'utf8')
+  } catch (e) { logEvent('tc.companion.chatctx_error', { sessionId: InSessionId, error: String(e?.message ?? e) }) }
+  companionChatCtxStamp.set(InSessionId, { ts: Date.now(), size: _size })
+  return { file: _file, changed: !!_prev && _changed }
+}
+
+/** 提問陪聊的提問檔：題目、選項、說明、聊天室提問前最後說的話（開面板與每句話前重寫，陪聊用 Read 看） */
+function companionWriteAskFile(InKey) {
+  const _a = askStore[InKey]
+  if (!_a) return null
+  askFillFromTranscript(InKey)
+  const _file = `ask_${_a.sessionId.slice(0, 8)}_${InKey.split(':').pop()}.md`
+  const _qs = askQuestionsOf(_a.input)
+  const _lines = [
+    `# 提問：${_a.input?.title ?? `聊天室正在問少爺 ${_qs.length} 題`}`,
+    `聊天室 ${_a.sessionId}｜提出時間 ${new Date(_a.ts).toLocaleString('zh-TW')}｜狀態 ${_a.status}${askHolds.has(InKey) ? '（可從 TC 作答）' : '（目前只能在 VS Code 分頁作答）'}`,
+    '',
+    '## 聊天室提問前最後說的話',
+    _a.lead ? _a.lead : '（對話紀錄裡沒找到）',
+    '',
+    ..._qs.flatMap((q, i) => [
+      `## 第 ${i + 1} 題｜${q.header || '（無短標）'}${q.multiSelect ? '（可複選）' : ''}${q.kind !== 'choice' ? `（${q.kind === 'text' ? '文字作答' : '數值作答'}）` : ''}`,
+      q.question,
+      ...(q.description ? [q.description] : []),
+      ...q.options.map((o, j) => `- 選項 ${j + 1}：${o.label}${o.description ? `——${o.description}` : ''}${o.preview ? `\n  預覽：${String(o.preview).slice(0, 600)}` : ''}`),
+      `- 其他：少爺自己寫的回覆（你可以幫他寫進 drafts）`,
+      '',
+    ]),
+  ]
+  try {
+    fs.mkdirSync(COMPANION_CWD, { recursive: true })
+    fs.writeFileSync(path.join(COMPANION_CWD, _file), _lines.join('\n'), 'utf8')
+  } catch (e) { logEvent('tc.companion.askfile_error', { key: InKey, error: String(e?.message ?? e) }) }
+  return _file
+}
+
 /** 陪聊對象的脈絡：標題、專案根、可讀資料夾、簡介 */
 function companionContext(InScope, InRefId) {
+  if (InScope === 'ask') {
+    const _a = askStore[InRefId]
+    if (!_a) return null
+    const _info = companionChatInfo(_a.sessionId)
+    const _memDirs = String(_info.proj?.memoryDir ?? '').split(',').map(s => s.trim()).filter(Boolean)
+    const _askFile = `ask_${_a.sessionId.slice(0, 8)}_${InRefId.split(':').pop()}.md`
+    const _chatCtxFile = `chatctx_${_a.sessionId.slice(0, 8)}.md`
+    return {
+      title: `提問｜${askSummary(_a.input) || _info.title}`,
+      projectId: _info.proj?.id ?? null,
+      projectRoot: _info.cwd,
+      dirs: [_info.proj?.designIntentDir, _info.proj?.scenarioDir, ..._memDirs].filter(Boolean),
+      askFile: _askFile,
+      chatCtxFile: _chatCtxFile,
+      brief: `聊天室「${_info.title}」(${_a.sessionId}) 正在問少爺 ${askQuestionsOf(_a.input).length} 題：${askSummary(_a.input)}；提問檔 ${_askFile}、聊天室脈絡檔 ${_chatCtxFile}（都在你的工作目錄）`,
+    }
+  }
+  if (InScope === 'chat') {
+    if (!InRefId || !findJsonlPath(InRefId)) return null
+    const _info = companionChatInfo(InRefId)
+    const _memDirs = String(_info.proj?.memoryDir ?? '').split(',').map(s => s.trim()).filter(Boolean)
+    const _ctxFile = `chatctx_${InRefId.slice(0, 8)}.md`
+    return {
+      title: `CHAT｜${_info.title}`,
+      projectId: _info.proj?.id ?? null,
+      projectRoot: _info.cwd,
+      dirs: [_info.proj?.designIntentDir, _info.proj?.scenarioDir, ..._memDirs].filter(Boolean),
+      chatCtxFile: _ctxFile,
+      brief: `聊天室「${_info.title}」(${InRefId})；專案路徑 ${_info.cwd ?? '不明'}；脈絡檔 ${_ctxFile}（在你的工作目錄）`,
+    }
+  }
   if (InScope === 'qa') {
     const _run = readQaRuns().runs.find(r => r.id === InRefId)
     if (!_run) return null
@@ -6749,6 +7564,7 @@ const COMPANION_RULES = [
   '需要佐證時可以用 Read／Grep／Glob 查專案的設計意圖、情境檔與計畫，但回覆仍要短。',
   '少爺的訊息可能來自語音辨識（沒有標點、有錯字）：讀意圖，關鍵字聽不懂就問。',
   '訊息開頭的「（系統：…）」是 TC 告訴你的狀態變化（例如少爺手動改了想法板、已交付），照著更新，不必複述。',
+  '少爺可能貼圖片或附檔（截圖、參考圖、文件）：圖片會直接附在訊息裡；檔案或太大的圖片會給存檔路徑，用 Read 看。先說你看到什麼、跟議題的關係，再接著討論；交出去時 TC 會自動附上附件路徑，你在想法板、brief、handoff 裡用檔名指稱即可。',
   '每次回覆的最後另起一行附一個機讀區塊（少爺看不到）：<tc-board>{JSON}</tc-board>，只能有一個、必須是合法 JSON。',
 ]
 
@@ -6788,6 +7604,34 @@ const COMPANION_HANDOFF_DUTIES = [
 const COMPANION_RIPPLE_FORMAT ='・ripples＝目前完整的連帶建議清單（每次全量、id 沿用，如 r1）：{"id":"r1","text":"建議一句話","why":"理由（引用哪份意圖、情境或支柱）","facets":["手感","演出"],"refs":["intent:…"],"status":"proposed|adopted|dismissed"}；facets 只能用九面向的名稱，refs 照抄目錄第一欄。少爺同意就標 adopted 並同時把它加進 ideas，不要就標 dismissed。'
 
 function companionSystemPrompt(InScope, InCtx) {
+  if (InScope === 'ask') return [
+    '你是 TheClaudenental 的「提問陪聊」：聊天室（另一個 Claude）正在向少爺（遊戲製作人）提問，要等他作答才會繼續。你**不是**那個聊天室，也不替少爺做決定——你的工作是讓少爺快速聚焦、理解這幾題到底在討論什麼，然後由他自己點選項，或請你把他的想法寫成「其他」欄的回覆。',
+    InCtx.brief,
+    '規則：', ...COMPANION_RULES.map(r => `・${r}`), ...companionCatalogRules(InCtx),
+    `・開場先 Read 提問檔 ${InCtx.askFile}（題目、選項、說明、聊天室提問前最後說的話）與聊天室脈絡檔 ${InCtx.chatCtxFile}（最近回合、標籤、少爺糾正過的地方）；需要佐證再查目錄與原檔。系統說檔案更新了就重讀。`,
+    '・TC 自動請你開場時：依序用白話講每一題——它其實在問什麼、為什麼現在要問（會牽動什麼）、選項之間真正的差別與代價；標了「建議」或 Recommended 的，說出聊天室為什麼建議，你同意或有疑慮就直說。每題兩三句，最後問少爺想先聊哪一題。',
+    '・之後回答少爺的追問。少爺說出自己的想法、或請你「幫我填／寫進其他」時，把它寫成可以直接送出的「其他」回覆放進 drafts：用少爺的口吻、第一人稱，完整到聊天室不必再追問；保留他的原意，不擅自加入他沒說的決定。口頭說一句「已幫你填進第 N 題的其他，看過再送」。',
+    '・少爺明確挑了某個現成選項，就提醒他直接點那個選項，不要寫 draft；作答與送出永遠是少爺在面板上按，不要說你已經替他回答或送出。',
+    '・回覆不用 markdown 符號（粗體、標題、表格）——少爺可能開著朗讀；要點多時用「第一、第二…」口語列出。',
+    '<tc-board> 格式：{"focus":[{"q":1,"gist":"這題白話在問什麼（一句）","lean":"你建議的選項標籤（照抄；沒把握就留空）","why":"理由（一句）"}],"drafts":[{"q":1,"text":"要填進「其他」的回覆全文"}],"refs":[]}',
+    '・focus 每次全量（題號從 1 起，照提問檔順序）；drafts 只列「這一輪新寫或改寫」的題，沒有就給空陣列；refs＝查到的相關目錄條目（照抄第一欄）。',
+  ].join('\n')
+  if (InScope === 'chat') return [
+    '你是 TheClaudenental CHAT 的「陪聊」：少爺（遊戲製作人）的開發者朋友兼顧問。你**不是**那個聊天室本身——你在旁邊，快速切入少爺此刻的思考點與他考量的因素，幫他把推理補完整。',
+    '少爺的目的：在送進聊天室之前先把脈絡想完整，減少聊天室裡因為沒先想清楚、事後為了修正而多送的 prompt（聊天室每多一則都要重讀整段脈絡，很貴）。',
+    InCtx.brief,
+    '規則：', ...COMPANION_RULES.map(r => `・${r}`), ...companionCatalogRules(InCtx), ...companionDesignRules(InCtx),
+    `・開場先 Read 脈絡檔 ${InCtx.chatCtxFile}：最近的對話、這個聊天室的標籤與摘要、最近的糾正訊號、同標籤的相關聊天室、綁定的 QA run／卡片、其他陪聊的交接摘要——用它對齊「少爺現在卡在哪、已經考慮了什麼、聊天室哪裡容易被誤解」，不要叫少爺從頭講。系統說聊天室有新進展時就重讀。`,
+    '・顧問的做法：先用一句話說出你理解的思考點→指出還沒考慮到的因素、推理缺口、或聊天室可能誤解的地方（看糾正訊號）→給建議與理由；不要重做聊天室已經在做的事。',
+    '・要點多時可以用「第一、第二…」口語列出（最多五點），不要用 markdown 符號（粗體、標題、表格）——少爺可能開著朗讀。',
+    '・facets（九面向）只在議題牽涉遊戲體驗時才填；工具、流程、架構類議題留空陣列。',
+    '<tc-board> 格式：{"ideas":[{"id":"i1","text":"少爺的思考點或已定方向","status":"draft|confirmed","facets":["手感"]}],"ripples":[],"brief":{"summary":"","decisions":[],"open":[]},"refs":[],"handoff":null}',
+    '・ideas＝少爺的思考點與已定方向（每次全量、id 沿用）；少爺明確同意的標 confirmed。',
+    COMPANION_RIPPLE_FORMAT.replace('連帶建議清單', '補完推理清單（還沒考慮到的因素、推理缺口、聊天室可能誤解的點，以及你的建議）'),
+    COMPANION_BRIEF_FORMAT,
+    '・refs＝相關的目錄條目（有目錄時，照抄第一欄），交回聊天室時一併附上當脈絡。',
+    '・少爺想把整理好的推理交回聊天室時，handoff 填 {"summary":"一則可以直接送進聊天室的完整指示：背景、要做什麼、不做什麼、怎麼驗收、還要先問的事"}，問一句「要放進聊天室嗎？」——放進輸入框或直接送出都由少爺按，你只提議。',
+  ].join('\n')
   if (InScope === 'qa') return [
     '你是 TheClaudenental 的「陪聊」：少爺（遊戲製作人）的開發者朋友，現在陪他聊一個 QA run——一起把這個議題想清楚，也順帶看見遊戲裡其他該跟著完善的系統與體驗。',
     InCtx.brief,
@@ -6825,6 +7669,9 @@ function companionPublic(InKey) {
     key: InKey, scope: _c.scope, refId: _c.refId, title: _c.title,
     messages: _c.messages.slice(-100), ideas: _c.ideas, ripples: _c.ripples ?? [], cartLog: _c.cartLog, cartRefs: _c.cartRefs ?? [], contextRefs: _c.contextRefs ?? [],
     brief: _c.brief ?? null, briefRev: _c.briefRev ?? 0, briefDoneRev: _c.briefDoneRev ?? 0, handoffDuties: COMPANION_HANDOFF_DUTIES,
+    cost: _c.cost ?? null,
+    attachments: _c.attachments ?? [],
+    focus: _c.focus ?? [], drafts: _c.drafts ?? [],
     pendingHandoff: _c.pendingHandoff,
     status: _p ? _p.status : 'off', model: _c.model ?? null, updatedAt: _c.updatedAt,
   }
@@ -6923,7 +7770,26 @@ function companionApplyBoard(InKey, InBoard) {
       _c.briefRev = (_c.briefRev ?? 0) + 1
     }
   }
-  if (_c.scope === 'qa') {
+  // 提問陪聊：每題的白話重點（全量）＋代填「其他」的草稿（只收這一輪新寫的，版號遞增讓面板知道要填進去）
+  if (_c.scope === 'ask') {
+    const _n = askQuestionsOf(askStore[_c.refId]?.input).length
+    const _q = (InQ) => { const _i = Number(InQ); return Number.isInteger(_i) && _i >= 1 && _i <= _n ? _i : null }
+    if (Array.isArray(InBoard.focus))
+      _c.focus = InBoard.focus.filter(f => f && _q(f.q)).map(f => ({ q: _q(f.q), gist: String(f.gist ?? '').trim().slice(0, 300), lean: String(f.lean ?? '').trim().slice(0, 160), why: String(f.why ?? '').trim().slice(0, 400) }))
+    for (const _d of Array.isArray(InBoard.drafts) ? InBoard.drafts : []) {
+      const _i = _q(_d?.q)
+      const _t = String(_d?.text ?? '').trim()
+      if (!_i || !_t) continue
+      _c.draftRev = (_c.draftRev ?? 0) + 1
+      _c.drafts = [...(_c.drafts ?? []).filter(x => x.q !== _i), { q: _i, text: _t.slice(0, 3000), rev: _c.draftRev, ts: Date.now() }]
+    }
+    _c.contextRefs = _c.contextRefs ?? []
+    for (const _ref of _validRefs(InBoard.refs)) {
+      if (_c.contextRefs.some(x => x.ref === _ref)) continue
+      _c.contextRefs.push({ ref: _ref, title: _catalog.refs.get(_ref).title, icon: _catalog.refs.get(_ref).icon, ts: Date.now() })
+    }
+  }
+  if (_c.scope === 'qa' || _c.scope === 'chat') {
     if (InBoard.handoff && typeof InBoard.handoff.summary === 'string' && InBoard.handoff.summary.trim()) {
       _c.pendingHandoff = { summary: InBoard.handoff.summary.trim().slice(0, 4000), ts: Date.now() }
     }
@@ -6975,6 +7841,28 @@ function companionApplyBoard(InKey, InBoard) {
   persistCompanions()
 }
 
+/** 陪聊花費（少爺 2026-10-08「我想知道陪聊花費的Token成本」）：實測 stream-json 輸入模式下 result.usage＝單輪、
+ *  total_cost_usd＝這個進程累計（換進程從 0 起算）→ 單輪花費取累計差；牌價（costBasis list），訂閱方案下是等價估算 */
+function companionAddCost(InKey, InProc, InEv) {
+  const _c = companionStore[InKey]
+  if (!_c || !InEv) return
+  const _total = Number(InEv.total_cost_usd)
+  const _turnUsd = Number.isFinite(_total) ? Math.max(0, _total - (InProc.lastTotalCost ?? 0)) : 0
+  if (Number.isFinite(_total)) InProc.lastTotalCost = _total
+  const _u = InEv.usage ?? {}
+  const _cost = _c.cost ?? { usd: 0, turns: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  _cost.usd += _turnUsd
+  _cost.turns += 1
+  _cost.input += Number(_u.input_tokens) || 0
+  _cost.output += Number(_u.output_tokens) || 0
+  _cost.cacheRead += Number(_u.cache_read_input_tokens) || 0
+  _cost.cacheWrite += Number(_u.cache_creation_input_tokens) || 0
+  _cost.lastTurnUsd = _turnUsd
+  _cost.model = Object.keys(InEv.modelUsage ?? {})[0] ?? _cost.model ?? null
+  _c.cost = _cost
+  logEvent('tc.companion.cost', { key: InKey, turnUsd: Number(_turnUsd.toFixed(5)), totalUsd: Number(_cost.usd.toFixed(4)) })
+}
+
 function companionArmIdle(InKey) {
   const _p = companionProcs.get(InKey)
   if (!_p) return
@@ -6995,14 +7883,17 @@ function companionStop(InKey, InReason) {
   if (companionStore[InKey]) companionBroadcast(InKey)
 }
 
-/** 寫一則使用者訊息進常駐進程（stream-json 輸入） */
-function companionWrite(InKey, InText) {
+/** 寫一則使用者訊息進常駐進程（stream-json 輸入）；有圖片＝內容改成「文字＋圖片區塊」陣列 */
+function companionWrite(InKey, InText, InImages = []) {
   const _p = companionProcs.get(InKey)
   if (!_p) return false
   _p.status = 'thinking'
   _p.turnText = ''
   _p.turnMsgId = `cm${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`
-  try { _p.proc.stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: InText } })}\n`) } catch { return false }
+  const _content = InImages.length
+    ? [{ type: 'text', text: InText }, ...InImages.map(a => ({ type: 'image', source: { type: 'base64', media_type: a.inlineType, data: a.inlineB64 } }))]
+    : InText
+  try { _p.proc.stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: _content } })}\n`) } catch { return false }
   companionArmIdle(InKey)
   companionBroadcast(InKey)
   return true
@@ -7026,8 +7917,8 @@ function companionFinishTurn(InKey, InResultText) {
   _p.deltaTimer = null
   companionBroadcast(InKey)
   if (_p.pending.length) {
-    const _next = _p.pending.splice(0).join('\n')
-    companionWrite(InKey, _next)
+    const _next = _p.pending.splice(0)
+    companionWrite(InKey, _next.map(x => x.text).join('\n'), _next.flatMap(x => x.images ?? []))
   }
 }
 
@@ -7054,7 +7945,7 @@ function companionSpawn(InKey) {
   try { _proc = spawn(getClaudeExe(), _args, { cwd: COMPANION_CWD, env: _env, stdio: ['pipe', 'pipe', 'pipe'] }) }
   catch (e) { logEvent('tc.companion.spawn_error', { key: InKey, error: String(e?.message ?? e) }); return null }
   // 狀態直接給 idle：stream-json 輸入模式要等第一句話寫進去才會吐 init（實測），stdin 先收著不會掉
-  const _p = { proc: _proc, buf: '', status: 'idle', gotInit: false, turnText: '', turnMsgId: null, pending: [], idleTimer: null, deltaTimer: null, recapDue: !_c.claudeSid && _c.messages.length > 0 }
+  const _p = { proc: _proc, buf: '', status: 'idle', gotInit: false, turnText: '', turnMsgId: null, pending: [], idleTimer: null, deltaTimer: null, recapDue: !_c.claudeSid && _c.messages.length > 0, lastTotalCost: 0 }
   companionProcs.set(InKey, _p)
   _c.title = _ctx.title
   _c.model = _model
@@ -7096,12 +7987,22 @@ function companionSpawn(InKey) {
       }
       if (_ev.type === 'result') {
         if (_ev.is_error || (_ev.subtype && _ev.subtype !== 'success')) companionPushMessage(InKey, 'system', `這一句陪聊沒有完成（${_ev.subtype ?? 'error'}），可以再說一次。`)
+        companionAddCost(InKey, _p, _ev)
         companionFinishTurn(InKey, _ev.result)
       }
     }
   })
   _proc.stderr.setEncoding('utf-8')
   _proc.stderr.on('data', (InChunk) => { const _t = String(InChunk).trim(); if (_t) logEvent('tc.companion.stderr', { key: InKey, text: _t.slice(0, 300) }) })
+  // 啟動失敗（找不到 claude 執行檔等）：沒有監聽的 error 事件會讓整個 TC 伺服器崩潰——記下來、清掉進程表，面板顯示未啟動
+  _proc.on('error', (InErr) => {
+    logEvent('tc.companion.spawn_error', { key: InKey, error: String(InErr?.message ?? InErr) })
+    if (companionProcs.get(InKey) !== _p) return
+    clearTimeout(_p.idleTimer)
+    clearTimeout(_p.deltaTimer)
+    companionProcs.delete(InKey)
+    if (companionStore[InKey]) { companionPushMessage(InKey, 'system', `陪聊啟動失敗（${String(InErr?.message ?? InErr).slice(0, 120)}）`); companionBroadcast(InKey) }
+  })
   _proc.on('close', (InCode) => {
     if (companionProcs.get(InKey) !== _p) return
     clearTimeout(_p.idleTimer)
@@ -7127,7 +8028,9 @@ function companionRecap(InKey) {
   const _recent = _c.messages.filter(m => m.role !== 'system').slice(-COMPANION_RECAP_MSGS)
   const _lines = _recent.map(m => `${m.role === 'user' ? '少爺' : '你'}：${m.text.slice(0, 300)}`)
   const _ideas = _c.ideas.map(i => `${i.id}［${i.status}］${i.text}`)
-  return `（系統：陪聊重新接上，前情提要——\n${_lines.join('\n')}${_ideas.length ? `\n目前想法板：\n${_ideas.join('\n')}` : ''}\n）`
+  // 重開的進程看不到先前訊息裡的圖片 → 列出存檔路徑，需要時用 Read 再看
+  const _atts = (_c.attachments ?? []).filter(a => !a.handed).map(a => `${a.name}：${a.file}`)
+  return `（系統：陪聊重新接上，前情提要——\n${_lines.join('\n')}${_ideas.length ? `\n目前想法板：\n${_ideas.join('\n')}` : ''}${_atts.length ? `\n少爺先前給的附件（要看就用 Read）：\n${_atts.join('\n')}` : ''}\n）`
 }
 
 function companionEnsure(InScope, InRefId) {
@@ -7141,12 +8044,20 @@ function companionEnsure(InScope, InRefId) {
   return _key
 }
 
-function companionSay(InKey, InText, InVia) {
+function companionSay(InKey, InText, InVia, InAttachments = []) {
   const _c = companionStore[InKey]
   if (!_c) return { ok: false, error: 'no companion' }
   const _text = String(InText ?? '').trim()
-  if (!_text) return { ok: false, error: 'empty' }
-  companionPushMessage(InKey, 'user', _text, InVia)
+  const { saved: _saved, bad: _bad } = companionSaveAttachments(InKey, InAttachments)
+  if (!_text && !_saved.length) return { ok: false, error: _bad.length ? `附件沒收進來：${_bad.join('；')}` : 'empty' }
+  const _m = companionPushMessage(InKey, 'user', _text, InVia)
+  if (_saved.length) {
+    _m.attachments = _saved.map(a => ({ id: a.id, name: a.name, type: a.type }))
+    _c.attachments = [...(_c.attachments ?? []), ..._saved.map(({ inlineB64, inlineType, ...a }) => a)]
+    persistCompanions()
+    logEvent('tc.companion.attach', { key: InKey, files: _saved.length, inline: _saved.filter(a => a.inlineB64).length, bytes: _saved.reduce((s, a) => s + a.size, 0) })
+  }
+  if (_bad.length) companionPushMessage(InKey, 'system', `有附件沒收進來：${_bad.join('；')}`)
   let _p = companionProcs.get(InKey)
   if (!_p) _p = companionSpawn(InKey)
   if (!_p) { companionBroadcast(InKey); return { ok: false, error: '找不到陪聊對象（run 或專案已不存在）' } }
@@ -7157,20 +8068,35 @@ function companionSay(InKey, InText, InVia) {
     _c.notes = []
     for (const _i of _c.ideas) if (_i.pendingAck) delete _i.pendingAck
   }
-  const _payload = [..._prefix, _text].join('\n')
-  if (_p.status === 'thinking' || _p.status === 'tool') _p.pending.push(_payload)
-  else companionWrite(InKey, _payload)
+  const _payload = [..._prefix, _text || '（少爺只給了附件，請看）', _saved.length ? companionAttNote(_saved) : ''].filter(Boolean).join('\n')
+  const _images = _saved.filter(a => a.inlineB64)
+  if (_p.status === 'thinking' || _p.status === 'tool') _p.pending.push({ text: _payload, images: _images })
+  else companionWrite(InKey, _payload, _images)
   companionBroadcast(InKey)
-  return { ok: true }
+  return { ok: true, attached: _saved.length, skipped: _bad }
 }
 
+// 提問陪聊開場（少爺 2026-10-08「TC此時要多一個陪聊…讓我快速聚焦，理解討論的內容」）：提問一出現在 TC Chat 就自動請陪聊先講白話重點
+const COMPANION_ASK_OPENING = '（系統：聊天室剛向少爺提問，TC 自動請你開場。請先讀提問檔與聊天室脈絡檔，再依規則用白話幫少爺聚焦每一題。）'
+
 app.post('/api/companion/open', async (request, reply) => {
-  const { scope, refId, warm } = request.body ?? {}
-  if (!['qa', 'som'].includes(scope) || !refId) { reply.code(400); return { ok: false, error: 'bad scope/refId' } }
+  const { scope, refId, warm, autoBrief } = request.body ?? {}
+  if (!['qa', 'som', 'chat', 'ask'].includes(scope) || !refId) { reply.code(400); return { ok: false, error: 'bad scope/refId' } }
+  // CHAT：開面板當下先把脈絡檔寫好（標籤、最近對話、糾正訊號…），陪聊第一句就讀得到
+  if (scope === 'chat') await companionRefreshChatContext(String(refId), true)
+  // 提問：題目檔＋該聊天室的脈絡檔
+  if (scope === 'ask') {
+    const _a = askStore[String(refId)]
+    if (!_a) { reply.code(404); return { ok: false, error: '找不到這次提問' } }
+    await companionRefreshChatContext(_a.sessionId, true)
+    companionWriteAskFile(String(refId))
+  }
   const _key = companionEnsure(scope, String(refId))
   if (!_key) { reply.code(404); return { ok: false, error: '找不到陪聊對象' } }
   // 預熱：開面板就先起進程，第一句話不必等啟動
   if (warm !== false && !companionProcs.get(_key)) companionSpawn(_key)
+  if (scope === 'ask' && autoBrief && !companionStore[_key].messages.length && getTcSetting('companion.askAutoBrief', true) !== false)
+    companionSay(_key, COMPANION_ASK_OPENING, 'auto')
   return { ok: true, key: _key, state: companionPublic(_key) }
 })
 app.get('/api/companion/state', async (request) => {
@@ -7178,8 +8104,29 @@ app.get('/api/companion/state', async (request) => {
   return { ok: !!companionStore[_key], state: companionPublic(_key) }
 })
 app.post('/api/companion/say', async (request) => {
-  const { key, text, via } = request.body ?? {}
-  return companionSay(key, text, via === 'voice' ? 'voice' : 'text')
+  const { key, text, via, attachments } = request.body ?? {}
+  // CHAT：聊天室在陪聊期間有新進展（transcript 變了）→ 重寫脈絡檔並提醒陪聊重讀
+  const _c = companionStore[key]
+  if (_c?.scope === 'chat') {
+    const _r = await companionRefreshChatContext(_c.refId)
+    if (_r.changed) _c.notes.push(`聊天室有新進展，脈絡檔已更新，回答前先重讀 ${_r.file}`)
+  }
+  if (_c?.scope === 'ask' && askStore[_c.refId]) {
+    const _r = await companionRefreshChatContext(askStore[_c.refId].sessionId)
+    companionWriteAskFile(_c.refId)
+    if (_r.changed) _c.notes.push(`聊天室有新進展，脈絡檔已更新，回答前先重讀 ${_r.file}`)
+    if (askStore[_c.refId].status !== 'pending') _c.notes.push('這次提問已經結束（已作答或聊天室已往下走），之後的討論不會再影響這次作答')
+  }
+  return companionSay(key, text, via === 'voice' ? 'voice' : 'text', attachments)
+})
+// 附件檔（面板縮圖／點開大圖）：只認陪聊紀錄裡有的 id，不吃 client 給的路徑
+app.get('/api/companion/att', async (request, reply) => {
+  const { key, id } = request.query ?? {}
+  const _a = (companionStore[key]?.attachments ?? []).find(x => x.id === id)
+  if (!_a || !fs.existsSync(_a.file)) return reply.code(404).send({ ok: false, error: '附件不在了（可能已超過保留天數）' })
+  reply.header('Content-Type', _a.type || 'application/octet-stream')
+  reply.header('Cache-Control', 'private, max-age=86400')
+  return reply.send(fs.createReadStream(_a.file))
 })
 // 手動改想法板（刪除／確認／改字／新增）；改動以系統訊息帶給陪聊，下一句生效
 app.post('/api/companion/board', async (request) => {
@@ -7241,6 +8188,11 @@ app.post('/api/companion/cart-sync', async (request) => {
   // 「陪聊整理」選件：拿掉＝這一版摘要不再自動放回（摘要有新版才會再出現）；放回＝回到未處理
   if (brief) {
     _c.briefDoneRev = removed ? (_c.briefRev ?? 0) : Math.max(0, (_c.briefRev ?? 0) - 1)
+    // 附件跟著「陪聊整理」選件走：拿掉＝還沒帶出去的這批不帶（記 dropped）；放回＝只把這批重新帶上
+    for (const _a of _c.attachments ?? []) {
+      if (removed && !_a.handed) { _a.handed = true; _a.dropped = true }
+      else if (!removed && _a.dropped) { _a.handed = false; delete _a.dropped }
+    }
     persistCompanions()
     companionBroadcast(key)
     return { ok: true }
@@ -7263,47 +8215,103 @@ app.post('/api/companion/cart-checkout', async (request) => {
   for (const _e of [..._c.cartLog, ...(_c.cartRefs ?? [])]) if (!_e.removed && !_e.checkedOut) { _e.checkedOut = true; _n++ }
   _c.briefDoneRev = _c.briefRev ?? 0
   for (const _r of _c.ripples ?? []) if (_r.status === 'adopted') _r.handed = true
+  for (const _a of _c.attachments ?? []) _a.handed = true
   if (_n) _c.notes.push(reason === 'cleared' ? '少爺清空了購物車；之後的新想法是新一輪' : '少爺已結帳，把購物車帶去新聊天室實作；之後的新想法是新一輪')
   persistCompanions()
   companionBroadcast(key)
   logEvent('tc.companion.checkout', { key, reason: reason ?? 'checkout', items: _n })
   return { ok: true, items: _n }
 })
-// QA 交付：組成留言走既有 /control 留言鏈（含喚醒：監看活著→監看、否則做法 B 直投、再否則無頭／新開聊天室接手）
-app.post('/api/companion/handoff', async (request, reply) => {
-  const { key, summary, via } = request.body ?? {}
-  const _c = companionStore[key]
-  if (!_c || _c.scope !== 'qa') { reply.code(400); return { ok: false, error: '只有 QA 陪聊可以交付' } }
-  const _ideas = _c.ideas.filter(i => i.status !== 'handed')
-  const _summary = String(summary ?? _c.pendingHandoff?.summary ?? '').trim()
-  if (!_summary && !_ideas.length) return { ok: false, error: '想法板是空的，沒有可交付的內容' }
-  const _ctxRefs = _c.contextRefs ?? []
-  const _brief = _c.brief ?? null
+/** 交出去的整段文字（QA 交付留言／CHAT 交回聊天室共用）：摘要、已定、待定、想法、相關條目、採納的建議與理由、交接要求。
+ *  CHAT 且陪聊已寫好完整指示時只附指示本體＋相關脈絡——已定／待定／思考點都已寫進指示，重貼一次只是讓聊天室多讀 */
+function companionHandoffText(InC, InSummary) {
+  const _isChat = InC.scope === 'chat'
+  const _ideas = InC.ideas.filter(i => i.status !== 'handed')
+  const _summary = String(InSummary ?? InC.pendingHandoff?.summary ?? '').trim()
+  const _ctxRefs = InC.contextRefs ?? []
+  const _brief = InC.brief ?? null
+  const _adopted = (InC.ripples ?? []).filter(r => r.status === 'adopted' && !r.handed)
+  const _refsText = _ctxRefs.length ? `相關脈絡（侍酒師目錄條目，可在侍酒師或原檔查）：\n${_ctxRefs.map(r => `- ${r.icon ?? ''}${r.title}（${r.ref}）`).join('\n')}` : ''
+  const _attText = companionAttHandoffText(InC)
+  if (_isChat && _summary) {
+    const _text = ['🗣 陪聊整理（少爺在 TC 陪聊顧問處先把脈絡想清楚的結果）', _summary, _refsText, _attText,
+      _ctxRefs.length ? `動工前先讀相關脈絡的原檔確認現況，不一致以原檔為準並告訴少爺。` : ''].filter(Boolean).join('\n\n')
+    return { text: _text, ideas: _ideas, empty: false }
+  }
   const _text = [
-    '🗣 陪聊交付（少爺在 TC 陪聊中整理並確認要實作的想法）',
+    _isChat ? '🗣 陪聊整理（少爺在 TC 陪聊顧問處先把脈絡想清楚的結果，請據此接著處理）' : '🗣 陪聊交付（少爺在 TC 陪聊中整理並確認要實作的想法）',
     _summary,
     _brief?.summary && _brief.summary !== _summary ? `議題摘要：${_brief.summary}` : '',
     _brief?.decisions?.length ? `已跟少爺說定：\n${_brief.decisions.map(x => `- ${x}`).join('\n')}` : '',
     _brief?.open?.length ? `還要少爺定（動工前先問）：\n${_brief.open.map(x => `- ${x}`).join('\n')}` : '',
-    _ideas.length ? `想法清單：\n${_ideas.map(i => `- ${i.status === 'confirmed' ? '［已確認］' : '［草稿］'}${i.text}`).join('\n')}` : '',
-    _ctxRefs.length ? `相關脈絡（侍酒師目錄條目，可在侍酒師或原檔查）：\n${_ctxRefs.map(r => `- ${r.icon ?? ''}${r.title}（${r.ref}）`).join('\n')}` : '',
-    (() => {
-      const _adopted = (_c.ripples ?? []).filter(r => r.status === 'adopted' && !r.handed)
-      return _adopted.length ? `少爺採納的連帶建議（陪聊的設計推理，連同理由）：\n${_adopted.map(r => `- ${r.text}${r.why ? `——${r.why}` : ''}${r.facets?.length ? `〔影響：${r.facets.join('、')}〕` : ''}`).join('\n')}` : ''
-    })(),
+    _ideas.length ? `${_isChat ? '少爺的思考點' : '想法清單'}：\n${_ideas.map(i => `- ${i.status === 'confirmed' ? '［已確認］' : '［草稿］'}${i.text}`).join('\n')}` : '',
+    _refsText,
+    _attText,
+    _adopted.length ? `少爺採納的${_isChat ? '補完推理（陪聊顧問的提醒，連同理由）' : '連帶建議（陪聊的設計推理，連同理由）'}：\n${_adopted.map(r => `- ${r.text}${r.why ? `——${r.why}` : ''}${r.facets?.length ? `〔影響：${r.facets.join('、')}〕` : ''}`).join('\n')}` : '',
     `交接要求：\n${COMPANION_HANDOFF_DUTIES.map(x => `- ${x}`).join('\n')}`,
-    '請照 Mode C 流程處理：先列計畫給少爺在 QA 分頁審，少爺放行前不動工。',
+    _isChat ? '有不清楚的先問少爺再動手；需要實作時照專案既有流程。' : '請照 Mode C 流程處理：先列計畫給少爺在 QA 分頁審，少爺放行前不動工。',
   ].filter(Boolean).join('\n\n')
-  const _res = await app.inject({ method: 'POST', url: `/api/qa/runs/${_c.refId}/control`, payload: { action: 'comment', text: _text, inPlaceLink: true } })
+  return { text: _text, ideas: _ideas, empty: !_summary && !_ideas.length && !_brief?.summary }
+}
+
+/** 交出去之後：想法、採納建議、附件標已交出，清掉提議、告訴陪聊 */
+function companionMarkHanded(InKey, InIdeas, InNote) {
+  const _c = companionStore[InKey]
+  for (const _i of InIdeas) _i.status = 'handed'
+  for (const _r of _c.ripples ?? []) if (_r.status === 'adopted') _r.handed = true
+  for (const _a of _c.attachments ?? []) _a.handed = true
+  _c.pendingHandoff = null
+  _c.notes.push(InNote)
+  persistCompanions()
+}
+
+// CHAT：組好交回聊天室的文字但不送（少爺按「放進輸入框」→ 他看過、改過再自己送；mark＝標已交出）
+app.post('/api/companion/compose', async (request) => {
+  const { key, mark } = request.body ?? {}
+  const _c = companionStore[key]
+  if (!_c) return { ok: false, error: 'no companion' }
+  const _h = companionHandoffText(_c)
+  if (_h.empty) return { ok: false, error: '想法板與摘要都是空的，還沒有可交出的內容' }
+  if (mark) {
+    companionMarkHanded(key, _h.ideas, '少爺把目前的整理放進聊天室輸入框了（他會看過再送）；之後的新想法另外整理')
+    companionPushMessage(key, 'system', '已把整理放進聊天室輸入框，看過再送。')
+    logEvent('tc.companion.compose', { key, ideas: _h.ideas.length })
+    companionBroadcast(key)
+  }
+  return { ok: true, text: _h.text }
+})
+
+// 交出去：QA＝組成留言走既有 /control 留言鏈（含喚醒：監看活著→監看、否則做法 B 直投、再否則無頭／新開聊天室接手）；
+// CHAT＝送進綁定的聊天室
+app.post('/api/companion/handoff', async (request, reply) => {
+  const { key, summary, via } = request.body ?? {}
+  const _c = companionStore[key]
+  if (!_c || !['qa', 'chat'].includes(_c.scope)) { reply.code(400); return { ok: false, error: '只有 QA 與 CHAT 陪聊可以交出' } }
+  // CHAT：直接送進那個聊天室——走既有 /api/claude/run（直投 → 監看 → 執行道排隊／續聊），聊天室本身才是動手的人
+  if (_c.scope === 'chat') {
+    const _h = companionHandoffText(_c, summary)
+    if (_h.empty) return { ok: false, error: '想法板與摘要都是空的，還沒有可交出的內容' }
+    const _info = companionChatInfo(_c.refId)
+    if (!_info.cwd) return { ok: false, error: '找不到這個聊天室的專案路徑' }
+    const _res = await app.inject({ method: 'POST', url: '/api/claude/run', payload: { projectPath: _info.cwd, prompt: _h.text, sessionId: _c.refId } })
+    let _body = null
+    try { _body = _res.json() } catch {}
+    if (_res.statusCode >= 400 || !_body?.ok) return { ok: false, error: _body?.error ?? `HTTP ${_res.statusCode}` }
+    companionMarkHanded(key, _h.ideas, '少爺已把目前的整理送進聊天室；之後的新想法另外整理')
+    companionPushMessage(key, 'system', `已送進聊天室（${_body.delivered === 'direct' ? '直投到開著的分頁' : _body.delivered === 'monitor' ? '投進分頁的監看收件匣' : _body.queued ? `聊天室還在想上一則，排隊第 ${_body.queuePos} 位` : '無頭續聊接手'}${via === 'voice' ? '，語音口令觸發' : ''}）。`)
+    logEvent('tc.companion.handoff', { key, ideas: _h.ideas.length, via: via ?? 'button', delivered: _body.delivered ?? (_body.queued ? 'queued' : 'run') })
+    companionBroadcast(key)
+    return { ok: true }
+  }
+  const _h = companionHandoffText(_c, summary)
+  if (_h.empty) return { ok: false, error: '想法板是空的，沒有可交付的內容' }
+  const _res = await app.inject({ method: 'POST', url: `/api/qa/runs/${_c.refId}/control`, payload: { action: 'comment', text: _h.text, inPlaceLink: true } })
   let _body = null
   try { _body = _res.json() } catch {}
   if (_res.statusCode >= 400 || !_body?.ok) return { ok: false, error: _body?.error ?? `HTTP ${_res.statusCode}` }
-  for (const _i of _ideas) _i.status = 'handed'
-  for (const _r of _c.ripples ?? []) if (_r.status === 'adopted') _r.handed = true
-  _c.pendingHandoff = null
-  _c.notes.push('少爺已把目前的想法交付給實作聊天室；之後的新想法另外整理')
-  companionPushMessage(key, 'system', `已交付給實作聊天室（${_ideas.length} 個想法${via === 'voice' ? '，語音口令觸發' : ''}）。實作聊天室會先列計畫，請到 QA 分頁審查。`)
-  logEvent('tc.companion.handoff', { key, ideas: _ideas.length, via: via ?? 'button' })
+  companionMarkHanded(key, _h.ideas, '少爺已把目前的想法交付給實作聊天室；之後的新想法另外整理')
+  companionPushMessage(key, 'system', `已交付給實作聊天室（${_h.ideas.length} 個想法${via === 'voice' ? '，語音口令觸發' : ''}）。實作聊天室會先列計畫，請到 QA 分頁審查。`)
+  logEvent('tc.companion.handoff', { key, ideas: _h.ideas.length, via: via ?? 'button' })
   companionBroadcast(key)
   return { ok: true }
 })
@@ -7325,13 +8333,919 @@ app.post('/api/companion/reset', async (request) => {
   const _c = companionStore[_key]
   if (!_c) return { ok: false }
   companionStop(_key, 'reset')
-  Object.assign(_c, { messages: [], ideas: [], ripples: [], cartLog: [], cartRefs: [], contextRefs: [], brief: null, briefRev: 0, briefDoneRev: 0, pendingHandoff: null, notes: [], claudeSid: null, updatedAt: Date.now() })
+  // 還沒交出去的附件檔一併刪；已交出去的路徑可能還被聊天室引用，留給保留天數清理
+  for (const _a of _c.attachments ?? []) if (!_a.handed) try { fs.unlinkSync(_a.file) } catch {}
+  Object.assign(_c, { messages: [], ideas: [], ripples: [], cartLog: [], cartRefs: [], contextRefs: [], attachments: [], brief: null, briefRev: 0, briefDoneRev: 0, focus: [], drafts: [], pendingHandoff: null, notes: [], claudeSid: null, updatedAt: Date.now() })
   persistCompanions()
   companionBroadcast(_key)
   return { ok: true }
 })
 
+// ─── 提問中繼（少爺 2026-10-08「我要TC的Chat也能像是VS Code顯示這些問題還有選項，並且TC此時要多一個陪聊，另闢子進程，
+//     讓我快速聚焦，理解討論的內容，我可以選擇是直接操作原本的選項，或是讓陪聊把內容填入其他選項」）：
+//     分頁的 AskUserQuestion 走權限詢問，PermissionRequest hook 與分頁對話框並行、先回者勝（Claude Code 2.1.293 實測）。
+//     TC 扣住 hook 連線＝這題能從 TC 作答；分頁先答、hook 被收掉或 TC 重啟時只剩顯示（從對話紀錄重建，hook 重連後恢復可答）。
+//     純邏輯在 askRelay.js，機檢 npm run check:ask。
+const ASK_FILE = path.join(os.homedir(), '.claude', 'tc_asks.json')
+const ASK_KEEP = 80
+const ASK_MAX_HOLD_MS = 26 * 60 * 60 * 1000
+const ASK_SWEEP_MS = 20 * 1000
+const askHolds = new Map()   // 提問鍵 → { resolve }：目前扣在 TC 手上的 hook 連線
+const askStore = (() => { try { return JSON.parse(fs.readFileSync(ASK_FILE, 'utf-8')) } catch { return {} } })()   // 提問鍵 → 紀錄
+let _askPersistTimer = null
+function persistAsks() {
+  if (_askPersistTimer) return
+  _askPersistTimer = setTimeout(() => {
+    _askPersistTimer = null
+    const _keys = Object.keys(askStore).sort((a, b) => (askStore[b].ts ?? 0) - (askStore[a].ts ?? 0))
+    for (const _k of _keys.slice(ASK_KEEP)) delete askStore[_k]
+    try { atomicWriteJson(ASK_FILE, askStore) } catch {}
+  }, 500)
+}
+// 開機：上一輪扣著的連線都斷了——還沒結束的提問改成只能顯示，等 hook 重連（重試）再恢復可答
+for (const _a of Object.values(askStore)) if (_a.status === 'pending') _a.detached = true
+
+/** 給 client 的提問狀態 */
+function askPublic(InKey) {
+  const _a = askStore[InKey]
+  if (!_a) return null
+  return {
+    key: InKey, sessionId: _a.sessionId, toolUseId: _a.toolUseId ?? null, title: _a.input?.title ?? null,
+    questions: askQuestionsOf(_a.input), lead: _a.lead ?? '', ts: _a.ts, status: _a.status,
+    answerable: askHolds.has(InKey), answeredVia: _a.answeredVia ?? null, answers: _a.answers ?? null, endedAt: _a.endedAt ?? null,
+    companionKey: `ask:${InKey}`,
+  }
+}
+function askBroadcast(InKey) { broadcast({ type: 'ask_update', key: InKey, ask: askPublic(InKey) }) }
+
+/** 對話紀錄尾段（提問一定在最後面）；讀不到回空字串 */
+function askTranscriptTail(InSessionId) {
+  const _fp = findJsonlPath(InSessionId)
+  if (!_fp) return ''
+  try {
+    const _size = fs.statSync(_fp).size
+    const _len = Math.min(_size, 4 * 1024 * 1024)
+    const _fd = fs.openSync(_fp, 'r')
+    const _buf = Buffer.alloc(_len)
+    fs.readSync(_fd, _buf, 0, _len, _size - _len)
+    fs.closeSync(_fd)
+    return _buf.toString('utf8')
+  } catch { return '' }
+}
+
+/** 記一筆提問（hook 登記或對話紀錄偵測）；同一組提問沿用同一筆。上一次已結束又被原題重問＝新的一輪，清掉上一輪的作答紀錄 */
+function askUpsert(InSessionId, InInput, InPatch) {
+  const _key = askKeyOf(InSessionId, InInput)
+  let _a = askStore[_key]
+  if (!_a || (_a.status !== 'pending' && InPatch.status === 'pending')) _a = { sessionId: InSessionId, input: InInput, ts: Date.now() }
+  Object.assign(_a, InPatch)
+  askStore[_key] = _a
+  persistAsks()
+  return _key
+}
+
+/** 補 tool_use id 與提問前聊天室說的話（hook 的輸入沒有 tool_use id；對話紀錄稍晚才寫到也沒關係，用到時再補） */
+function askFillFromTranscript(InKey, InTail = null) {
+  const _a = askStore[InKey]
+  if (!_a || _a.toolUseId) return
+  const _open = findOpenAsk(InTail ?? askTranscriptTail(_a.sessionId))
+  if (!_open || askKeyOf(_a.sessionId, _open.input) !== InKey) return
+  _a.toolUseId = _open.toolUseId
+  _a.lead = String(_open.lead ?? '').slice(0, 3000)
+  persistAsks()
+}
+
+/** 側欄標記：聊天室有待答的提問（點聊天室列就帶進 Chat 作答） */
+function askMarkSession(InSessionId) {
+  const _s = sessions.get(InSessionId)
+  if (!_s) return
+  const _open = Object.entries(askStore).filter(([, a]) => a.sessionId === InSessionId && a.status === 'pending').sort((a, b) => a[1].ts - b[1].ts).at(-1)
+  _s.pendingAsk = _open ? { key: _open[0], count: askQuestionsOf(_open[1].input).length, summary: askSummary(_open[1].input), answerable: askHolds.has(_open[0]), ts: _open[1].ts } : null
+  broadcast({ type: 'session', session: _s })
+}
+
+/** 一題結束（作答／分頁先答／回合結束）：狀態定案、放掉扣著的連線、停掉它的陪聊 */
+function askFinish(InKey, InStatus, InPatch = {}) {
+  const _a = askStore[InKey]
+  if (!_a || _a.status !== 'pending') return false
+  Object.assign(_a, InPatch, { status: InStatus, endedAt: Date.now() })
+  delete _a.detached
+  askHolds.get(InKey)?.resolve({})
+  persistAsks()
+  if (companionProcs.has(`ask:${InKey}`)) companionStop(`ask:${InKey}`, InStatus)
+  askMarkSession(_a.sessionId)
+  askBroadcast(InKey)
+  logEvent('tc.ask.end', { key: InKey, status: InStatus, via: _a.answeredVia ?? null })
+  return true
+}
+
+/** 分頁那邊的事件放掉提問：answered_elsewhere＝同一組提問在分頁答完；其他（回合結束、新的提示詞、分頁關閉）＝該聊天室所有未答提問都結束 */
+function askRelease(InSessionId, InWhy, InInput = null) {
+  if (!InSessionId) return
+  const _keys = InWhy === 'answered_elsewhere' && InInput ? [askKeyOf(InSessionId, InInput)]
+    : Object.keys(askStore).filter(k => askStore[k].sessionId === InSessionId && askStore[k].status === 'pending')
+  for (const _k of _keys) {
+    if (InWhy === 'answered_elsewhere') askFinish(_k, 'answered', { answeredVia: 'session', answers: InInput?.answers ?? null })
+    else askFinish(_k, 'closed', { closedBy: InWhy })
+  }
+}
+
+/** hook 長輪詢：扣住連線直到 TC 作答、分頁先答、或 hook 被收掉（逾時／分頁結束 hook） */
+async function askHold(request, reply, e) {
+  const _sid = e.session_id
+  const _input = e.tool_input ?? {}
+  const _key = askUpsert(_sid, _input, { status: 'pending', lastHookAt: Date.now(), cwd: e.cwd ?? null })
+  delete askStore[_key].detached
+  // 同一題重複登記（hook 重試、TC 重啟後重連）：舊連線放掉，新的接手
+  askHolds.get(_key)?.resolve({})
+  askFillFromTranscript(_key)
+  if (sessions.has(_sid) || readLiveSessions().has(_sid)) setStatus(_sid, 'waiting')
+  emitLog(_sid, `[Ask] 提問 ${askQuestionsOf(_input).length} 題：${askSummary(_input)}`, 'permission')
+  logEvent('tc.ask.pending', { key: _key, sid: _sid, questions: askQuestionsOf(_input).length })
+  const _out = await new Promise((resolve) => {
+    const _h = {}
+    const _done = (InOut) => {
+      if (askHolds.get(_key) === _h) askHolds.delete(_key)
+      clearTimeout(_h.timer)
+      resolve(InOut ?? {})
+    }
+    _h.resolve = _done
+    _h.timer = setTimeout(() => _done({}), ASK_MAX_HOLD_MS)
+    askHolds.set(_key, _h)
+    // hook 被收掉（逾時、分頁先答後結束 hook、使用者中斷）：連線斷了就不能再代答，改成只顯示
+    request.raw.socket?.once('close', () => {
+      if (askHolds.get(_key) !== _h) return
+      _done({})
+      const _a = askStore[_key]
+      if (_a?.status === 'pending') {
+        _a.detached = true
+        persistAsks()
+        askSweepOne(_key)
+        askMarkSession(_sid)
+        askBroadcast(_key)
+      }
+    })
+    askMarkSession(_sid)
+    askBroadcast(_key)
+  })
+  reply.header('Content-Type', 'application/json; charset=utf-8')
+  return reply.send(asciiJson(_out))
+}
+
+/** 單筆檢查：對話紀錄已有結果＝分頁答完了；聊天室已關＝結束 */
+function askSweepOne(InKey, InTail = null) {
+  const _a = askStore[InKey]
+  if (!_a || _a.status !== 'pending') return
+  const _tail = InTail ?? askTranscriptTail(_a.sessionId)
+  askFillFromTranscript(InKey, _tail)
+  if (_a.toolUseId && askHasResult(_tail, _a.toolUseId)) { askFinish(InKey, 'answered', { answeredVia: _a.answeredVia ?? 'session' }); return }
+  if (!askHolds.has(InKey) && !readLiveSessions().has(_a.sessionId)) askFinish(InKey, 'closed', { closedBy: 'session_gone' })
+}
+setInterval(() => {
+  for (const [_k, _a] of Object.entries(askStore)) if (_a.status === 'pending') askSweepOne(_k)
+}, ASK_SWEEP_MS)
+
+// 某聊天室的提問：hook 登記過的＋從對話紀錄重建的（TC 重啟、hook 沒送到時面板照樣顯示，只是不能從 TC 送出）
+app.get('/api/ask/state', async (request) => {
+  const _sid = String(request.query?.session ?? '')
+  if (!_sid) return { ok: false, asks: [] }
+  const _tail = askTranscriptTail(_sid)
+  const _open = _tail ? findOpenAsk(_tail) : null
+  const _live = readLiveSessions().get(_sid)
+  if (_open && _live) {
+    const _key = askKeyOf(_sid, _open.input)
+    const _a = askStore[_key]
+    // TC 剛代答、結果還沒寫進對話紀錄的那幾秒不要被重建回未答（作答時還沒補到 tool_use id 的，看結束時間）
+    const _ended = _a && _a.status !== 'pending'
+    if (!_a || (_ended && (_a.toolUseId ? _a.toolUseId !== _open.toolUseId : Date.now() - (_a.endedAt ?? 0) > 60 * 1000)))
+      askUpsert(_sid, _open.input, { status: 'pending', detached: !askHolds.has(_key), toolUseId: _open.toolUseId, lead: String(_open.lead ?? '').slice(0, 3000), ts: _open.ts ?? Date.now() })
+  }
+  for (const [_k, _a] of Object.entries(askStore)) if (_a.sessionId === _sid && _a.status === 'pending') askSweepOne(_k, _tail)
+  const _recent = Date.now() - 2 * 60 * 1000
+  const _asks = Object.keys(askStore).filter(k => askStore[k].sessionId === _sid && (askStore[k].status === 'pending' || (askStore[k].endedAt ?? 0) > _recent))
+    .sort((a, b) => askStore[a].ts - askStore[b].ts).map(askPublic)
+  return { ok: true, asks: _asks }
+})
+
+// 少爺在 TC 作答：組成 hook 回應（原輸入＋answers／annotations），放行扣著的連線＝分頁對話框收掉、聊天室帶著答案繼續
+app.post('/api/ask/answer', async (request, reply) => {
+  const { key, answers, notes } = request.body ?? {}
+  const _a = askStore[key]
+  if (!_a) { reply.code(404); return { ok: false, error: '找不到這次提問' } }
+  if (_a.status !== 'pending') return { ok: false, error: _a.status === 'answered' ? '這題已經回答過了' : '這次提問已經結束', status: _a.status }
+  const _h = askHolds.get(key)
+  if (!_h) return { ok: false, detached: true, error: '這題目前不在 TC 手上（hook 已收掉、或 TC 重啟後還沒重連），請到 VS Code 分頁作答' }
+  const _r = buildAskAnswer(_a.input, answers, notes)
+  if (!_r.ok) return { ok: false, error: _r.error }
+  askFillFromTranscript(key)
+  const _answers = _r.output.hookSpecificOutput.decision.updatedInput.answers
+  Object.assign(_a, { status: 'answered', answeredVia: 'tc', answers: _answers, endedAt: Date.now() })
+  delete _a.detached
+  _h.resolve(_r.output)
+  persistAsks()
+  setStatus(_a.sessionId, 'active')
+  emitLog(_a.sessionId, `[Ask] TC 已作答 ${_r.answered} 題`, 'hook')
+  logEvent('tc.ask.answered', { key, answered: _r.answered, notes: Object.keys(notes ?? {}).length })
+  if (companionProcs.has(`ask:${key}`)) companionStop(`ask:${key}`, 'answered')
+  askMarkSession(_a.sessionId)
+  askBroadcast(key)
+  return { ok: true, answered: _r.answered }
+})
+
 // ─── Start ────────────────────────────────────────────────────────────────────
+
+// ─── 用量上限中斷：偵測、記帳、到點續接（少爺 2026-10-10）──────────────────────────
+// 偵測兩路：① StopFailure hook（新開的聊天室即時送來）② 逐字稿掃描（還沒載入新 hook 的聊天室也抓得到）。
+// 逐字稿那筆合成訊息帶 isApiErrorMessage、apiError=usage_limit_reached、quotaLimits.resetsAt（epoch 秒）＝精確重設時間。
+// 偵測與記帳永遠開（不花用量）；自動續接受總設定 usage.autoResume.* 控制、預設關（主帳號有他人共用）。
+// 續接一律走既有 /api/claude/run（直投 → 監看 → 無頭），接回同一個 session；分頁開著卻投不進去＝只通知，不另起無頭雙寫。
+// 純判斷在 usageInterrupts.js，機檢 usageInterrupts.check.mjs。
+const USAGE_INTERRUPTS_FILE = path.join(os.homedir(), '.claude', 'tc_usage_interrupts.json')
+const STOPFAILURE_LOG_FILE = path.join(os.homedir(), '.claude', 'tc_stopfailure_log.jsonl')
+const USAGE_SCAN_WINDOW_MS = 12 * 60 * 60 * 1000
+const USAGE_TICK_MS = 30 * 1000
+const USAGE_ESTIMATE_MS = 5 * 60 * 60 * 1000
+const USAGE_RESUME_STALL_MS = 2 * 60 * 1000   // 續接送出後這麼久都沒有回覆＝送達但沒動
+const usageScanMtime = new Map()   // 逐字稿路徑 → 上次掃描時的 mtime（沒變就不重讀）
+let usageInterrupts = loadUsageInterrupts()
+let usageLastBatchAt = 0
+let usageTickRunning = false
+
+function loadUsageInterrupts() {
+  try { return JSON.parse(fs.readFileSync(USAGE_INTERRUPTS_FILE, 'utf-8'))?.records ?? {} } catch { return {} }
+}
+
+function saveUsageInterrupts() {
+  atomicWriteJson(USAGE_INTERRUPTS_FILE, { records: usageInterrupts })
+  broadcast({ type: 'usage_interrupts_update', records: Object.values(usageInterrupts) })
+}
+
+/** 讀逐字稿尾端（第一行可能被截斷，丟掉） */
+function readTranscriptTail(InPath, InBytes = 128 * 1024) {
+  try {
+    const _st = fs.statSync(InPath)
+    const _len = Math.min(_st.size, InBytes)
+    const _fd = fs.openSync(InPath, 'r')
+    const _buf = Buffer.alloc(_len)
+    fs.readSync(_fd, _buf, 0, _len, _st.size - _len)
+    fs.closeSync(_fd)
+    const _lines = _buf.toString('utf-8').split('\n')
+    if (_st.size > _len) _lines.shift()
+    const _entries = []
+    for (const _l of _lines) { if (!_l.trim()) continue; try { _entries.push(JSON.parse(_l)) } catch {} }
+    return { entries: _entries, mtimeMs: _st.mtimeMs }
+  } catch { return null }
+}
+
+/** 逐字稿尾端最後一筆 API 錯誤合成訊息，以及它之後是否已有真正的對話（自己接上或少爺手動接上） */
+function lastApiErrorOf(InEntries) {
+  let _idx = -1
+  for (let i = InEntries.length - 1; i >= 0; i--) { if (InEntries[i]?.isApiErrorMessage) { _idx = i; break } }
+  if (_idx < 0) return null
+  const _e = InEntries[_idx]
+  const _content = _e.message?.content
+  const _text = typeof _content === 'string' ? _content : Array.isArray(_content) ? _content.map(x => x?.text ?? '').join(' ') : ''
+  const _activityAfter = InEntries.slice(_idx + 1).some(x =>
+    (x.type === 'assistant' && !x.isApiErrorMessage && x.message?.model !== '<synthetic>') ||
+    (x.type === 'user' && !x.isMeta && x.message?.role === 'user'))
+  const _quota = _e.quotaLimits ?? _e.apiErrorParams?.rate_limit_info ?? null
+  return {
+    at: Date.parse(_e.timestamp) || Date.now(),
+    error: _e.error ?? null,
+    apiError: _e.apiError ?? null,
+    text: _text,
+    resetsAt: _quota?.resetsAt ? Number(_quota.resetsAt) * 1000 : null,
+    rateLimitType: _quota?.rateLimitType ?? null,
+    sessionId: _e.sessionId ?? null,
+    cwd: _e.cwd ?? null,
+    entrypoint: _e.entrypoint ?? null,
+    hasActivityAfter: _activityAfter,
+  }
+}
+
+/** 記一筆中斷（同一個 session 只留最新一次；舊的處理紀錄與排除旗標沿用） */
+/** TC 自己的背景工作（主題標籤器、陪聊）不是聊天室：不記中斷、不續接 */
+function isTcInternalSession(InSid, InCwd) {
+  return /tc-tagger|tc-companion/i.test(`${InCwd ?? ''}|${findJsonlPath(InSid) ?? ''}`)
+}
+
+/** 把已存在的 TC 內部工作紀錄收掉（舊版曾記進來、續接後必然「送達但沒動」） */
+function dismissTcInternalInterrupts() {
+  let _changed = false
+  for (const _r of Object.values(usageInterrupts)) {
+    if (_r.status === 'dismissed' || !isTcInternalSession(_r.sessionId, _r.cwd)) continue
+    _r.status = 'dismissed'
+    _r.dismissedAt = Date.now()
+    _r.dismissReason = 'tc_internal'
+    _changed = true
+  }
+  if (_changed) saveUsageInterrupts()
+}
+
+function recordUsageInterrupt(InInfo, InSource) {
+  const _sid = InInfo?.sessionId
+  if (!_sid) return null
+  if (isTcInternalSession(_sid, InInfo.cwd ?? sessions.get(_sid)?.cwd)) return null
+  const _cls = classifyApiError(InInfo)
+  if (_cls.kind === 'other') return null
+  const _prev = usageInterrupts[_sid]
+  if (_prev && (_prev.interruptedAt ?? 0) >= (InInfo.at ?? 0)) return _prev
+  const _now = Date.now()
+  let _resetAt = InInfo.resetsAt ?? parseResetText(_cls.text)?.getTime() ?? null
+  let _estimated = false
+  if (_cls.kind === 'transient') _resetAt = _now + AUTO_RESUME_DEFAULTS.transientRetrySec * 1000
+  if (_resetAt === null && _cls.kind === 'usage_limit') { _resetAt = (InInfo.at ?? _now) + USAGE_ESTIMATE_MS; _estimated = true }
+  // 歸屬前先同步登入檔：登入檔若在 TC 之外換了帳號，切換紀錄先補上，這筆中斷才不會算到舊帳號
+  try { syncActiveCredentials() } catch (e) { console.error('[account sync]', e) }
+  const _account = accountAt(InInfo.at ?? _now)
+  const _rec = {
+    sessionId: _sid,
+    cwd: InInfo.cwd ?? sessions.get(_sid)?.cwd ?? null,
+    entrypoint: InInfo.entrypoint ?? null,
+    name: sessions.get(_sid)?.displayName ?? null,
+    accountUuid: _account?.accountUuid ?? null,
+    kind: _cls.kind,
+    error: _cls.error,
+    apiError: _cls.apiError,
+    text: String(_cls.text ?? '').slice(0, 240),
+    interruptedAt: InInfo.at ?? _now,
+    resetAt: _resetAt,
+    estimated: _estimated,
+    weekly: isWeeklyLimit(InInfo.rateLimitType, _cls.text),
+    rateLimitType: InInfo.rateLimitType ?? null,
+    status: _cls.kind === 'account_unavailable' ? 'account_unavailable' : 'waiting',
+    source: InSource,
+    excluded: _prev?.excluded ?? false,
+    notified: null,
+    history: _prev?.history ?? [],
+  }
+  usageInterrupts[_sid] = _rec
+  saveUsageInterrupts()
+  noteAccountFromInterrupt(_account, _rec)
+  logEvent('usage.interrupt', { sessionId: _sid, kind: _rec.kind, error: _rec.error, resetAt: _rec.resetAt, weekly: _rec.weekly, source: InSource, accountUuid: _rec.accountUuid })
+  emitLog(_sid, `[用量中斷] ${_rec.kind === 'account_unavailable' ? '帳號不可用（不會自動續接）' : `重設 ${_rec.resetAt ? new Date(_rec.resetAt).toLocaleString('zh-TW', { hour12: false }) : '時間不明'}${_estimated ? '（估計）' : ''}`}`, 'hook')
+  broadcast({ type: 'usage_interrupt_notice', record: _rec, notice: _rec.status })
+  return _rec
+}
+
+/** 掃最近 12 小時內有變動的逐字稿，找停在 API 錯誤之後沒有新對話的聊天室 */
+function scanTranscriptsForUsageLimits() {
+  const _projectsDir = path.join(CLAUDE_DIR, 'projects')
+  const _cut = Date.now() - USAGE_SCAN_WINDOW_MS
+  let _dirs = []
+  try { _dirs = fs.readdirSync(_projectsDir) } catch { return }
+  for (const _d of _dirs) {
+    if (/tc-tagger|tc-companion/i.test(_d)) continue   // 標籤器／陪聊子進程不是聊天室、不續接
+    const _dir = path.join(_projectsDir, _d)
+    let _files = []
+    try { _files = fs.readdirSync(_dir).filter(f => f.endsWith('.jsonl')) } catch { continue }
+    for (const _f of _files) {
+      const _p = path.join(_dir, _f)
+      let _st
+      try { _st = fs.statSync(_p) } catch { continue }
+      if (_st.mtimeMs < _cut || usageScanMtime.get(_p) === _st.mtimeMs) continue
+      usageScanMtime.set(_p, _st.mtimeMs)
+      const _tail = readTranscriptTail(_p)
+      const _last = _tail ? lastApiErrorOf(_tail.entries) : null
+      if (!_last || _last.hasActivityAfter || _last.at < _cut) continue
+      recordUsageInterrupt({ ..._last, sessionId: _last.sessionId ?? _f.slice(0, -6) }, 'scan')
+    }
+  }
+}
+
+/** 中斷之後逐字稿已有新對話（Claude Code 內建的「重設後繼續」或少爺手動接上） */
+function usageResumedSelf(InRecord) {
+  const _p = findJsonlPath(InRecord.sessionId)
+  const _tail = _p ? readTranscriptTail(_p) : null
+  if (!_tail) return false
+  const _last = lastApiErrorOf(_tail.entries)
+  if (_last) {
+    if (_last.at > InRecord.interruptedAt + 1000) return false   // 又撞了一次＝新的中斷，交給掃描更新
+    return _last.hasActivityAfter
+  }
+  // 逐字稿尾端沒有錯誤合成訊息（只有 hook 送來、或已被大量新內容推出尾端）→ 看中斷時間之後有沒有真正的對話
+  return _tail.entries.some(x => (Date.parse(x.timestamp) || 0) > InRecord.interruptedAt && (
+    (x.type === 'assistant' && !x.isApiErrorMessage && x.message?.model !== '<synthetic>') ||
+    (x.type === 'user' && !x.isMeta && x.message?.role === 'user')))
+}
+
+/** 某時間之後逐字稿有沒有真正的回覆（續接送出後確認聊天室真的動了） */
+function usageActivityAfter(InSid, InTs) {
+  const _p = findJsonlPath(InSid)
+  const _tail = _p ? readTranscriptTail(_p) : null
+  if (!_tail) return false
+  return _tail.entries.some(x => (Date.parse(x.timestamp) || 0) > InTs &&
+    x.type === 'assistant' && !x.isApiErrorMessage && x.message?.model !== '<synthetic>')
+}
+
+/**
+ * 續接送出後確認真的動了：送達不等於開工——開著的分頁撞上限後，Claude Code 會把新訊息扣到重設時間才放行
+ * （「等重設再自動繼續」機制，不看登入檔有沒有換；2026-10-10 G1 換帳號後收到續接訊息卻停到分頁重開）。
+ * 超過時限沒有任何回覆＝標「送達但沒動」並通知，請少爺到該分頁輸入「繼續」或在面板按立即續接。
+ */
+function checkResumeStalled(InNow) {
+  let _changed = false
+  for (const _r of Object.values(usageInterrupts)) {
+    if (_r.status !== 'resumed' || _r.resumeVerified || !_r.resumedAt) continue
+    if (InNow - _r.resumedAt > 30 * 60 * 1000) { _r.resumeVerified = true; _changed = true; continue }
+    if (usageActivityAfter(_r.sessionId, _r.resumedAt)) { _r.resumeVerified = true; _changed = true; continue }
+    if (InNow - _r.resumedAt < USAGE_RESUME_STALL_MS) continue
+    // 監看送進去的訊息會被扣住，直投（官方跨工作階段收件管道）叫得醒（2026-10-10 G1 實證：舊進程 13 秒內開工）——直投登記過就自動補叫一次
+    if (!_r.stallRetried && ccmsgAvailable(_r.sessionId)) {
+      _r.stallRetried = true
+      _r.resumedAt = InNow
+      _changed = true
+      const _sid = _r.sessionId
+      ccmsgPostVerified(_sid, resumePrompt(_r, new Date(), false, _r._switchedTo ?? null), { kind: 'usage_resume_retry' })
+        .then(rep => {
+          _r.history = [...(_r.history ?? []), { at: Date.now(), reason: 'stall_retry_direct', ok: !!rep.ok, delivered: rep.ok ? `direct:${rep.receipt ?? 'none'}` : null, error: rep.error || null }].slice(-10)
+          saveUsageInterrupts()
+          logEvent('usage.resume_stall_retry', { sessionId: _sid, ok: !!rep.ok, receipt: rep.receipt ?? null })
+        })
+        .catch(() => {})
+      continue
+    }
+    _r.status = 'stalled'
+    _r.stalledAt = InNow
+    _r.notified = 'notify_stalled'
+    _changed = true
+    logEvent('usage.resume_stalled', { sessionId: _r.sessionId, resumedAt: _r.resumedAt })
+    emitLog(_r.sessionId, '[用量中斷] 續接訊息已送達但聊天室沒有動（可能被 Claude Code 的「等重設再繼續」扣住）——請到該分頁輸入「繼續」', 'hook')
+    broadcast({ type: 'usage_interrupt_notice', record: _r, notice: 'notify_stalled' })
+  }
+  if (_changed) saveUsageInterrupts()
+}
+
+/** 投得進去嗎：分頁開著要能直投或有活監看；分頁沒開＝無頭續接同一個 session */
+function usageDeliverable(InSid) {
+  if (claudeLanes.isSessionBusy(InSid)) return false
+  if (isLiveInteractiveSession(InSid)) return ccmsgAvailable(InSid) || isMonitorAlive(InSid)
+  return true
+}
+
+async function resumeUsageInterrupt(InSid, InReason, InSwitchedTo = null) {
+  const _rec = usageInterrupts[InSid]
+  if (!_rec) return { ok: false, error: '沒有這筆中斷紀錄' }
+  const _cwd = _rec.cwd ?? sessions.get(InSid)?.cwd ?? null
+  if (!_cwd) return { ok: false, error: '不知道這個聊天室的專案路徑' }
+  if (!usageDeliverable(InSid)) return { ok: false, error: '分頁開著但投不進去（沒有直投登記也沒有活監看）——請直接在該分頁輸入「繼續」，避免另起無頭進程雙寫' }
+  let _res = null
+  try {
+    // 分頁開著、或有活監看／直投登記＝原地續接（2026-10-10 G1 開著分頁卻被寫成「無頭續接、不要掛監看」）
+    const _headless = !isLiveInteractiveSession(InSid) && !isMonitorAlive(InSid) && !ccmsgAvailable(InSid)
+    _res = (await app.inject({ method: 'POST', url: '/api/claude/run', payload: { projectPath: _cwd.replace(/\\/g, '/'), prompt: resumePrompt(_rec, new Date(), _headless, InSwitchedTo), sessionId: InSid } })).json()
+  } catch (e) { _res = { ok: false, error: String(e) } }
+  _rec.history = [...(_rec.history ?? []), { at: Date.now(), reason: InReason, ok: !!_res?.ok, delivered: _res?.delivered ?? (_res?.queued ? 'queued' : (_res?.ok ? 'spawn' : null)), error: _res?.error ?? null }].slice(-10)
+  if (_res?.ok) { _rec.status = 'resumed'; _rec.resumedAt = Date.now(); _rec.resumeVerified = false; _rec.notified = null }
+  saveUsageInterrupts()
+  logEvent('usage.resume', { sessionId: InSid, reason: InReason, ok: !!_res?.ok, delivered: _rec.history.at(-1).delivered, error: _res?.error ?? null })
+  emitLog(InSid, `[用量中斷] ${_res?.ok ? '已續接' : '續接失敗'}（${InReason === 'auto_switch' ? `換帳號後自動：${InSwitchedTo}` : InReason === 'auto' ? '自動' : '手動'}）${_res?.error ? `：${_res.error}` : ''}`, 'hook')
+  return _res ?? { ok: false }
+}
+
+// ─── 用量上限自動換帳號（第二階段，少爺 2026-10-10）────────────────────────────────
+// 所有聊天室共用 ~/.claude/.credentials.json：換掉這份檔＝全部聊天室同時換帳號，執行中的分頁不必重開
+// （2026-10-10 16:00 少爺手動切換後，從前一天就開著的進程直接用新帳號回覆＝總控實證）。
+// 保管庫 ~/.claude/tc_accounts/：accounts.json 只放帳號資料；<accountUuid>.credentials.json 放該帳號的登入（與原登入檔同在使用者目錄）。
+// 權杖絕不經 API 或介面送出。使用中帳號的登入檔一變動（權杖更新會輪替）就同步回保管庫——舊的更新權杖被再用一次，
+// 伺服器會把整個登入作廢（官方文件記載 v2.1.211 前兩個進程同時更新造成全部登出），所以保管庫必須永遠是最新那一份。
+// 純判斷在 accountVault.js，機檢 accountVault.check.mjs。
+const ACCOUNTS_DIR = path.join(CLAUDE_DIR, 'tc_accounts')
+const ACCOUNTS_INDEX_FILE = path.join(ACCOUNTS_DIR, 'accounts.json')
+const LIVE_CREDENTIALS_FILE = path.join(CLAUDE_DIR, '.credentials.json')
+const CLAUDE_JSON_FILE = path.join(os.homedir(), '.claude.json')
+const ACCOUNT_LOGIN_TIMEOUT_MS = 15 * 60 * 1000
+let accountState = loadAccountState()
+let accountLiveMtime = 0
+const accountLoginJobs = new Map()   // 登入工作 id → { proc, dir, output, url, status, error, accountUuid, startedAt }
+
+function loadAccountState() {
+  try {
+    const _s = JSON.parse(fs.readFileSync(ACCOUNTS_INDEX_FILE, 'utf-8'))
+    return { accounts: _s.accounts ?? {}, lastSwitchAt: _s.lastSwitchAt ?? 0, switches: _s.switches ?? [] }
+  } catch { return { accounts: {}, lastSwitchAt: 0, switches: [] } }
+}
+
+function saveAccountState() {
+  fs.mkdirSync(ACCOUNTS_DIR, { recursive: true })
+  atomicWriteJson(ACCOUNTS_INDEX_FILE, accountState)
+  broadcast({ type: 'accounts_update' })
+}
+
+function accountList() { return Object.values(accountState.accounts) }
+function accountCredFile(InUuid) { return path.join(ACCOUNTS_DIR, `${InUuid}.credentials.json`) }
+function readJsonFile(InPath) { try { return JSON.parse(fs.readFileSync(InPath, 'utf-8')) } catch { return null } }
+
+/** 原子寫入；InIndent＝0 寫成單行（登入檔原本就是單行） */
+function writeJsonAtomic(InPath, InData, InIndent = 0) {
+  const _tmp = `${InPath}.${crypto.randomUUID()}.tmp`
+  fs.writeFileSync(_tmp, InIndent ? JSON.stringify(InData, null, InIndent) : JSON.stringify(InData), 'utf-8')
+  fs.renameSync(_tmp, InPath)
+}
+
+/** 某份共用登入檔屬於保管庫裡哪個帳號：登入檔沒有組織 id（Claude Code 自己登入時）就看 ~/.claude.json 的帳號資料 */
+function matchLiveAccount(InLive) {
+  return matchAccountByCredentials(accountList(), InLive, InLive?.organizationUuid ? null : (readJsonFile(CLAUDE_JSON_FILE)?.oauthAccount ?? null))
+}
+
+/** 目前共用登入檔屬於保管庫裡哪個帳號（不在保管庫＝null） */
+function activeAccount() { return matchLiveAccount(readJsonFile(LIVE_CREDENTIALS_FILE)) }
+
+/** 某個時間點正在用的帳號：照切換紀錄回推（換帳號後才送到的舊帳號中斷，不能算到新帳號頭上） */
+function accountAt(InTs) {
+  const _sw = accountState.switches ?? []
+  const _before = [..._sw].reverse().find(s => s.at <= InTs)
+  if (_before) return accountState.accounts[_before.to] ?? null
+  const _after = _sw.find(s => s.at > InTs)
+  if (_after) return _after.from ? accountState.accounts[_after.from] ?? null : null
+  return activeAccount()
+}
+
+/** 中斷紀錄回寫帳號狀態：用量上限＝冷卻到重設；帳號不可用（帳務、停權、登入失效）＝停用、永不自動切過去 */
+function noteAccountFromInterrupt(InAccount, InRecord) {
+  if (!InAccount) return
+  if (InRecord.kind === 'usage_limit' && InRecord.resetAt) {
+    const _raise = raiseCooling(InAccount, InRecord.resetAt, InRecord.interruptedAt, InRecord.weekly)
+    if (_raise) {
+      Object.assign(InAccount, _raise)
+      saveAccountState()
+    }
+  } else if (InRecord.kind === 'account_unavailable' && !InAccount.disabled) {
+    InAccount.disabled = true
+    InAccount.disabledReason = `自動停用：${InRecord.error ?? '帳號不可用'}（${String(InRecord.text ?? '').slice(0, 80)}）`
+    InAccount.disabledAt = Date.now()
+    saveAccountState()
+    logEvent('account.disabled', { accountUuid: InAccount.accountUuid, error: InRecord.error })
+    if (InRecord.error === 'authentication_failed') revertSwitchIfFresh(InAccount.accountUuid)
+  }
+}
+
+/** 剛切過去的帳號登入失效＝保管的登入是死的：立刻換回原帳號，免得所有聊天室卡在死登入上（2026-10-12 19:59 事故） */
+function revertSwitchIfFresh(InFailedUuid) {
+  const _decision = decideRevert({ switches: accountState.switches, failedUuid: InFailedUuid, now: Date.now(), windowSec: AUTO_SWITCH_DEFAULTS.revertWindowSec, accounts: accountList() })
+  logEvent('account.revert_decision', { failedUuid: InFailedUuid, action: _decision.action, reason: _decision.reason, to: _decision.to ?? null })
+  if (_decision.action !== 'revert') return
+  const _r = switchAccount(_decision.to, 'revert')
+  emitLog(null, `[換帳號] 切過去的帳號登入失效 → ${_r.ok ? '已換回原帳號' : `換回失敗：${_r.error}`}`, 'hook')
+}
+
+/** 存一份登入進保管庫（加入帳號、匯入目前登入）；同一帳號再存＝更新並解除停用 */
+function storeAccount(InCredFile, InOauthAccount, InSource) {
+  if (!InCredFile?.claudeAiOauth?.refreshToken) throw new Error('登入資料不完整（沒有訂閱登入）')
+  const _rec = accountRecordFrom(InCredFile, InOauthAccount, Date.now())
+  if (!_rec.accountUuid || !_rec.organizationUuid) throw new Error('辨識不到帳號（缺帳號或組織 id）')
+  if (InOauthAccount?.organizationUuid && InOauthAccount.organizationUuid !== _rec.organizationUuid) throw new Error('登入檔與帳號資料不屬於同一個組織，拒絕存入')
+  fs.mkdirSync(ACCOUNTS_DIR, { recursive: true })
+  writeJsonAtomic(accountCredFile(_rec.accountUuid), { claudeAiOauth: InCredFile.claudeAiOauth, organizationUuid: _rec.organizationUuid, oauthAccount: InOauthAccount ?? null, savedAt: Date.now() })
+  const _prev = accountState.accounts[_rec.accountUuid]
+  accountState.accounts[_rec.accountUuid] = { ..._prev, ..._rec, addedAt: _prev?.addedAt ?? _rec.addedAt, source: _prev?.source ?? InSource, disabled: false, disabledReason: null, disabledAt: null }
+  saveAccountState()
+  logEvent('account.store', { accountUuid: _rec.accountUuid, source: InSource })
+  return accountState.accounts[_rec.accountUuid]
+}
+
+/** 匯入目前 VS Code 登入中的帳號（共用登入檔＋~/.claude.json 的帳號資料） */
+function importActiveAccount(InSource) {
+  const _live = readJsonFile(LIVE_CREDENTIALS_FILE)
+  const _oa = readJsonFile(CLAUDE_JSON_FILE)?.oauthAccount ?? null
+  if (!_live?.claudeAiOauth) throw new Error('目前沒有訂閱登入')
+  if (!_oa?.organizationUuid) throw new Error('~/.claude.json 沒有帳號資料，請稍後再試')
+  if (_live.organizationUuid && _oa.organizationUuid !== _live.organizationUuid) throw new Error('目前登入檔與 ~/.claude.json 的帳號資料對不上（可能正在切換），請稍後再試')
+  return storeAccount({ ..._live, organizationUuid: liveOrganizationUuid(_live, _oa) }, _oa, InSource)
+}
+
+/** 自動換帳號開著、或保管庫已有別的帳號時，目前登入的帳號若還不在保管庫就自動收進來（否則換走時它的登入會遺失） */
+function autoImportActiveAccount(InSwitchSettings) {
+  if (!InSwitchSettings.enabled && !accountList().length) return
+  const _live = readJsonFile(LIVE_CREDENTIALS_FILE)
+  if (!_live?.claudeAiOauth || matchLiveAccount(_live)) return
+  try { importActiveAccount('auto_import') } catch {}
+}
+
+/**
+ * 外部切換補記後回溯：切換點之後記到原帳號的中斷改歸新帳號，原帳號因此被調高的冷卻倒回、新帳號補上冷卻
+ * （2026-10-13 20:19 事故：外部切換晚了 55 分鐘才補記，sasocaptain 被標冷卻到 00:20，23:30 沒有帳號可換）
+ */
+function correctAttributionAfterExternalSwitch(InExt) {
+  const _moved = recordsToReattribute(Object.values(usageInterrupts), InExt)
+  for (const _r of _moved) _r.accountUuid = InExt.to
+  if (_moved.length) saveUsageInterrupts()
+  const _from = accountState.accounts[InExt.from]
+  const _roll = _from ? rollbackCoolingSince(_from, InExt.at) : null
+  if (_roll) {
+    Object.assign(_from, _roll)
+    saveAccountState()
+  }
+  const _to = accountState.accounts[InExt.to]
+  for (const _r of _moved) if (_r.kind === 'usage_limit') noteAccountFromInterrupt(_to, _r)
+  if (_moved.length || _roll) logEvent('account.reattribute', { from: InExt.from, to: InExt.to, since: InExt.at, moved: _moved.map(r => r.sessionId), fromCooling: _from?.coolingUntil ?? null, toCooling: _to?.coolingUntil ?? null })
+}
+
+/** 使用中帳號的登入檔變了（權杖更新輪替）→ 同步回保管庫 */
+function syncActiveCredentials() {
+  let _st
+  try { _st = fs.statSync(LIVE_CREDENTIALS_FILE) } catch { return }
+  if (_st.mtimeMs === accountLiveMtime) return
+  accountLiveMtime = _st.mtimeMs
+  const _live = readJsonFile(LIVE_CREDENTIALS_FILE)
+  const _acc = matchLiveAccount(_live)
+  // 登入檔在 TC 之外換了帳號 ⇒ 補一筆外部切換，中斷歸屬（accountAt）才不會算到錯的帳號
+  const _ext = detectExternalSwitch({ switches: accountState.switches, liveUuid: _acc?.accountUuid ?? null, at: Math.round(_st.mtimeMs), now: Date.now(), graceMs: (AUTO_SWITCH_DEFAULTS.verifyAfterSec + 10) * 1000 })
+  if (_ext) {
+    accountState.switches = [...(accountState.switches ?? []), _ext].slice(-50)
+    saveAccountState()
+    logEvent('account.switch', { from: _ext.from, to: _ext.to, reason: 'external' })
+    emitLog(null, `[換帳號] 登入檔在 TC 之外換成 ${_acc.email ?? _acc.displayName ?? _acc.accountUuid}（已補記，之後的中斷算到這個帳號）`, 'hook')
+    correctAttributionAfterExternalSwitch(_ext)
+  }
+  if (!_acc || !_live?.claudeAiOauth?.refreshToken) return
+  const _saved = readJsonFile(accountCredFile(_acc.accountUuid)) ?? {}
+  const _a = _saved.claudeAiOauth ?? {}
+  const _b = _live.claudeAiOauth
+  if (_a.refreshToken === _b.refreshToken && _a.accessToken === _b.accessToken) return
+  writeJsonAtomic(accountCredFile(_acc.accountUuid), { ..._saved, claudeAiOauth: _b, organizationUuid: _live.organizationUuid ?? _acc.organizationUuid, savedAt: Date.now() })
+  // 換了新的更新權杖＝重新登入過、登入是活的：之前因登入失效被自動停用的帳號解除停用
+  if (_acc.disabled && _a.refreshToken !== _b.refreshToken && String(_acc.disabledReason ?? '').includes('authentication_failed')) {
+    _acc.disabled = false
+    _acc.disabledReason = null
+    _acc.disabledAt = null
+    logEvent('account.reenabled', { accountUuid: _acc.accountUuid, reason: 'fresh_login' })
+  }
+  _acc.refreshTokenExpiresAt = _b.refreshTokenExpiresAt ?? _acc.refreshTokenExpiresAt
+  _acc.subscriptionType = _b.subscriptionType ?? _acc.subscriptionType
+  _acc.rateLimitTier = _b.rateLimitTier ?? _acc.rateLimitTier
+  saveAccountState()
+}
+
+/** 換帳號：目前帳號最新的登入先存回保管庫，再把目標帳號的登入寫進共用登入檔（保留 MCP 登入），並更新 ~/.claude.json 的帳號資料 */
+function switchAccount(InUuid, InReason) {
+  const _target = accountState.accounts[InUuid]
+  if (!_target) return { ok: false, error: '保管庫沒有這個帳號' }
+  const _saved = readJsonFile(accountCredFile(InUuid))
+  if (!_saved?.claudeAiOauth?.refreshToken) return { ok: false, error: '這個帳號的登入資料不見了，請重新加入帳號' }
+  accountLiveMtime = 0
+  syncActiveCredentials()
+  const _live = readJsonFile(LIVE_CREDENTIALS_FILE) ?? {}
+  let _from = matchLiveAccount(_live)
+  if (_from?.accountUuid === InUuid) return { ok: true, already: true }
+  if (!_from && _live.claudeAiOauth) {
+    try { _from = importActiveAccount('before_switch') }
+    catch (e) { return { ok: false, error: `目前登入的帳號不在保管庫、也收不進來（${e.message}），為免登入遺失不切換` } }
+  }
+  writeJsonAtomic(LIVE_CREDENTIALS_FILE, mergeCredentials(_live, _saved))
+  if (_saved.oauthAccount) {
+    const _cj = readJsonFile(CLAUDE_JSON_FILE)
+    if (_cj) { _cj.oauthAccount = _saved.oauthAccount; writeJsonAtomic(CLAUDE_JSON_FILE, _cj, 2) }
+  }
+  accountLiveMtime = 0
+  const _now = Date.now()
+  if (_from) _from.lastActiveAt = _now
+  _target.lastActiveAt = _now
+  accountState.lastSwitchAt = _now
+  accountState.switches = [...(accountState.switches ?? []), { at: _now, from: _from?.accountUuid ?? null, to: InUuid, reason: InReason }].slice(-50)
+  saveAccountState()
+  const _label = a => a ? (a.email ?? a.displayName ?? a.accountUuid) : '未知帳號'
+  logEvent('account.switch', { from: _from?.accountUuid ?? null, to: InUuid, reason: InReason })
+  emitLog(null, `[換帳號] ${_label(_from)} → ${_label(_target)}（${InReason === 'auto' ? '自動：原帳號冷卻或停用' : InReason === 'revert' ? '回退：切過去的登入失效' : '手動'}）`, 'hook')
+  broadcast({ type: 'account_switched', from: _from?.accountUuid ?? null, to: InUuid, reason: InReason })
+  setTimeout(() => verifyAccountSwitch(InUuid), AUTO_SWITCH_DEFAULTS.verifyAfterSec * 1000)
+  return { ok: true, from: _from?.accountUuid ?? null, to: InUuid }
+}
+
+/** 切換後確認共用登入檔沒被舊帳號寫回（剛好有進程在更新舊權杖時可能發生）；被寫回就再寫一次 */
+function verifyAccountSwitch(InUuid) {
+  const _live = readJsonFile(LIVE_CREDENTIALS_FILE)
+  const _now = matchLiveAccount(_live)
+  if (_now?.accountUuid === InUuid) return
+  const _last = (accountState.switches ?? []).at(-1)
+  if (_last?.to !== InUuid) return   // 之後又換過，不管
+  logEvent('account.switch_reverted', { expected: InUuid, found: _now?.accountUuid ?? null })
+  const _saved = readJsonFile(accountCredFile(InUuid))
+  if (_saved?.claudeAiOauth) { accountLiveMtime = 0; syncActiveCredentials(); writeJsonAtomic(LIVE_CREDENTIALS_FILE, mergeCredentials(readJsonFile(LIVE_CREDENTIALS_FILE) ?? {}, _saved)); accountLiveMtime = 0 }
+}
+
+/** 加入帳號：在臨時設定目錄跑官方 `claude auth login`（開瀏覽器登入），成功後把那份登入搬進保管庫、刪掉臨時目錄 */
+function startAccountLogin() {
+  const _id = `login-${Date.now()}`
+  const _dir = path.join(ACCOUNTS_DIR, _id)
+  fs.mkdirSync(_dir, { recursive: true })
+  const _env = { ...process.env, CLAUDE_CONFIG_DIR: _dir }
+  for (const k of ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN']) delete _env[k]
+  const _proc = spawn(getClaudeExe(), ['auth', 'login', '--claudeai'], { cwd: _dir, env: _env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+  const _job = { id: _id, dir: _dir, proc: _proc, output: '', url: null, status: 'waiting_browser', error: null, accountUuid: null, startedAt: Date.now() }
+  accountLoginJobs.set(_id, _job)
+  const _onData = d => { _job.output = (_job.output + d.toString()).slice(-8000); _job.url = _job.url ?? parseLoginUrl(_job.output); broadcast({ type: 'account_login_update', id: _id }) }
+  _proc.stdout.on('data', _onData)
+  _proc.stderr.on('data', _onData)
+  const _timer = setTimeout(() => { if (_job.status === 'waiting_browser') { _job.status = 'failed'; _job.error = '超過 15 分鐘沒完成登入'; try { _proc.kill() } catch {} } }, ACCOUNT_LOGIN_TIMEOUT_MS)
+  _proc.on('exit', (InCode) => {
+    clearTimeout(_timer)
+    if (_job.status === 'waiting_browser') {
+      if (InCode === 0) {
+        try {
+          const _acc = storeAccount(readJsonFile(path.join(_dir, '.credentials.json')), readJsonFile(path.join(_dir, '.claude.json'))?.oauthAccount ?? null, 'login')
+          _job.status = 'done'; _job.accountUuid = _acc.accountUuid
+        } catch (e) { _job.status = 'failed'; _job.error = e.message }
+      } else { _job.status = 'failed'; _job.error = _job.error ?? `登入程序結束（代碼 ${InCode}）` }
+    }
+    try { fs.rmSync(_dir, { recursive: true, force: true }) } catch {}
+    broadcast({ type: 'account_login_update', id: _id })
+  })
+  return _job
+}
+
+function loginJobView(InJob) {
+  return { id: InJob.id, status: InJob.status, url: InJob.url, error: InJob.error, accountUuid: InJob.accountUuid, startedAt: InJob.startedAt,
+    needsCode: /paste code/i.test(InJob.output) }
+}
+
+app.get('/api/accounts', async () => {
+  const _now = Date.now()
+  const _active = activeAccount()
+  return {
+    accounts: accountList().map(a => accountPublicView(a, _now, _active?.accountUuid ?? null)),
+    activeUuid: _active?.accountUuid ?? null,
+    liveInVault: !!_active,
+    settings: resolveAutoSwitchSettings(k => getTcSetting(k)),
+    lastSwitchAt: accountState.lastSwitchAt,
+    switches: (accountState.switches ?? []).slice(-10),
+  }
+})
+
+app.post('/api/accounts/import-current', async () => {
+  try { const _a = importActiveAccount('import'); return { ok: true, account: accountPublicView(_a, Date.now(), _a.accountUuid) } }
+  catch (e) { return { ok: false, error: e.message } }
+})
+
+app.post('/api/accounts/:uuid/switch', async (request) => switchAccount(request.params.uuid, 'manual'))
+
+app.post('/api/accounts/:uuid/disable', async (request) => {
+  const _a = accountState.accounts[request.params.uuid]
+  if (!_a) return { ok: false, error: '保管庫沒有這個帳號' }
+  _a.disabled = request.body?.disabled !== false
+  _a.disabledReason = _a.disabled ? (request.body?.reason ?? '手動停用') : null
+  _a.disabledAt = _a.disabled ? Date.now() : null
+  saveAccountState()
+  return { ok: true, disabled: _a.disabled }
+})
+
+app.post('/api/accounts/:uuid/clear-cooling', async (request) => {
+  const _a = accountState.accounts[request.params.uuid]
+  if (!_a) return { ok: false, error: '保管庫沒有這個帳號' }
+  _a.coolingUntil = null; _a.coolingWeekly = false
+  saveAccountState()
+  return { ok: true }
+})
+
+app.delete('/api/accounts/:uuid', async (request) => {
+  const _uuid = request.params.uuid
+  if (!accountState.accounts[_uuid]) return { ok: false, error: '保管庫沒有這個帳號' }
+  if (activeAccount()?.accountUuid === _uuid) return { ok: false, error: '使用中的帳號不能移除，請先切換到別的帳號' }
+  delete accountState.accounts[_uuid]
+  try { fs.rmSync(accountCredFile(_uuid), { force: true }) } catch {}
+  saveAccountState()
+  return { ok: true }
+})
+
+app.post('/api/accounts/login', async () => {
+  for (const j of accountLoginJobs.values()) if (j.status === 'waiting_browser') return { ok: true, job: loginJobView(j), reused: true }
+  try { return { ok: true, job: loginJobView(startAccountLogin()) } } catch (e) { return { ok: false, error: e.message } }
+})
+
+app.get('/api/accounts/login/:id', async (request) => {
+  const _j = accountLoginJobs.get(request.params.id)
+  return _j ? { ok: true, job: loginJobView(_j) } : { ok: false, error: '沒有這個登入工作' }
+})
+
+app.post('/api/accounts/login/:id/code', async (request) => {
+  const _j = accountLoginJobs.get(request.params.id)
+  if (!_j || _j.status !== 'waiting_browser') return { ok: false, error: '登入工作不在等待中' }
+  const _code = String(request.body?.code ?? '').trim()
+  if (!_code) return { ok: false, error: '沒有授權碼' }
+  try { _j.proc.stdin.write(`${_code}\n`) } catch (e) { return { ok: false, error: e.message } }
+  return { ok: true }
+})
+
+app.post('/api/accounts/login/:id/cancel', async (request) => {
+  const _j = accountLoginJobs.get(request.params.id)
+  if (!_j) return { ok: false, error: '沒有這個登入工作' }
+  if (_j.status === 'waiting_browser') { _j.status = 'cancelled'; try { _j.proc.kill() } catch {} }
+  return { ok: true }
+})
+
+async function usageInterruptTick() {
+  if (usageTickRunning) return
+  usageTickRunning = true
+  try {
+    try { scanTranscriptsForUsageLimits() } catch (e) { console.error('[usage scan]', e) }
+    try { dismissTcInternalInterrupts() } catch (e) { console.error('[usage internal]', e) }
+    const _settings = resolveAutoResumeSettings(k => getTcSetting(k))
+    const _now = Date.now()
+    try { checkResumeStalled(_now) } catch (e) { console.error('[usage stall]', e) }
+    // 第二階段：目前帳號在冷卻／停用且另一個帳號可用 ⇒ 換帳號（少爺定：不主動換回，只在中斷時檢查）
+    const _switchSettings = resolveAutoSwitchSettings(k => getTcSetting(k))
+    let _active = null
+    try {
+      syncActiveCredentials()
+      autoImportActiveAccount(_switchSettings)
+      _active = activeAccount()
+      const _sw = decideSwitch({ accounts: accountList(), activeUuid: _active?.accountUuid ?? null, now: _now, settings: _switchSettings, lastSwitchAt: accountState.lastSwitchAt })
+      if (_sw.action === 'switch') {
+        const _r = switchAccount(_sw.target.accountUuid, 'auto')
+        if (_r.ok) _active = accountState.accounts[_sw.target.accountUuid]
+      }
+    } catch (e) { console.error('[account switch]', e) }
+    // 登入失效的中斷：現在的登入屬於沒被停用的帳號＝聊天室能再跑，改回待續接（帳務、停權不在此列）
+    const _activeStatus = _active ? accountStatus(_active, _now) : null
+    let _recovered = 0
+    for (const _r of Object.values(usageInterrupts)) {
+      const _patch = recoverAuthFailedRecord(_r, _active, _activeStatus, _now)
+      if (!_patch) continue
+      Object.assign(_r, _patch)
+      _recovered++
+      logEvent('usage.recovered', { sessionId: _r.sessionId, from: 'authentication_failed', resetAt: _r.resetAt, activeUuid: _active?.accountUuid ?? null })
+    }
+    if (_recovered) saveUsageInterrupts()
+    const _activeOk = _switchSettings.enabled && !!_active && accountStatus(_active, _now) === 'available'
+    const _switchedLabel = _active ? (_active.email ?? _active.displayName ?? _active.accountUuid) : null
+    // 換帳號續接後又馬上撞上限的（isAutoSwitchThrashing）不再算「別的帳號撞的」，改等重設，免得來回空轉
+    const _isOtherAccount = r => _activeOk && !!r.accountUuid && r.accountUuid !== _active.accountUuid && !isAutoSwitchThrashing(r, _now)
+    // 目前帳號還在冷卻（屬於它的中斷有重設時間未到）＝這一輪不在它身上續接，避免一接又撞；別的帳號撞的、已換過來的不受影響
+    const _coolingUntil = Math.max(0, ...Object.values(usageInterrupts)
+      .filter(r => r.status === 'waiting' && r.kind === 'usage_limit' && !_isOtherAccount(r) && (r.resetAt ?? 0) + _settings.bufferSec * 1000 > _now)
+      .map(r => r.resetAt))
+    const _ready = []
+    let _changed = false
+    for (const _r of Object.values(usageInterrupts)) {
+      if (_r.status !== 'waiting') continue
+      const _switchedAway = _isOtherAccount(_r)
+      const _due = _switchedAway || _now >= (_r.resetAt ?? 0) + _settings.bufferSec * 1000
+      const _action = decideAction({ record: _r, now: _now, settings: _settings, resumedSelf: _due && usageResumedSelf(_r), deliverable: _due && usageDeliverable(_r.sessionId), switchedAway: _switchedAway })
+      if (_action === 'resolved_self') { _r.status = 'resolved'; _r.resolvedAt = _now; _changed = true; continue }
+      if (_action === 'resume') { if (_switchedAway || !_coolingUntil) _ready.push({ record: _r, switchedTo: _switchedAway ? _switchedLabel : null }); continue }
+      if (_action.startsWith('notify_') || _action === 'hold_quiet') {
+        if (_r.notified !== _action) {
+          _r.notified = _action
+          _changed = true
+          logEvent('usage.notify', { sessionId: _r.sessionId, action: _action })
+          broadcast({ type: 'usage_interrupt_notice', record: _r, notice: _action })
+        }
+      }
+    }
+    if (_changed) saveUsageInterrupts()
+    if (_ready.length && _now - usageLastBatchAt >= _settings.batchGapSec * 1000) {
+      usageLastBatchAt = _now
+      const _batch = pickBatch(_ready.map(x => ({ ...x.record, _switchedTo: x.switchedTo })), _settings.maxPerBatch)
+      for (const _r of _batch) await resumeUsageInterrupt(_r.sessionId, _r._switchedTo ? 'auto_switch' : 'auto', _r._switchedTo)
+    }
+  } finally { usageTickRunning = false }
+}
+
+app.post('/hook/StopFailure', async (request) => {
+  const e = request.body ?? {}
+  // 原文全量落檔：官方未記載訂閱用量上限是否報成 rate_limit，留證據供日後對照
+  try { fs.appendFileSync(STOPFAILURE_LOG_FILE, JSON.stringify({ ts: Date.now(), ...e }) + '\n') } catch {}
+  let _info = { sessionId: e.session_id, cwd: e.cwd, error: e.error, error_details: e.error_details, last_assistant_message: e.last_assistant_message, at: Date.now() }
+  const _p = e.transcript_path || (e.session_id ? findJsonlPath(e.session_id) : null)
+  const _tail = _p ? readTranscriptTail(_p) : null
+  const _last = _tail ? lastApiErrorOf(_tail.entries) : null
+  if (_last && Math.abs(_last.at - Date.now()) < 10 * 60 * 1000) {
+    _info = { ..._info, apiError: _last.apiError, text: _last.text, resetsAt: _last.resetsAt, rateLimitType: _last.rateLimitType, entrypoint: _last.entrypoint, at: _last.at }
+  }
+  const _rec = recordUsageInterrupt(_info, 'hook')
+  return { ok: true, kind: _rec?.kind ?? null }
+})
+
+app.get('/api/usage/interrupts', async () => ({
+  records: Object.values(usageInterrupts)
+    .sort((a, b) => (b.interruptedAt ?? 0) - (a.interruptedAt ?? 0))
+    .map(r => ({ ...r, title: getSessionDisplayTitle(r.sessionId) ?? r.name ?? null })),
+  settings: resolveAutoResumeSettings(k => getTcSetting(k)),
+}))
+
+app.post('/api/usage/interrupts/:sid/resume', async (request) => resumeUsageInterrupt(request.params.sid, 'manual'))
+
+app.post('/api/usage/interrupts/:sid/dismiss', async (request) => {
+  const _r = usageInterrupts[request.params.sid]
+  if (!_r) return { ok: false, error: '沒有這筆中斷紀錄' }
+  _r.status = 'dismissed'
+  _r.dismissedAt = Date.now()
+  saveUsageInterrupts()
+  return { ok: true }
+})
+
+app.post('/api/usage/interrupts/:sid/exclude', async (request) => {
+  const _r = usageInterrupts[request.params.sid]
+  if (!_r) return { ok: false, error: '沒有這筆中斷紀錄' }
+  _r.excluded = request.body?.excluded !== false
+  _r.notified = null
+  saveUsageInterrupts()
+  return { ok: true, excluded: _r.excluded }
+})
+
+setInterval(() => { usageInterruptTick().catch(e => console.error('[usage tick]', e)) }, USAGE_TICK_MS)
+// 啟動後立刻同步一次登入檔，不等第一輪定期檢查（重啟前後若在 TC 之外換了帳號，先補記，之後送到的中斷才算得對）
+setTimeout(() => { try { syncActiveCredentials() } catch (e) { console.error('[account sync]', e) } }, 0)
 
 await app.listen({ port: PORT, host: '0.0.0.0' })
 console.log(`TheClaudenental server running on http://localhost:${PORT}`)

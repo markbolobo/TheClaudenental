@@ -11,6 +11,8 @@ import {
 } from './chatSupport.jsx'
 import { WorkflowLauncher } from './WorkflowLauncher.jsx'
 import { PresentButton, usePresentation } from './PresentationView.jsx'
+import { CompanionPanel } from './CompanionPanel.jsx'
+import { AskPanel, AskToolUseCard } from './AskPanel.jsx'
 
 // Phase 7: 把訊息變成 TODO 卡（插單機制）
 function PinToTodoButton({ text, sessionId }) {
@@ -273,6 +275,8 @@ function ChatPanel({ streamEvents, chatInit, selectedId }) {
   const attachMenuRef = useRef(null)
   const [sessionId, setSessionId] = useState(null)
   const [messages, setMessages] = useState([])
+  // 🗣 陪聊顧問（少爺 2026-10-08）：獨立於本聊天室，先把推理想完整再送進來
+  const [showCompanion, setShowCompanion] = useState(false)
   // 互動式簡報（少爺 2026-07-21）：設定 mode=present 時新回覆完成自動演出；config 於 mount 讀一次
   //（分頁切換會 remount → 到規矩改完設定切回來即生效）
   const presentCfgRef = useRef(null)
@@ -759,7 +763,7 @@ function ChatPanel({ streamEvents, chatInit, selectedId }) {
     return () => document.removeEventListener('mousedown', handler)
   }, [showAttachMenu])
 
-  function clearChat() { setMessages([]); setSessionId(null) }
+  function clearChat() { setMessages([]); setSessionId(null); setShowCompanion(false) }
 
   return (
     <div className="flex flex-col h-full">
@@ -789,8 +793,21 @@ function ChatPanel({ streamEvents, chatInit, selectedId }) {
         {sessionId && (
           <span className="text-[9px] text-[var(--text-muted)] font-mono shrink-0">{sessionId.slice(0,8)}</span>
         )}
+        {sessionId && (
+          <button onClick={() => setShowCompanion(true)}
+            title="陪聊顧問：獨立於這個聊天室（不在它裡面跑），從標籤、最近對話、你糾正過的地方與相關聊天室快速切入你的思考點，先把推理補完整再送進來，省下事後修正的 prompt"
+            className="shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-[var(--gold)]/50 text-[var(--gold)] hover:bg-[var(--gold)]/10">🗣 陪聊</button>
+        )}
         <button onClick={clearChat} className="text-[9px] text-[var(--text-muted)] hover:text-[var(--text)] shrink-0">✕ clear</button>
       </div>
+      {showCompanion && sessionId && (
+        <CompanionPanel key={sessionId} scope="chat" refId={sessionId}
+          onClose={() => setShowCompanion(false)}
+          onDraftToChat={(InText) => {
+            setInput(prev => (prev.trim() ? `${prev.trimEnd()}\n\n${InText}` : InText))
+            setShowCompanion(false)
+          }} />
+      )}
 
       {/* Chat 搜尋框（對話內全文搜尋；有輸入時 render 全部 filter 結果） */}
       {messages.length > 30 && (
@@ -905,8 +922,10 @@ function ChatPanel({ streamEvents, chatInit, selectedId }) {
             )}
             {/* Thinking block — React state controlled，避免原生 details 在某些環境不展開 */}
             {m.role === 'thinking' && <ThinkingBlock text={m.text} fullMessage={m} />}
+            {/* 提問（AskUserQuestion）：顯示成題目卡；待答時下方的提問面板可直接作答 */}
+            {m.role === 'tool_use' && m.toolName === 'AskUserQuestion' && <AskToolUseCard input={m.input} />}
             {/* Tool use */}
-            {m.role === 'tool_use' && (
+            {m.role === 'tool_use' && m.toolName !== 'AskUserQuestion' && (
               <details className="border border-sky-700/40 rounded bg-sky-900/10 px-2 py-1">
                 <summary className="text-[9px] text-sky-400 cursor-pointer select-none">
                   <span className="uppercase tracking-widest">⚙ {m.toolName}</span>
@@ -965,6 +984,9 @@ function ChatPanel({ streamEvents, chatInit, selectedId }) {
 
       {/* Input area */}
       <div className="shrink-0 border-t border-[var(--border)] bg-[var(--surface)]">
+
+        {/* ❓ 提問面板（少爺 2026-10-08）：聊天室在等你回答 AskUserQuestion 時出現在輸入框上方，像 VS Code 一樣直接作答，右側附提問陪聊 */}
+        {sessionId && <AskPanel key={sessionId} sessionId={sessionId} />}
 
         {/* Workflow Launcher（心腹啟動器）— 抽出為 WorkflowLauncher.jsx 與侍酒師結帳區 / QA 留言列共用；
             CHAT 專屬的 請繼續 / FB 暫存 / 人脈盤查 pills 以 extraPills 傳入 */}

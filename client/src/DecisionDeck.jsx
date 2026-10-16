@@ -1,13 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useModelOptions, EFFORT_OPTIONS } from './modelOptions.js'
 import { confirmIfLiveInteractive, fetchLiveInteractiveIds } from './liveSessionGuard.js'
-import { loadDecisionDrafts, saveDecisionDrafts, isDraftAnswered, relationsOf } from './decisionSupport.js'
+import { loadDecisionDrafts, saveDecisionDrafts, isDraftAnswered, relationsOf, layerIcon, recommendedChoiceOf } from './decisionSupport.js'
+import { MotionPreview } from './MotionPreview.jsx'
 
 // ⬜ 待定奪面板（少爺 2026-09-29「待我定奪的項目都照 VS Code 這樣（原生的方式）」）
 // 仿 Claude Code 的 AskUserQuestion：上方分頁切題、選項＝標題＋說明、數字鍵直選、「其他」＝自由回覆想法。
 // 每題「💬 進一步說明」＝原文脈絡＋Claude 讀原檔與牽動檔整理的白話說明（server 快取，題目內容變了才重算）。
 // 送出＝server 把決定寫回原 md（harness 層）＋建待辦卡＋派子任務（資料維護＋後續實作，實作走 QA 閘門）。
 // API：/api/decisions/state｜explain｜submit（server/index.js「待定奪面板」段）；非元件共用在 decisionSupport.js。
+// QA 分頁共用同一個面板（少爺 2026-10-08「QA Run 待我定奪的互動方式與侍酒師的待定奪一樣的形式，統一設計」）：
+// 帶 qaRun＝送出後交給該 run 的綁定聊天室（寫成 run 的一則留言、走 QA 喚醒鏈）；
+// 侍酒師答到「掛在進行中 QA Run」的設計題時，預設也改交給那個 run 的聊天室，不另開子任務。
 
 const plain = (t) => <span className="whitespace-pre-wrap">{t}</span>
 const shortChip = (t) => { const s = String(t ?? '').replace(/[`*]/g, '').trim(); return s.length > 12 ? `${s.slice(0, 12)}…` : s }
@@ -30,11 +34,11 @@ function Radio({ on }) {
 }
 
 // rec＝{ tag, reason }：原文標的建議＝「建議」、進一步說明裡 Claude 的建議＝「Claude 建議」
-function OptionRow({ index, on, label, desc, extra, rec = null, onPick }) {
+function OptionRow({ index, on, label, desc, extra, rec = null, onPick, onPeek = null, peeking = false }) {
   return (
-    <div role="radio" aria-checked={on} tabIndex={0} onClick={onPick}
+    <div role="radio" aria-checked={on} tabIndex={0} onClick={onPick} onMouseEnter={onPeek ?? undefined} onFocus={onPeek ?? undefined}
       onKeyDown={e => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); onPick() } }}
-      className={`flex items-start gap-3 px-3 py-2 rounded-lg border cursor-pointer outline-none focus-visible:ring-1 focus-visible:ring-[var(--gold)]/60 ${on ? 'border-[var(--gold)]/60 bg-[var(--gold)]/10' : 'border-transparent hover:bg-white/5'}`}>
+      className={`flex items-start gap-3 px-3 py-2 rounded-lg border cursor-pointer outline-none focus-visible:ring-1 focus-visible:ring-[var(--gold)]/60 ${on ? 'border-[var(--gold)]/60 bg-[var(--gold)]/10' : peeking ? 'border-violet-400/40 bg-violet-500/5' : 'border-transparent hover:bg-white/5'}`}>
       <Radio on={on} />
       <div className="min-w-0 flex-1">
         <div className="text-[12px] text-[var(--text)] leading-snug">
@@ -54,6 +58,25 @@ function Sec({ icon, title, children }) {
     <div>
       <div className="text-[10px] text-sky-300/80 mb-0.5">{icon} {title}</div>
       <div className="text-[var(--text)] leading-relaxed">{children}</div>
+    </div>
+  )
+}
+
+// 🖼 示意框（少爺 2026-10-09「我喜歡 VS Code 用這種搭配視覺的方式，讓我更好理解討論的情境，我要 TC 的也有」）：
+// 仿 VS Code 提問的選項預覽——游標停在哪個選項就顯示哪張（沒停＝已選的、再來是建議的）。
+// 圖來源：條目的「示意 X」區塊（寫題的 Claude 畫的，md 是 SSOT）；沒有的話用「進一步說明」順便畫的示意。
+// 等寬字體優先挑中英 1:2 的（更紗黑體、細明體），中文字跟符號才對得齊。
+// 速度、延遲、時序的題另有 🎞 動態示意（少爺 2026-10-10，條目的 ```motion 區塊）：曲線＋播放頭＋畫面模擬，見 MotionPreview.jsx。
+const PREVIEW_FONT = "'Sarasa Mono TC', 'Sarasa Term TC', 'MingLiU', 'MS Gothic', ui-monospace, monospace"
+function PreviewPane({ title, text, motion, fromExplain }) {
+  return (
+    <div className="rounded-lg border border-violet-500/40 bg-violet-500/10 p-2.5 min-w-0 self-start space-y-2">
+      <div className="text-[10px] text-violet-200 flex items-center gap-1.5">
+        <span>{motion ? '🎞' : '🖼'} {title}</span>
+        {fromExplain && <span className="text-[9px] text-[var(--text-muted)]">（Claude 依說明畫的示意）</span>}
+      </div>
+      {motion && <MotionPreview text={motion} />}
+      {text && <pre className="text-[11px] leading-snug text-[var(--text)] whitespace-pre overflow-x-auto" style={{ fontFamily: PREVIEW_FONT }}>{text}</pre>}
     </div>
   )
 }
@@ -124,7 +147,7 @@ function RelChips({ nodes, onJump }) {
     <button key={n.key} onClick={() => onJump(n)}
       title={`${n.sourceTitle} · ${n.openId} ${n.question}${n.resolved ? `\n${n.resolvedBy === 'derived' ? '推導定' : '已定'}：${n.resolution}` : ''}`}
       className={`text-[10px] px-1.5 py-0.5 rounded border ${n.resolved ? 'border-emerald-500/40 text-emerald-300/90' : 'border-[var(--border)] text-[var(--text)] hover:border-[var(--gold)]/60'}`}>
-      {n.resolved ? (n.resolvedBy === 'derived' ? '🧩' : '✓') : '○'} {n.layer === 'intent' ? '🧭' : '🎬'} {shortChip(n.question)}
+      {n.resolved ? (n.resolvedBy === 'derived' ? '🧩' : '✓') : '○'} {layerIcon(n.layer)} {shortChip(n.question)}
     </button>
   ))
 }
@@ -203,7 +226,7 @@ export function DerivedReview({ items, projectId, rich = plain, onJumpToSource =
           {list.map(x => (
             <div key={x.key} className="rounded border border-sky-500/20 px-2 py-1.5 text-[11px] space-y-0.5">
               <div className="flex items-center gap-1.5 flex-wrap text-[10px] text-[var(--text-muted)]">
-                <button onClick={() => onJumpToSource?.(x)} className="text-[var(--gold)]/80 hover:text-[var(--gold)]">{x.layer === 'intent' ? '🧭' : '🎬'} {x.sourceTitle}</button>
+                <button onClick={() => onJumpToSource?.(x)} className="text-[var(--gold)]/80 hover:text-[var(--gold)]">{layerIcon(x.layer)} {x.sourceTitle}</button>
                 <span className="px-1 rounded bg-sky-500/20 text-sky-300">{x.d.id}</span>
                 {x.d.resolvedAt && <span>推導於 {x.d.resolvedAt}</span>}
               </div>
@@ -241,8 +264,11 @@ export function DecisionViewToggle({ view, onChange }) {
   return <div className="inline-flex rounded border border-[var(--border)] overflow-hidden text-[10px] shrink-0">{_btn('deck', '🗳 定奪面板')}{_btn('list', '📋 清單')}</div>
 }
 
-export function DecisionDeck({ items, projectId, rich = plain, onJumpToSource = null, onGoToChat = null, onReload = null, showSource = true }) {
+export function DecisionDeck({ items, projectId, rich = plain, onJumpToSource = null, onGoToChat = null, onReload = null, showSource = true, qaRun = null }) {
   const MODEL_OPTIONS = useModelOptions()
+  // QA 模式的模型／強度／聯動跟 QA 留言列共用同一組記憶（同一個 run、同一個綁定聊天室）
+  const _modelKey = qaRun ? 'tc_qa_model' : 'tc_decision_model'
+  const _effortKey = qaRun ? 'tc_qa_effort' : 'tc_decision_effort'
   const [idx, setIdx] = useState(0)
   const [collapsed, setCollapsed] = useState(false)
   const [drafts, setDrafts] = useState(loadDecisionDrafts)
@@ -250,10 +276,11 @@ export function DecisionDeck({ items, projectId, rich = plain, onJumpToSource = 
   const [sent, setSent] = useState({})
   const [seenItems, setSeenItems] = useState(items)
   if (items !== seenItems) { setSeenItems(items); setSent({}) }
-  const [deckState, setDeckState] = useState({ explanations: {}, dispatches: {}, explainModel: '' })
+  const [deckState, setDeckState] = useState({ explanations: {}, dispatches: {}, explainModel: '', qaLinks: {} })
   const [reloadTick, setReloadTick] = useState(0)
   const [explainOpen, setExplainOpen] = useState(false)
   const [rawOpen, setRawOpen] = useState(false)
+  const [peek, setPeek] = useState(null)   // { q: 題目 key, c: 選項 key }：游標停著的選項（示意框跟著它；換題自動失效）
   const [busy, setBusy] = useState({})
   const [errs, setErrs] = useState({})
   const [sending, setSending] = useState(false)
@@ -264,24 +291,28 @@ export function DecisionDeck({ items, projectId, rich = plain, onJumpToSource = 
   const [targetSid, setTargetSid] = useState('')
   const [sessions, setSessions] = useState([])
   const [liveIds, setLiveIds] = useState(() => new Set())
-  const [model, setModel] = useState(() => localStorage.getItem('tc_decision_model') ?? '')
-  const [effort, setEffort] = useState(() => localStorage.getItem('tc_decision_effort') ?? '')
+  const [model, setModel] = useState(() => localStorage.getItem(_modelKey) ?? '')
+  const [effort, setEffort] = useState(() => localStorage.getItem(_effortKey) ?? '')
+  const [inPlaceLink, setInPlaceLink] = useState(() => localStorage.getItem('tc_qa_inplace_link') !== '0')
+  const [routeQa, setRouteQa] = useState(true)
   const stripRef = useRef(null)
   const replyRef = useRef(null)
 
   useEffect(() => { saveDecisionDrafts(drafts) }, [drafts])
-  useEffect(() => { try { localStorage.setItem('tc_decision_model', model) } catch { /* 無痕視窗 */ } }, [model])
-  useEffect(() => { try { localStorage.setItem('tc_decision_effort', effort) } catch { /* 無痕視窗 */ } }, [effort])
+  useEffect(() => { try { localStorage.setItem(_modelKey, model) } catch { /* 無痕視窗 */ } }, [model, _modelKey])
+  useEffect(() => { try { localStorage.setItem(_effortKey, effort) } catch { /* 無痕視窗 */ } }, [effort, _effortKey])
+  useEffect(() => { if (qaRun) { try { localStorage.setItem('tc_qa_inplace_link', inPlaceLink ? '1' : '0') } catch { /* 無痕視窗 */ } } }, [inPlaceLink, qaRun])
 
-  // 面板狀態（說明快取＋每題最近派出的子任務）：開啟時抓一次；子任務綁定／侍酒師刷新時重抓
+  // 面板狀態（說明快取＋每題最近派出的子任務＋掛著該題的 QA Run）：開啟時抓一次；子任務綁定／侍酒師刷新時重抓
+  const _qaRunId = qaRun?.id ?? null
   useEffect(() => {
     if (!projectId) return
     let alive = true
-    fetch(`/api/decisions/state/${projectId}`).then(r => r.json())
-      .then(d => { if (alive && d.ok) setDeckState({ explanations: d.explanations ?? {}, dispatches: d.dispatches ?? {}, explainModel: d.explainModel ?? '', graph: d.graph ?? null }) })
+    fetch(`/api/decisions/state/${projectId}${_qaRunId ? `?qaRun=${_qaRunId}` : ''}`).then(r => r.json())
+      .then(d => { if (alive && d.ok) setDeckState({ explanations: d.explanations ?? {}, dispatches: d.dispatches ?? {}, explainModel: d.explainModel ?? '', graph: d.graph ?? null, qaLinks: d.qaLinks ?? {} }) })
       .catch(() => {})
     return () => { alive = false }
-  }, [projectId, reloadTick])
+  }, [projectId, reloadTick, _qaRunId])
   useEffect(() => {
     const onEvt = (e) => { if (!e.detail?.projectId || e.detail.projectId === projectId) setReloadTick(t => t + 1) }
     window.addEventListener('tc-decision-dispatch-update', onEvt)
@@ -309,15 +340,39 @@ export function DecisionDeck({ items, projectId, rich = plain, onJumpToSource = 
   const choicesOf = (it) => {
     if (it.d.choices?.length) return it.d.choices
     // 原文沒列選項：用「進一步說明」整理出的方案當選項
-    return (deckState.explanations[it.key]?.options ?? []).map(o => ({ key: o.key, label: o.label, text: o.label, desc: '', derived: true }))
+    return (deckState.explanations[it.key]?.options ?? []).map(o => ({ key: o.key, label: o.label, text: o.label, desc: '', derived: true, preview: o.preview || '', motion: o.motion || '' }))
   }
   const exp = cur ? deckState.explanations[cur.key] ?? null : null
   const expOpt = (k) => exp?.options?.find(o => o.key === k) ?? null
   const choices = cur ? choicesOf(cur) : []
   const draft = cur ? drafts[cur.key] ?? null : null
+  // 🖼 示意／🎞 動態示意：條目自帶的優先（靜態與動態可以並存），沒有才用說明畫的；
+  // 顯示「游標停的 → 已選的 → 建議的 → 第一張有圖的」
+  const previewOf = (c) => {
+    if (c.preview || c.motion) return { text: c.preview || '', motion: c.motion || '', fromExplain: false }
+    const _e = expOpt(c.key)
+    return _e?.preview || _e?.motion ? { text: _e.preview || '', motion: _e.motion || '', fromExplain: true } : null
+  }
+  const hasOptionPreview = choices.some(c => previewOf(c))
+  const peekKey = cur && peek?.q === cur.key ? peek.c : null
+  const _peekChoice = [peekKey, draft?.kind === 'choose' ? draft.choiceKey : null, recommendedChoiceOf(choices, cur?.d)?.key]
+    .map(k => choices.find(c => c.key === k)).find(c => c && previewOf(c)) ?? choices.find(c => previewOf(c)) ?? null
+  const shownPreview = _peekChoice ? { title: `${_peekChoice.key}. ${_peekChoice.label}`, ...previewOf(_peekChoice) }
+    : cur?.d.preview || cur?.d.motion ? { title: '整題示意', text: cur.d.preview || '', motion: cur.d.motion || '', fromExplain: false } : null
   const answeredItems = visible.filter(x => !sent[x.key] && isDraftAnswered(drafts[x.key]))
   const disp = cur ? deckState.dispatches[cur.key] ?? null : null
   const lastDispatchSid = Object.values(deckState.dispatches).filter(x => x.sessionId).sort((a, b) => b.ts - a.ts)[0]?.sessionId ?? null
+  // 侍酒師：這題掛在哪個進行中的 QA Run（送出時改交給那個 run 的聊天室）
+  const qaLinksOf = (it) => (qaRun ? [] : deckState.qaLinks?.[it.key] ?? [])
+  const curQaLinks = cur ? qaLinksOf(cur) : []
+  const answeredQaLinked = answeredItems.filter(x => qaLinksOf(x).length)
+  // 「其餘照建議」：還沒作答、而且原文有標建議選項的題（只填草稿，送出前都還能改）
+  const recommendFillable = visible.filter(x => !sent[x.key] && !isDraftAnswered(drafts[x.key]) && recommendedChoiceOf(choicesOf(x), x.d))
+  const fillRecommended = () => setDrafts(p => {
+    const n = { ...p }
+    for (const x of recommendFillable) n[x.key] = { kind: 'choose', choiceKey: recommendedChoiceOf(choicesOf(x), x.d).key, ts: Date.now() }
+    return n
+  })
 
   const patchDraft = (key, patch) => setDrafts(p => ({ ...p, [key]: { ...(p[key] ?? {}), ...patch, ts: Date.now() } }))
   const clearDraft = (key) => setDrafts(p => { const n = { ...p }; delete n[key]; return n })
@@ -336,7 +391,7 @@ export function DecisionDeck({ items, projectId, rich = plain, onJumpToSource = 
     try {
       const r = await fetch('/api/decisions/explain', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectId, layer: it.layer, sourceId: it.sourceId, file: it.file, openId: it.d.id, force: !!force }),
+        body: JSON.stringify({ projectId, layer: it.layer, sourceId: it.sourceId, file: it.file, openId: it.d.id, force: !!force, runId: _qaRunId }),
       }).then(res => res.json())
       if (r.ok) setDeckState(s => ({ ...s, explanations: { ...s.explanations, [it.key]: r.explanation } }))
       else setErrs(m => ({ ...m, [it.key]: r.error ?? '說明產生失敗' }))
@@ -359,7 +414,10 @@ export function DecisionDeck({ items, projectId, rich = plain, onJumpToSource = 
 
   const submit = async () => {
     if (!answeredItems.length || sending) return
-    if (dispatchOn && target === 'session') {
+    // QA 模式：run 是無頭喚醒但綁著活的 VS Code 分頁＝錯配，跟 QA 留言同一道確認
+    if (qaRun?.wakeMode === 'spawn' && qaRun.boundSessionId && inPlaceLink)
+      if (!(await confirmIfLiveInteractive(qaRun.boundSessionId, '無頭喚醒'))) return
+    if (!qaRun && dispatchOn && target === 'session') {
       if (!targetSid) { setBanner({ ok: false, error: '先選要送入的聊天室' }); return }
       // 目標分頁的監看活著＝原地聯動投遞（不會雙寫）；沒掛才需要「活分頁無頭送入」的警示
       const _alive = await fetch(`/api/qa/monitor-status?session=${targetSid}`).then(r => r.json()).then(d => !!d.alive).catch(() => false)
@@ -379,7 +437,9 @@ export function DecisionDeck({ items, projectId, rich = plain, onJumpToSource = 
     try {
       const r = await fetch('/api/decisions/submit', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectId, answers, dispatch: { enabled: dispatchOn, target, sessionId: target === 'session' ? targetSid : null, model: model || null, effort: effort || null, qaForImpl } }),
+        body: JSON.stringify({ projectId, answers, dispatch: qaRun
+          ? { enabled: true, target: 'qa', runId: qaRun.id, model: model || null, effort: effort || null, inPlaceLink }
+          : { enabled: dispatchOn, target, sessionId: target === 'session' ? targetSid : null, model: model || null, effort: effort || null, qaForImpl, routeQa } }),
       }).then(res => res.json())
       const _okKeys = new Set((r.results ?? []).filter(x => x.ok).map(x => x.key))
       const _bad = (r.results ?? []).filter(x => !x.ok)
@@ -390,6 +450,7 @@ export function DecisionDeck({ items, projectId, rich = plain, onJumpToSource = 
       setBanner({
         ok: !!r.ok && !_bad.length && !r.dispatchError, written: r.written ?? 0, dispatched: !!r.dispatched, card: r.card ?? null,
         run: r.run ?? null, projectRoot: r.projectRoot ?? '', firstKey: answers.find(a => _okKeys.has(a.key))?.key ?? null,
+        qaDelivered: (r.qaDelivered ?? []).filter(x => x.ok),
         errors: _bad.map(b => `${b.openId}（${b.file}）：${b.error}`), stale: _bad.some(b => b.stale),
         error: r.ok ? (r.dispatchError ?? null) : (r.error ?? '送出失敗'),
       })
@@ -422,7 +483,7 @@ export function DecisionDeck({ items, projectId, rich = plain, onJumpToSource = 
   const curRel = cur ? rel(cur.key) : null
   const thread = cur ? [...(cur.d.thread ?? []), ...(sent[cur.key]?.kind === 'reply' ? [{ who: 'owner', at: '剛剛', text: sent[cur.key].text }] : [])] : []
   const awaitingClaude = !!cur && (cur.d.awaiting === 'claude' || sent[cur.key]?.kind === 'reply')
-  const goChat = (InSid) => onGoToChat?.({ sessionId: InSid ?? null, projectPath: banner?.projectRoot || 'C:/Project/RomanPrototype' })
+  const goChat = (InSid, InPath = null) => onGoToChat?.({ sessionId: InSid ?? null, projectPath: InPath || qaRun?.boundProjectPath || banner?.projectRoot || 'C:/Project/RomanPrototype' })
 
   return (
     <div tabIndex={-1} onKeyDown={onKeyDown} className="rounded-xl border border-[var(--gold)]/35 bg-[var(--surface)] shadow-lg outline-none">
@@ -447,16 +508,20 @@ export function DecisionDeck({ items, projectId, rich = plain, onJumpToSource = 
         <div className="px-4 pt-3 pb-2 space-y-3">
           <div className="flex items-center gap-2 flex-wrap text-[10px] text-[var(--text-muted)]">
             {showSource && (onJumpToSource
-              ? <button onClick={() => onJumpToSource(cur)} className="text-[var(--gold)]/80 hover:text-[var(--gold)]" title="到這題所在的頁面">{cur.layer === 'intent' ? '🧭' : '🎬'} {cur.sourceTitle}</button>
-              : <span>{cur.layer === 'intent' ? '🧭' : '🎬'} {cur.sourceTitle}</span>)}
+              ? <button onClick={() => onJumpToSource(cur)} className="text-[var(--gold)]/80 hover:text-[var(--gold)]" title="到這題所在的頁面">{layerIcon(cur.layer)} {cur.sourceTitle}</button>
+              : <span>{layerIcon(cur.layer)} {cur.sourceTitle}</span>)}
             <span className="px-1.5 py-0.5 rounded bg-amber-400/20 text-amber-300">{cur.d.id}</span>
             {cur.d.raised && <span>提出 {cur.d.raised}</span>}
             {disp && (
-              <button onClick={() => goChat(disp.sessionId)} title={disp.cardId ? `待辦卡 ${disp.cardId}` : undefined}
+              <button onClick={() => goChat(disp.sessionId)} title={disp.cardId ? `待辦卡 ${disp.cardId}` : disp.runId ? `QA Run ${disp.runId}` : undefined}
                 className={`px-1.5 py-0.5 rounded border ${disp.running ? 'border-sky-500/50 text-sky-300 animate-pulse' : 'border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)]'}`}>
-                🛠 子任務{disp.running ? '處理中' : '已派出'} · {fmtTime(disp.ts)}
+                {disp.target === 'qa' ? '🧪 已送交 QA Run' : `🛠 子任務${disp.running ? '處理中' : '已派出'}`} · {fmtTime(disp.ts)}
               </button>
             )}
+            {curQaLinks.map(l => (
+              <span key={l.runId} title={`這題掛在進行中的 QA Run「${l.topic}」：送出後交給該 run 的聊天室處理`}
+                className="px-1.5 py-0.5 rounded border border-emerald-500/40 text-emerald-300/90 max-w-[260px] truncate">🧪 QA Run：{l.topic}</span>
+            ))}
           </div>
 
           <div className="text-[15px] leading-snug text-[var(--text)]">{rich(cur.d.question ?? cur.d.title)}</div>
@@ -499,18 +564,22 @@ export function DecisionDeck({ items, projectId, rich = plain, onJumpToSource = 
             </div>
           )}
 
-          <div role="radiogroup" className="space-y-0.5">
+          {/* 選項＋🖼 示意框：有示意時寬螢幕左右並排、窄螢幕示意在下（同 VS Code 提問的預覽版面） */}
+          <div className={shownPreview ? 'grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]' : ''}>
+          <div role="radiogroup" className="space-y-0.5 min-w-0" onMouseLeave={() => setPeek(null)}>
             {choices.map((c, i) => {
               const _exp = explainOpen ? expOpt(c.key) : null
               const _claudeRec = explainOpen && exp?.recommend?.key === c.key ? exp.recommend.reason : null
               const _rec = c.recommended ? { tag: '建議', reason: _claudeRec ?? recommendReasonOf(cur.d, c.key) }
                 : _claudeRec !== null ? { tag: 'Claude 建議', reason: _claudeRec } : null
+              const _hasPv = !!previewOf(c)
               return (
                 <OptionRow key={c.key} index={i + 1} on={draft?.kind === 'choose' && draft.choiceKey === c.key}
-                  label={<><span className="text-[var(--text-muted)] mr-1">{c.key}.</span>{rich(c.label)}</>}
+                  label={<><span className="text-[var(--text-muted)] mr-1">{c.key}.</span>{rich(c.label)}{_hasPv && <span className="ml-1 text-[9px] text-violet-300/80" title={previewOf(c).motion ? '這個選項有動態示意（停在這裡看速度感）' : '這個選項有示意圖'}>{previewOf(c).motion ? '🎞' : '🖼'}</span>}</>}
                   desc={c.desc ? rich(c.desc) : null}
                   extra={_exp?.experience ? <div className="text-[10px] text-sky-300/80 mt-0.5">🎮 {rich(_exp.experience)}</div> : null}
-                  rec={_rec} onPick={() => pick(c)} />
+                  rec={_rec} onPick={() => pick(c)}
+                  onPeek={_hasPv ? () => setPeek({ q: cur.key, c: c.key }) : null} peeking={shownPreview && _peekChoice?.key === c.key} />
               )
             })}
             {choices.length === 0 && (
@@ -518,6 +587,8 @@ export function DecisionDeck({ items, projectId, rich = plain, onJumpToSource = 
             )}
             <OptionRow index={choices.length + 1} on={draft?.kind === 'reply'} label="其他——寫下你的想法"
               desc="不必從選項挑；送出後 Claude 會判斷能不能直接定案，不夠就在這題下回覆或追問你" onPick={pickOther} />
+          </div>
+          {shownPreview && <PreviewPane title={shownPreview.title} text={shownPreview.text} motion={shownPreview.motion} fromExplain={shownPreview.fromExplain} />}
           </div>
           {draft?.kind === 'reply' && (
             <textarea ref={replyRef} value={draft.text ?? ''} onChange={e => patchDraft(cur.key, { text: e.target.value })} rows={3}
@@ -535,6 +606,14 @@ export function DecisionDeck({ items, projectId, rich = plain, onJumpToSource = 
               className={`text-[11px] px-2.5 py-1 rounded border ${explainOpen ? 'border-sky-500/60 text-sky-300 bg-sky-500/10' : 'border-sky-500/30 text-sky-300/80 hover:bg-sky-500/10'}`}>
               💬 進一步說明{exp && !exp.stale ? ' ✓' : ''}
             </button>
+            {/* 條目沒附示意、說明也還沒畫：一鍵請 Claude 畫（走進一步說明，已有說明但沒圖＝重畫） */}
+            {choices.length > 0 && !hasOptionPreview && !cur.d.preview && !cur.d.motion && (
+              <button onClick={() => requestExplain(cur, !!exp)} disabled={!!busy[cur.key]}
+                title="讓 Claude 讀原檔與牽動的機制，替每個選項畫一張示意（同進一步說明，約 30–60 秒，畫好會記住）"
+                className="text-[11px] px-2.5 py-1 rounded border border-violet-500/40 text-violet-300 hover:bg-violet-500/10">
+                {busy[cur.key] ? '🖼 示意繪製中…' : '🖼 畫示意'}
+              </button>
+            )}
             <button onClick={() => setRawOpen(v => !v)}
               className={`text-[11px] px-2.5 py-1 rounded border ${rawOpen ? 'border-[var(--gold)]/50 text-[var(--gold)]' : 'border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text)]'}`}>🧾 原文</button>
             {draft && <button onClick={() => clearDraft(cur.key)} className="text-[10px] text-[var(--text-muted)] hover:text-red-300">清除作答</button>}
@@ -548,11 +627,36 @@ export function DecisionDeck({ items, projectId, rich = plain, onJumpToSource = 
 
       {!collapsed && (
         <div className="border-t border-[var(--border)] px-4 py-2.5 space-y-2 rounded-b-xl bg-black/10">
+          {qaRun ? (
+            // QA 模式：處理後續的就是這個 run 的綁定聊天室（不另開子任務）；模型／強度／聯動跟 QA 留言列同一組
+            <div className="flex items-center gap-x-3 gap-y-1.5 flex-wrap text-[10px] text-[var(--text-muted)]">
+              <span title="TC 先把決定寫回原檔（計畫書／意圖檔／情境檔），再寫成這個 run 的一則留言、喚醒綁定聊天室做後續：資料維護、連動題推導、依定案推進計畫">
+                送出後交給本 Run 的聊天室{qaRun.boundSessionId ? `（${qaRun.boundSessionId.slice(0, 8)}）` : '（尚未綁定：TC 會開新聊天室接手並綁回）'}
+              </span>
+              <label className="flex items-center gap-1 cursor-pointer select-none" title={inPlaceLink ? '原地聯動：優先送進開著的 VS Code 分頁當場處理' : '已關閉聯動：本次強制走無頭進程，不佔用分頁'}>
+                <input type="checkbox" checked={inPlaceLink} onChange={e => setInPlaceLink(e.target.checked)} className="accent-[var(--gold)] w-3 h-3" />
+                🔗 聯動
+              </label>
+              <select value={model} onChange={e => setModel(e.target.value)} className={SMALL_SELECT} title="喚醒 Claude 時使用的 AI 模型（與 QA 留言列共用）">
+                {MODEL_OPTIONS.map(o => <option key={o.value} value={o.value} title={o.title} disabled={o.disabled}>{o.label}</option>)}
+              </select>
+              <select value={effort} onChange={e => setEffort(e.target.value)} className={SMALL_SELECT} title="模型強度（與 QA 留言列共用）">
+                {EFFORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+              </select>
+            </div>
+          ) : (
           <div className="flex items-center gap-x-3 gap-y-1.5 flex-wrap text-[10px] text-[var(--text-muted)]">
             <label className="flex items-center gap-1 cursor-pointer select-none" title="TC 先把決定寫回原檔；勾選時再開一個 Claude 子任務做後續：落成不變量／情境標記、牽動檔同步、機檢、需要時實作">
               <input type="checkbox" checked={dispatchOn} onChange={e => setDispatchOn(e.target.checked)} className="accent-[var(--gold)] w-3 h-3" />
               送出後派子任務處理後續（資料維護＋實作）
             </label>
+            {dispatchOn && answeredQaLinked.length > 0 && (
+              <label className="flex items-center gap-1 cursor-pointer select-none text-emerald-300/90"
+                title={`這些題掛在進行中的 QA Run，負責實作的是那個 run 的聊天室：${[...new Set(answeredQaLinked.flatMap(x => qaLinksOf(x).map(l => l.topic)))].join('、')}`}>
+                <input type="checkbox" checked={routeQa} onChange={e => setRouteQa(e.target.checked)} className="accent-[var(--gold)] w-3 h-3" />
+                🧪 其中 {answeredQaLinked.length} 筆屬於進行中的 QA Run → 交給該 Run 的聊天室
+              </label>
+            )}
             {dispatchOn && (
               <>
                 <label className="flex items-center gap-1 cursor-pointer select-none" title="有實作的項目開 Mode C QA Run、計畫等你確認才編譯；沒勾＝實作前先在聊天室回報計畫">
@@ -581,26 +685,37 @@ export function DecisionDeck({ items, projectId, rich = plain, onJumpToSource = 
               </>
             )}
           </div>
+          )}
           <div className="flex items-center gap-3">
             <button onClick={submit} disabled={!answeredItems.length || sending}
               className={`px-4 py-1.5 rounded-lg border text-[12px] ${answeredItems.length && !sending ? 'border-[var(--gold)]/70 text-[var(--gold)] bg-[var(--gold)]/10 hover:bg-[var(--gold)]/20' : 'border-[var(--border)] text-[var(--text-muted)] cursor-not-allowed'}`}>
               {sending ? '送出中…' : `✅ 送出 ${answeredItems.length} 筆定奪`}
             </button>
             <span className="text-[10px] text-[var(--text-muted)]">已答 {answeredItems.length} / {visible.length}</span>
+            {recommendFillable.length > 0 && (
+              <button onClick={fillRecommended} title="還沒作答、而且原文有標建議的題，一次選成建議選項（只填作答，送出前都還能改）"
+                className="text-[10px] px-2 py-0.5 rounded border border-[var(--gold)]/40 text-[var(--gold)]/90 hover:bg-[var(--gold)]/10">✨ 其餘照建議（{recommendFillable.length} 題）</button>
+            )}
             <span className="flex-1" />
             <span className="text-[9px] text-[var(--text-muted)] hidden md:inline">←→ 換題 · 1–9 選 · E 說明 · Ctrl+Enter 送出</span>
           </div>
           {banner && (
             <div className={`text-[11px] rounded px-2.5 py-1.5 border space-y-0.5 ${banner.ok ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200' : 'border-amber-500/40 bg-amber-500/10 text-amber-100'}`}>
               {banner.written > 0 && (
-                <div>✅ 已寫回 {banner.written} 筆到原檔{banner.dispatched ? `，子任務已派出${banner.card ? `（待辦卡「${banner.card.title}」）` : ''}` : '（沒有派子任務）'}；侍酒師正在重新萃取。</div>
+                <div>✅ 已寫回 {banner.written} 筆到原檔{banner.card ? `，子任務已派出（待辦卡「${banner.card.title}」）` : banner.dispatched || banner.qaDelivered?.length ? '' : '（沒有派子任務）'}{qaRun ? '。' : '；侍酒師正在重新萃取。'}</div>
               )}
+              {banner.qaDelivered?.map(q => (
+                <div key={q.runId}>🧪 {q.count} 筆已交給 QA Run「{q.topic}」的聊天室（寫成該 run 的留言、已喚醒）</div>
+              ))}
               {banner.errors?.map((e, i) => <div key={i}>⚠ {e}</div>)}
               {banner.error && <div>⚠ {banner.error}</div>}
               <div className="flex gap-3">
-                {banner.dispatched && onGoToChat && (
+                {banner.card && onGoToChat && (
                   <button onClick={() => goChat(banner.run?.sessionId ?? deckState.dispatches[banner.firstKey]?.sessionId ?? null)} className="underline">👀 到 Chat 看子任務</button>
                 )}
+                {onGoToChat && banner.qaDelivered?.map(q => (
+                  <button key={q.runId} onClick={() => goChat(q.sessionId, q.projectPath)} className="underline">👀 到 Chat 看 {q.topic.slice(0, 12)}…</button>
+                ))}
                 {banner.stale && onReload && <button onClick={onReload} className="underline">↻ 重新整理題目</button>}
               </div>
             </div>

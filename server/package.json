@@ -7,7 +7,12 @@
     "start": "node index.js",
     "check:models": "node modelCatalog.check.mjs",
     "check:lanes": "node claudeLanes.check.mjs",
-    "check:closearm": "node qaCloseArm.check.mjs"
+    "check:closearm": "node qaCloseArm.check.mjs",
+    "check:ask": "node askRelay.check.mjs",
+    "check:qadecisions": "node qaDecisions.check.mjs",
+    "check:usage": "node usageInterrupts.check.mjs",
+    "check:accounts": "node accountVault.check.mjs",
+    "check:transcripts": "node transcriptReader.check.mjs"
   },
   "keywords": [],
   "author": "",

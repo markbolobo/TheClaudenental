@@ -9,6 +9,9 @@ import { reloginSession } from './relogin.js'
 import { WorkflowLauncher } from './WorkflowLauncher.jsx'
 import { CompanionPanel } from './CompanionPanel.jsx'
 import QuietToggle, { QUIET_HINT } from './QuietToggle'
+import { DecisionDeck, DerivedReview } from './DecisionDeck.jsx'
+import { RichText } from './ScenarioView.jsx'
+import { layerIcon } from './decisionSupport.js'
 
 const STATUS_META = {
   announced: { label: '待放行', cls: 'text-yellow-400 border-yellow-500/50' },
@@ -144,6 +147,79 @@ function StatusBadge({ status }) {
     <span className={`text-[10px] px-2 py-0.5 rounded border uppercase tracking-widest ${meta.cls}`}>
       {meta.label}
     </span>
+  )
+}
+
+// ⬜ 待定奪（少爺 2026-10-08「QA Run 待我定奪的互動方式與侍酒師的待定奪一樣的形式，統一設計」）：
+// 與侍酒師同一個 DecisionDeck／DerivedReview。題目＝計畫書「待定奪」段的 OPEN-n＋段內引用的意圖／情境題（server /api/qa/runs/:id/decisions）；
+// 送出＝TC 寫回原檔＋寫成本 run 的一則留言、喚醒綁定聊天室。舊格式（### Q1、表格）面板讀不到，給一鍵請 Claude 轉成標準格式。
+const QA_DECISION_FORMAT_REQUEST = '請把計畫書的待定奪段改成標準格式，讓 TC 的定奪面板讀得到：本 run 自己的題（實作時機、修法、範圍…）寫成 `- [ ] OPEN-n 題目` 條目（子項 **現況**／**要你定的原因**／**選項**：A) …；B) …／**建議**／**牽動**，格式同設計意圖檔，見 MasterBrain/.agent/scripts/open_decisions.mjs）；設計題（機制、體驗）寫進對應的意圖檔或情境檔待定奪，並在計畫書這段用 [[檔名]]（整份）或 [[檔名]] OPEN-n（單題）掛上來。已有答案的題照數獨規則寫成推導定。改完不必等我，面板會自動出現。'
+
+function QaDecisionSection({ run, onGoToChat, onRequestFormat }) {
+  const [data, setData] = useState(null)
+  const [tick, setTick] = useState(0)
+  const [decidedOpen, setDecidedOpen] = useState(false)
+  // 只在「可能動到題目」的 run 變化時重抓（PIE 中事件串流很密，不跟著每筆事件重抓）：計畫書／來源、留言與回覆、引導語、接手狀態
+  const _refetchKey = [run.id, run.status, run.qapPath ?? '', (run.decisionSources ?? []).join(','), run.comments?.length ?? 0,
+    (run.comments ?? []).filter(c => c.reply).length, run.guidance?.t ?? 0, run.claudeAck?.state ?? ''].join('|')
+  useEffect(() => {
+    let _alive = true
+    fetch(`/api/qa/runs/${run.id}/decisions`).then(r => r.json())
+      .then(d => { if (_alive) setData(d) })
+      .catch(() => { if (_alive) setData(null) })
+    return () => { _alive = false }
+  }, [run.id, _refetchKey, tick])
+  useEffect(() => {
+    const _on = () => setTick(t => t + 1)
+    window.addEventListener('tc-sommelier-refreshed', _on)
+    window.addEventListener('tc-decision-dispatch-update', _on)
+    return () => {
+      window.removeEventListener('tc-sommelier-refreshed', _on)
+      window.removeEventListener('tc-decision-dispatch-update', _on)
+    }
+  }, [])
+  const rich = useCallback((t) => <RichText text={t} />, [])
+  if (!data?.ok) return null
+  const { items = [], derived = [], decided = [], legacy = 0, plan, projectId } = data
+  // 計畫書沒有待定奪段＝這輪沒有要你定的事（例：總控 run），不提示；只有舊格式題目讀不到時才提示
+  const _formatHint = legacy > 0
+  if (!items.length && !derived.length && !decided.length && !_formatHint) return null
+  return (
+    <div id={`qa-decisions-${run.id}`} className="border border-[var(--gold)]/40 rounded bg-[var(--surface)] p-3 space-y-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-[10px] uppercase tracking-widest text-[var(--gold)]">⬜ 待定奪（需要你決策）</span>
+        <span className="text-[10px] text-[var(--text-muted)]">{items.length} 題待定{derived.length ? ` · ${derived.length} 筆推導待確認` : ''}{decided.length ? ` · 已定 ${decided.length}` : ''}</span>
+        <span className="flex-1" />
+        {plan && <span className="text-[9px] text-[var(--text-muted)] font-mono" title={plan.heading}>🧪 {plan.file}</span>}
+      </div>
+      {_formatHint && (
+        <div className="text-[10px] rounded border border-amber-500/40 bg-amber-500/5 px-2 py-1.5 text-amber-200 flex items-center gap-2 flex-wrap">
+          <span>計畫書的待定奪段有 {legacy} 處不是標準格式（### Q1、- **Q1、表格…）；只寫在那裡的題，面板讀不到</span>
+          <button onClick={() => { if (confirm('請綁定聊天室把計畫書的待定奪段轉成標準格式（OPEN-n 條目＋[[意圖檔]] 連結）？會以一則留言喚醒它。')) onRequestFormat?.(QA_DECISION_FORMAT_REQUEST) }}
+            className="px-1.5 py-0.5 rounded border border-amber-500/50 text-amber-200 hover:bg-amber-500/10">📨 請 Claude 轉成標準格式</button>
+        </div>
+      )}
+      <DerivedReview items={derived} projectId={projectId} rich={rich} />
+      {items.length > 0 && (
+        <DecisionDeck items={items} projectId={projectId} rich={rich} qaRun={run} onGoToChat={onGoToChat} onReload={() => setTick(t => t + 1)} />
+      )}
+      {decided.length > 0 && (
+        <div className="text-[10px]">
+          <button onClick={() => setDecidedOpen(v => !v)} className="text-[var(--text-muted)] hover:text-[var(--text)]">{decidedOpen ? '⌄' : '›'} ✓ 本 run 已定 {decided.length} 題</button>
+          {decidedOpen && (
+            <div className="mt-1 space-y-0.5 pl-3">
+              {decided.map(x => (
+                <div key={x.key} className="text-[var(--text)]/90">
+                  <span className="text-[var(--text-muted)]">{layerIcon(x.layer)} {x.openId}</span> {x.question}
+                  <span className="text-emerald-300/90"> ⇒ {x.resolution}</span>
+                  {x.resolvedAt && <span className="text-[var(--text-muted)]">（{x.resolvedAt}）</span>}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -455,14 +531,52 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
     loadGitStatus(gitProjectId)
   }, [gitProjectId, gitMessage, gitProject, gitPickedPaths, loadGitStatus, runAutoCommit])
 
+  // 少爺 2026-10-12「QA 載入過慢」：清單只抓摘要（原本 90 筆含已結案全文＝1.9MB、每 10 秒重抓），
+  // 選中 run 的完整內容另外抓；ws 推來的是完整 run，直接套用
+  const [runDetail, setRunDetail] = useState(null)
+  const runDetailRef = useRef(null)
+  useEffect(() => { runDetailRef.current = runDetail }, [runDetail])
+  const detailLoadingRef = useRef(null)
+  const loadRunDetail = useCallback((InRunId) => {
+    if (!InRunId || detailLoadingRef.current === InRunId) return
+    detailLoadingRef.current = InRunId
+    fetch(`/api/qa/runs/${InRunId}`).then(r => r.json()).then(d => {
+      if (!d.ok || !d.run || selectedRunIdRef.current !== InRunId) return
+      // 抓的途中 ws 已推來更新版就不蓋回舊的
+      setRunDetail(prev => (prev?.id === d.run.id && (prev.updatedAt ?? 0) > (d.run.updatedAt ?? 0)) ? prev : d.run)
+    }).catch(() => {}).finally(() => { if (detailLoadingRef.current === InRunId) detailLoadingRef.current = null })
+  }, [])
+  useEffect(() => { loadRunDetail(selectedRunId) }, [selectedRunId, loadRunDetail])
+
   // 少爺 2026-08-07：進 QA 分頁不再預設自動選最新 run——選擇一律由少爺顯式動作（點 run／新宣告聚焦／會議室聯動）產生
   const reload = useCallback(() => {
-    fetch('/api/qa/runs?limit=100').then(r => r.json()).then(d => {
-      setRuns(d.runs ?? [])
+    fetch('/api/qa/runs?limit=100&summary=1').then(r => r.json()).then(d => {
+      const _runs = d.runs ?? []
+      setRuns(_runs)
+      // ws 漏接的保險：選中 run 的摘要和手上的完整內容對不上＝有變動，重抓（倒數自動開跑、Claude 讀留言不會動 updatedAt，所以一併比狀態與接手訊號）
+      const _sel = _runs.find(r => r.id === selectedRunIdRef.current)
+      const _d = runDetailRef.current
+      if (_sel && (_d?.id !== _sel.id || _d.updatedAt !== _sel.updatedAt || _d.status !== _sel.status
+        || _d.claudeAck?.state !== _sel.claudeAck?.state || _d.claudeAck?.workingAt !== _sel.claudeAck?.workingAt)) loadRunDetail(_sel.id)
     }).catch(() => {})
-  }, [])
+  }, [loadRunDetail])
 
   useEffect(() => { reload() }, [reload])
+
+  // ⬜ 各 run 還有幾題待你定（清單徽章）：30 秒一次＋定奪送出／侍酒師重萃取時重抓；舊版 server 沒有這支 API＝不顯示
+  const [decisionCounts, setDecisionCounts] = useState({})
+  useEffect(() => {
+    const _load = () => fetch('/api/qa/decision-counts').then(r => r.json()).then(d => { if (d.ok) setDecisionCounts(d.counts ?? {}) }).catch(() => {})
+    _load()
+    const _t = setInterval(_load, 30_000)
+    window.addEventListener('tc-decision-dispatch-update', _load)
+    window.addEventListener('tc-sommelier-refreshed', _load)
+    return () => {
+      clearInterval(_t)
+      window.removeEventListener('tc-decision-dispatch-update', _load)
+      window.removeEventListener('tc-sommelier-refreshed', _load)
+    }
+  }, [])
 
   // 監看存活燈（少爺 2026-09-08）：聯動壞得最久的原因是「壞了看不出來」——把它變成留言列上看得見的狀態。
   // alive=true → 少爺的動作會送進那個 VS Code 分頁原地處理；false → 只會走無頭進程，分頁不動。
@@ -495,7 +609,9 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
         return [run, ...prev]
       })
       // 新宣告的 run 自動聚焦（少爺打開視窗就是要看它）；一般更新不補位聚焦（少爺 2026-08-07：預設不自動選）
-      if (['announced', 'countdown'].includes(run.status)) setSelectedRunId(run.id)
+      const _focus = ['announced', 'countdown'].includes(run.status)
+      if (_focus || run.id === selectedRunIdRef.current) setRunDetail(run)
+      if (_focus) setSelectedRunId(run.id)
     }
     window.addEventListener('tc-qa-run-update', onUpdate)
     const poll = setInterval(reload, 10000)
@@ -511,7 +627,9 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedSessionId])
 
-  const run = runs.find(r => r.id === selectedRunId) ?? null
+  // 選中 run：清單裡要有它（封存／超出清單＝視為未選），內容用完整版
+  const _selectedInList = runs.some(r => r.id === selectedRunId)
+  const run = _selectedInList && runDetail?.id === selectedRunId ? runDetail : null
 
   // ── 心腹啟動器（少爺 2026-07-20）：CHAT 輸入區塊的「心腹」進駐留言列（與 📎 同排）──
   // ⚡ 啟動＝組好的心腹模板直接走既有留言路徑送出（喚醒 bound session，模型/強度/附檔全沿用）
@@ -659,6 +777,10 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
               <StatusBadge status={r.status} />
               {r.status === 'finished' && r.outcome && (
                 <span className="text-[9px] text-[var(--text-muted)]">{OUTCOME_LABEL[r.outcome] ?? r.outcome}</span>
+              )}
+              {decisionCounts[r.id] > 0 && (
+                <span title={`還有 ${decisionCounts[r.id]} 題待你定（含推導待確認）`}
+                  className="text-[9px] px-1 rounded border border-[var(--gold)]/50 text-[var(--gold)]">⬜ {decisionCounts[r.id]}</span>
               )}
             </div>
             <div className="text-[9px] text-[var(--text-muted)] mt-0.5">{new Date(r.createdAt).toLocaleString()}</div>
@@ -1090,7 +1212,7 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
 
         {!run && (
           <div className="text-[var(--text-muted)] text-xs text-center mt-12">
-            等待 Claude 宣告 QA 計畫…（autoqa 會在跑 QA 前把「目的+方法」推上這裡）
+            {_selectedInList ? '讀取 QA run…' : '等待 Claude 宣告 QA 計畫…（autoqa 會在跑 QA 前把「目的+方法」推上這裡）'}
           </div>
         )}
         {run && (
@@ -1228,6 +1350,9 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
                 {run.qapPath && <span className="text-[9px] text-[var(--text-muted)] font-mono self-center">{run.qapPath}</span>}
               </div>
             </div>
+
+            {/* ⬜ 待定奪：與侍酒師同一個定奪面板（少爺 2026-10-08）；放在計畫之前——它常是這輪卡住的地方 */}
+            <QaDecisionSection key={run.id} run={run} onGoToChat={onGoToChat} onRequestFormat={(t) => sendComment(t)} />
 
             {/* A 計畫區（目的+方法） */}
             <div className="border border-[var(--border)] rounded bg-[var(--surface)] p-3">
@@ -1394,11 +1519,19 @@ export function QAMonitorPanel({ selectedSessionId = null, onGoToChat = null, pr
                 <div key={i} className="mb-2 text-[11px]">
                   <div>
                     <span className="text-[var(--gold)]">少爺</span>
+                    {c.kind === 'decision' && <span className="text-[9px] text-[var(--gold)]/80"> · ⬜ 定奪{c.via === 'sommelier' ? '（侍酒師送交）' : ''}</span>}
                     {c.itemId != null && <span className="text-[9px] text-[var(--text-muted)]"> · 項目 {c.itemId}</span>}
                     <span className="text-[9px] text-[var(--text-muted)]"> · {fmtTime(c.t)}</span>
                     {!c.seenByClaude && <span className="text-[9px] text-yellow-400"> · 未讀</span>}
                   </div>
-                  <div className="pl-2">{c.text}</div>
+                  {/* 定奪留言的全文是給 Claude 的處理指令：介面只顯示每筆的決定，全文收在展開裡 */}
+                  {c.kind === 'decision' && Array.isArray(c.summary) ? (
+                    <div className="pl-2">
+                      {c.summary.map((s, j) => <div key={j}>{s}</div>)}
+                      <details className="text-[10px] text-[var(--text-muted)]"><summary className="cursor-pointer">給 Claude 的完整處理指令</summary>
+                        <div className="whitespace-pre-wrap mt-0.5">{c.text}</div></details>
+                    </div>
+                  ) : <div className="pl-2">{c.text}</div>}
                   {c.reply && (
                     <div className="pl-4 mt-0.5 text-[var(--text-muted)]">↳ <span className="text-blue-400">Claude</span>：{c.reply}</div>
                   )}

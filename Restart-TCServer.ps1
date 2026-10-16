@@ -22,10 +22,16 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Write-Output '拒�
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 & node --check (Join-Path $ServerDir 'index.js')
 if ($LASTEXITCODE -ne 0) { Write-Output '拒絕重啟：server/index.js 語法檢查失敗'; exit 5 }
-# 機檢清單：執行道（跨聊天室並行，check:lanes）、預約結案（少爺說／按結案後到已完成自動代按，check:closearm）
+# 機檢清單：執行道（跨聊天室並行，check:lanes）、預約結案（少爺說／按結案後到已完成自動代按，check:closearm）、
+# 提問中繼（分頁的 AskUserQuestion 在 TC Chat 顯示與代答，check:ask）、QA 待定奪（QA Run 與侍酒師同一個定奪面板，check:qadecisions）
 $gateChecks = @(
     @{ File = 'claudeLanes.check.mjs'; Why = '執行道機檢未通過（npm run check:lanes），跨聊天室並行規則被改壞了' },
-    @{ File = 'qaCloseArm.check.mjs';  Why = '預約結案機檢未通過（npm run check:closearm），結案代按規則被改壞了' }
+    @{ File = 'qaCloseArm.check.mjs';  Why = '預約結案機檢未通過（npm run check:closearm），結案代按規則被改壞了' },
+    @{ File = 'askRelay.check.mjs';    Why = '提問中繼機檢未通過（npm run check:ask），TC 顯示／代答提問的接線被改壞了' },
+    @{ File = 'qaDecisions.check.mjs'; Why = 'QA 待定奪機檢未通過（npm run check:qadecisions），QA Run 與侍酒師共用的定奪面板接線被改壞了' },
+    @{ File = 'usageInterrupts.check.mjs'; Why = '用量中斷機檢未通過（npm run check:usage），偵測／開關／續接接線被改壞了' }
+    @{ File = 'accountVault.check.mjs'; Why = '換帳號機檢未通過（npm run check:accounts），換帳號判斷／權杖保管／續接接線被改壞了' }
+    @{ File = 'transcriptReader.check.mjs'; Why = '逐字稿增量讀取機檢未通過（npm run check:transcripts），用量熱度／掃描器／監看又會整份重讀、server 會卡住' }
 )
 foreach ($gate in $gateChecks) {
     Push-Location $ServerDir
@@ -42,7 +48,8 @@ foreach ($gate in $gateChecks) {
 # ⚠️ Windows PowerShell 5.1：函式輸出單一物件會被攤平，單一 PSCustomObject 的 .Count 是空值 ⇒ 一律回字串陣列、呼叫端再包 @()
 function Get-RunningHeadless {
     try {
-        $r = Invoke-RestMethod -Uri "$Api/api/claude/processes" -TimeoutSec 5
+        # 伺服器偶有十餘秒的事件迴圈卡頓（2026-10-12 實測 11.5 秒）⇒ 放寬到 30 秒，避免誤判查詢失敗
+        $r = Invoke-RestMethod -Uri "$Api/api/claude/processes" -TimeoutSec 30
         return , [string[]]@($r.processes | Where-Object { $_.status -eq 'running' } | ForEach-Object { [string]$_.sessionId })
     } catch {
         return $null

@@ -5,8 +5,10 @@ import { MetricsDashboard } from './MetricsDashboard.jsx'
 import { SommelierPanel } from './Sommelier.jsx'
 import { reloginSession } from './relogin.js'
 import { QAMonitorPanel } from './QAMonitor.jsx'
+import AutomationPauseToggle from './AutomationPauseToggle.jsx'
 import BountySettings from './BountySettings.jsx'
 import MarkerPanel from './MarkerPanel.jsx'
+import UsageInterruptPanel, { useUsageInterruptCount } from './UsageInterruptPanel.jsx'
 import CellarPanel from './CellarPanel.jsx'
 import { ChatPanel } from './ChatPanel.jsx'
 import { PresentButton } from './PresentationView.jsx'
@@ -307,6 +309,14 @@ function SessionItem({ session, isSelected, onClick, onDoubleClick, onCostClick,
             </button>
           )}
         </div>
+        {/* Row 4a: 待答提問（少爺 2026-10-08）——點這列就帶進 Chat，在提問面板直接作答 */}
+        {session.pendingAsk && (
+          <div className="mt-1 rounded border border-[var(--gold)]/40 bg-[var(--gold)]/5 px-1.5 py-1"
+            title={session.pendingAsk.answerable ? '點這列進 Chat 作答（TC 送出＝直接回答 VS Code 分頁）' : '點這列進 Chat 看題目、跟陪聊討論；送出要到 VS Code 分頁'}>
+            <div className="text-[8px] text-[var(--gold)] font-semibold tracking-wide">❓ 等你回答 {session.pendingAsk.count} 題{session.pendingAsk.answerable ? '' : '（到 VS Code 作答）'}</div>
+            <div className="text-[9px] text-[var(--text)] truncate">{session.pendingAsk.summary}</div>
+          </div>
+        )}
         {/* Row 4: pending permission — chat session 的權限卡桌面端由右側欄顯示；手機端無右側欄，呼叫端開 showChatPermission 在列表內補上 */}
         {session.pendingPermission && (!isChatSession || showChatPermission) && (
           <div className="mt-1 rounded border border-amber-600/40 bg-amber-900/10 px-1.5 py-1">
@@ -422,9 +432,22 @@ function HistoryPanel({ onContinue }) {
   const [activeCost, setActiveCost] = useState(null)
   const [loading, setLoading] = useState(false)
 
+  // 少爺 2026-10-08：隱藏例行工項聊天室（一鍵提交／話題筆記／打包失敗分析）；偏好存 TC 總設定 history.hideRoutine，未設＝隱藏
+  const [hideRoutine, setHideRoutine] = useState(true)
+
   useEffect(() => {
     fetch('/api/history').then(r => r.json()).then(d => setList(d.sessions ?? []))
+    fetch('/api/settings').then(r => r.json()).then(d => setHideRoutine(d?.['history.hideRoutine'] !== false)).catch(() => {})
   }, [])
+
+  function toggleHideRoutine() {
+    const _next = !hideRoutine
+    setHideRoutine(_next)
+    fetch('/api/settings', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 'history.hideRoutine': _next ? null : false }),
+    }).catch(() => {})
+  }
 
   // 少爺 2026-07-16 Phase2：LLM tag 是背景排隊產生的 → 列表顯示期間輪詢快取端點合併
   // （輕量端點只讀 in-memory cache，不重掃 transcript）
@@ -545,10 +568,27 @@ function HistoryPanel({ onContinue }) {
     </div>
   )
 
-  const shownList = tagFilter ? list.filter(s => (s.tags ?? []).includes(tagFilter)) : list
+  const tagList = tagFilter ? list.filter(s => (s.tags ?? []).includes(tagFilter)) : list
+  const routineList = tagList.filter(s => s.routine)
+  const shownList = hideRoutine ? tagList.filter(s => !s.routine) : tagList
+  // 各出身的筆數（開關列的 tooltip 用）
+  const routineBreakdown = Object.entries(routineList.reduce((acc, s) => ({ ...acc, [s.routine.label]: (acc[s.routine.label] ?? 0) + 1 }), {}))
+    .map(([label, n]) => `${label} ${n}`).join('・')
 
   return (
     <div className="flex-1 overflow-y-auto px-2 py-2">
+      {/* 例行工項開關列（有例行工項聊天室才出現） */}
+      {routineList.length > 0 && (
+        <div className="flex items-center gap-2 px-2 py-1 mb-1 text-[10px] text-[var(--text-muted)]">
+          <span title={routineBreakdown}>
+            🔧 {hideRoutine ? `已隱藏 ${routineList.length} 個例行工項聊天室` : `顯示中：${routineList.length} 個例行工項聊天室`}
+          </span>
+          <button onClick={toggleHideRoutine}
+            className="ml-auto px-2 py-0.5 rounded border border-[var(--border)] hover:border-[var(--gold-border)] hover:text-[var(--gold)]">
+            {hideRoutine ? '顯示' : '隱藏'}
+          </button>
+        </div>
+      )}
       {/* tag 過濾列（點列表任一 tag 進入；✕ 清除） */}
       {tagFilter && (
         <div className="flex items-center gap-2 px-2 py-1.5 mb-1 rounded border border-[var(--gold-border)] bg-[var(--gold-dim)]">
@@ -573,6 +613,7 @@ function HistoryPanel({ onContinue }) {
             <div className="flex items-center gap-1.5 text-[10px] text-[var(--text-muted)]">
               <span className="truncate">{s.project.replace('c--', '').replace(/-/g,'/')} · {new Date(s.mtime).toLocaleDateString()}</span>
               {s.costUsd != null && <span className="shrink-0 text-[var(--gold)]/70">{fmtCost(s.costUsd)}</span>}
+              {s.routine && <span className="shrink-0 px-1 rounded border border-[var(--border)] text-[9px]">🔧 {s.routine.label}</span>}
             </div>
           </div>
           {/* 少爺 2026-07-16：聊天室重點 hashtag（LLM 語意 tag=金框；點 tag 過濾同主題聊天室） */}
@@ -1489,6 +1530,17 @@ const TC_SETTINGS_SCHEMA = [
     hint: '預設（未設＝23:30）：夜間語意標籤與新建的每日誓約（如知識訂閱）都對齊這個時刻；個別誓約可在 Marker 面板各自改',
   },
   {
+    group: 'History',
+    key: 'history.hideRoutine',
+    label: '例行工項聊天室',
+    type: 'select',
+    options: [
+      { value: null,  label: '隱藏（預設）' },
+      { value: false, label: '顯示' },
+    ],
+    hint: '例行工項＝一鍵提交、話題筆記、打包失敗分析、知識訂閱這類由按鈕或排程開出的聊天室；History 頂端的「顯示／隱藏」也是改這一項',
+  },
+  {
     group: '侍酒師',
     key: 'decision.explainModel',
     label: '待定奪「進一步說明」使用的模型',
@@ -1547,6 +1599,89 @@ const TC_SETTINGS_SCHEMA = [
       { value: 60,   label: '60 分鐘' },
     ],
     hint: '休息＝結束常駐進程；對話與想法板都保留，下次說話會自動接上',
+  },
+  {
+    group: '陪聊與直投',
+    key: 'companion.askAutoBrief',
+    label: '提問出現時，陪聊自動先講白話重點',
+    type: 'select',
+    options: [
+      { value: null,  label: '開啟（預設）：Chat 顯示提問就請陪聊整理每題在問什麼、選項差在哪' },
+      { value: false, label: '關閉：陪聊先待命，等你開口才回應（省一輪花費）' },
+    ],
+    hint: 'Chat 的提問面板右側是提問陪聊（獨立子進程）；每次提問自動開場約一輪陪聊花費',
+  },
+  {
+    group: '用量中斷',
+    key: 'usage.autoResume.enabled',
+    label: '用量重設後自動續接被中斷的聊天室',
+    type: 'select',
+    options: [
+      { value: null, label: '開啟（預設）：重設時間一到，自動把中斷的聊天室接回原處繼續' },
+      { value: false, label: '關閉：只偵測與通知，到點後在「⏸ 用量中斷」按立即續接' },
+    ],
+    hint: '偵測與記錄永遠開著、不花用量；這個開關只管「要不要自動花用量接回去」',
+  },
+  {
+    group: '用量中斷',
+    key: 'usage.autoSwitch.enabled',
+    label: '撞上限時自動換到另一個帳號，並直接續接',
+    type: 'select',
+    options: [
+      { value: null, label: '關閉（預設）：不換帳號' },
+      { value: true, label: '開啟：目前帳號撞上限（或停用）時，換到保管庫裡沒在冷卻的帳號，被中斷的聊天室直接接回原處' },
+    ],
+    hint: '帳號在「⏸ 用量中斷」上方的帳號區加入。不主動換回：只有聊天室再被中斷時才檢查另一個帳號是否冷卻。停用的帳號（會籍停止、帳務問題）永遠不切過去。換帳號是全部聊天室一起換',
+  },
+  {
+    group: '用量中斷',
+    key: 'usage.autoResume.maxPerBatch',
+    label: '自動續接每批最多幾個聊天室',
+    type: 'select',
+    options: [
+      { value: null, label: '3 個（預設）' },
+      { value: 1,    label: '1 個' },
+      { value: 5,    label: '5 個' },
+      { value: 10,   label: '10 個' },
+    ],
+  },
+  {
+    group: '用量中斷',
+    key: 'usage.autoResume.batchGapSec',
+    label: '兩批之間間隔',
+    type: 'select',
+    options: [
+      { value: null, label: '90 秒（預設）' },
+      { value: 30,   label: '30 秒' },
+      { value: 180,  label: '3 分鐘' },
+      { value: 600,  label: '10 分鐘' },
+    ],
+    hint: '接回後若馬上又撞上限，剩下的會整批停下、等下一個重設時間',
+  },
+  {
+    group: '用量中斷',
+    key: 'usage.autoResume.weeklyLimitAutoResume',
+    label: '週上限重設後也自動續接',
+    type: 'select',
+    options: [
+      { value: null, label: '是（預設）：週上限重設後也自動續接' },
+      { value: false, label: '否：週上限只通知，到點後手動續接' },
+    ],
+  },
+  {
+    group: '用量中斷',
+    key: 'usage.autoResume.quietStart',
+    label: '不自動續接時段：開始',
+    type: 'time',
+    placeholder: '',
+    hint: '開始與結束都設才生效、可跨午夜；這段時間到點只通知，時段結束後才續接',
+  },
+  {
+    group: '用量中斷',
+    key: 'usage.autoResume.quietEnd',
+    label: '不自動續接時段：結束',
+    type: 'time',
+    placeholder: '',
   },
 ]
 
@@ -2040,6 +2175,8 @@ export default function App() {
   const [showBountySettings, setShowBountySettings] = useState(false)
   const [showTcSettings, setShowTcSettings] = useState(false)     // 總設定（少爺 2026-08-07）：跨功能使用者偏好 modal
   const [showMarkers, setShowMarkers] = useState(false)
+  const [showUsageInterrupts, setShowUsageInterrupts] = useState(false)   // ⏸ 用量中斷（少爺 2026-10-10）
+  const usageInterruptCount = useUsageInterruptCount()
   const [showCellar, setShowCellar] = useState(false)
   const [tcCommitPopup, setTcCommitPopup] = useState(null)   // 酒窖 TC Commit 完成的彈跳視窗（少爺 2026-08-20）
   const [contractModal, setContractModal]       = useState(null)
@@ -2412,6 +2549,10 @@ export default function App() {
     if (msg.type === 'companion_delta') {
       try { window.dispatchEvent(new CustomEvent('tc-companion-delta', { detail: { key: msg.key, msgId: msg.msgId, text: msg.text, status: msg.status } })) } catch { /* 舊瀏覽器 */ }
     }
+    // ❓ 提問中繼（少爺 2026-10-08）：分頁的 AskUserQuestion 狀態給 Chat 的提問面板
+    if (msg.type === 'ask_update') {
+      try { window.dispatchEvent(new CustomEvent('tc-ask-update', { detail: { key: msg.key, ask: msg.ask } })) } catch { /* 舊瀏覽器 */ }
+    }
     if (msg.type === 'companion_cart') {
       try { window.dispatchEvent(new CustomEvent('tc-companion-cart', { detail: { key: msg.key, projectId: msg.projectId, add: msg.add ?? [], remove: msg.remove ?? [] } })) } catch { /* 舊瀏覽器 */ }
     }
@@ -2590,6 +2731,7 @@ export default function App() {
         <HighTableModal onClose={() => setShowHighTable(false)} onChanged={reloadTcProjects} />
       )}
       {showMarkers && <MarkerPanel onClose={() => setShowMarkers(false)} />}
+      {showUsageInterrupts && <UsageInterruptPanel onClose={() => setShowUsageInterrupts(false)} />}
       {showCellar && <CellarPanel onClose={() => setShowCellar(false)} />}
       {showTcSettings && <TcSettingsModal onClose={() => setShowTcSettings(false)} />}
       {tcCommitPopup && <TcCommitResultModal result={tcCommitPopup} onClose={() => setTcCommitPopup(null)} />}
@@ -2632,6 +2774,13 @@ export default function App() {
           title="Marker — 你委託 Claude 定期履行的任務（誓約）"
           className="text-[9px] text-[var(--text-muted)] hover:text-[var(--gold)] border border-[var(--border)] hover:border-[var(--gold-border)] rounded-sm px-1.5 py-0.5 transition-colors tracking-wide uppercase">
           ⧗ Marker
+        </button>
+        <AutomationPauseToggle />
+        <button
+          onClick={() => setShowUsageInterrupts(true)}
+          title="用量中斷 — Token 用完被中斷的聊天室、重設時間與續接（自動續接開關在 ⚙ 總設定）"
+          className={`text-[9px] border rounded-sm px-1.5 py-0.5 transition-colors tracking-wide uppercase ${usageInterruptCount > 0 ? 'text-amber-400 border-amber-500/50 hover:border-amber-400' : 'text-[var(--text-muted)] hover:text-[var(--gold)] border-[var(--border)] hover:border-[var(--gold-border)]'}`}>
+          ⏸ 用量{usageInterruptCount > 0 ? ` ${usageInterruptCount}` : ''}
         </button>
         <button
           onClick={() => setShowBountySettings(true)}

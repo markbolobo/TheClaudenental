@@ -1,4 +1,6 @@
-// 🗣 陪聊面板（少爺 2026-10-04）——QA run 與侍酒師共用
+// 🗣 陪聊面板（少爺 2026-10-04）——QA run、侍酒師、CHAT 聊天室共用
+// CHAT（2026-10-08）「一樣是獨立的(非聊天室本身的)，類似顧問能夠快速切入我的思考點…減少聊天室內…為了修正產生的Prompt次數」：
+// 交回聊天室預設「放進輸入框」（少爺看過再送），另有「直接送出」
 // 「QA Run 中有個按鈕(對應不同的QA)，會讓TC有個陪聊功能(陪我腦力激盪)，會將我的想法整理並實作，也會即時回應我」
 // 「仕酒師負責的是更前期的部分(加入購物車…我可以知道你將我哪些想法加入購物車)」
 // 「語音功能算是附加的(第二套做法)…原本的文字互動依舊保留」
@@ -33,9 +35,66 @@ async function postJson(InUrl, InBody) {
   } catch { return { ok: false, error: '連不到 TC 伺服器' } }
 }
 
+// 附件（少爺 2026-10-08「陪聊先處理圖片支援」）：與 CHAT 同樣接受的類型；圖片另做一張縮圖給陪聊看（API 會把長邊壓到 1568，
+// 先縮可少傳、也不會撞單張 5MB 上限），原圖照樣上傳存檔、交出去時給實作的聊天室看細節
+const ATT_ACCEPT = 'image/*,.pdf,.txt,.md,.json,.csv'
+const ATT_PREVIEW_EDGE = 1568
+const ATT_PREVIEW_MAX_BYTES = 3 * 1024 * 1024
+
+function readAsDataUrl(InFile) {
+  return new Promise((resolve, reject) => {
+    const _r = new FileReader()
+    _r.onload = ev => resolve(ev.target.result)
+    _r.onerror = () => reject(_r.error)
+    _r.readAsDataURL(InFile)
+  })
+}
+
+/** 圖片太大（邊長或位元組）才縮；縮不了就回 null，伺服器會改請陪聊用 Read 看原圖 */
+function shrinkImage(InDataUrl, InBytes) {
+  return new Promise(resolve => {
+    const _img = new Image()
+    _img.onload = () => {
+      const _edge = Math.max(_img.width, _img.height)
+      if (_edge <= ATT_PREVIEW_EDGE && InBytes <= ATT_PREVIEW_MAX_BYTES) { resolve(null); return }
+      const _scale = Math.min(1, ATT_PREVIEW_EDGE / _edge)
+      const _c = document.createElement('canvas')
+      _c.width = Math.round(_img.width * _scale)
+      _c.height = Math.round(_img.height * _scale)
+      _c.getContext('2d').drawImage(_img, 0, 0, _c.width, _c.height)
+      resolve(_c.toDataURL('image/jpeg', 0.9))
+    }
+    _img.onerror = () => resolve(null)
+    _img.src = InDataUrl
+  })
+}
+
+/** File → 附件 { name, type, dataUrl, inlineDataUrl? } */
+async function fileToAttachment(InFile) {
+  const _dataUrl = await readAsDataUrl(InFile)
+  const _att = { name: InFile.name || (InFile.type.startsWith('image/') ? 'image.png' : 'file'), type: InFile.type, dataUrl: _dataUrl }
+  if (InFile.type.startsWith('image/')) {
+    const _small = await shrinkImage(_dataUrl, InFile.size)
+    if (_small) _att.inlineDataUrl = _small
+  }
+  return _att
+}
+
+/** 陪聊花費（牌價等價）：標頭小字＋滑過看明細 */
+function costText(InCost) {
+  if (!InCost?.turns) return null
+  const _avg = InCost.usd / InCost.turns
+  return {
+    short: `$${InCost.usd.toFixed(InCost.usd < 1 ? 3 : 2)}`,
+    title: `陪聊花費（牌價等價${InCost.model ? `，${InCost.model}` : ''}）：共 $${InCost.usd.toFixed(4)}・${InCost.turns} 句・平均每句 $${_avg.toFixed(4)}・上一句 $${(InCost.lastTurnUsd ?? 0).toFixed(4)}\n`
+      + `tokens：輸入 ${InCost.input}・輸出 ${InCost.output}・快取讀 ${InCost.cacheRead}・快取寫 ${InCost.cacheWrite}\n只算這個陪聊自己的進程，不含聊天室本身`,
+  }
+}
+
 /**
- * @param scope 'qa' | 'som'
- * @param refId QA run id 或侍酒師專案 id
+ * @param scope 'qa' | 'som' | 'chat'
+ * @param refId QA run id、侍酒師專案 id 或聊天室 session id
+ * @param onDraftToChat CHAT 用：(text) → 把整理好的指示放進聊天室輸入框
  * @param cartKeyOf 侍酒師用：(companionKey, ideaId) → 購物車條目 key（判斷是否還在購物車）
  * @param cartKeys 侍酒師用：目前購物車的 key 集合
  * @param onCartToggle 侍酒師用：(companionKey, entry, putBack) → 從面板放回／拿掉陪聊想法
@@ -45,7 +104,8 @@ async function postJson(InUrl, InBody) {
  * @param onGoToCart 侍酒師用：轉跳購物車（接著開新聊天室）
  */
 export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf = null, cartKeys = null, onCartToggle = null,
-  refInfo = null, onRefToggle = null, onStateLoaded = null, cartCount = 0, onGoToCart = null }) {
+  refInfo = null, onRefToggle = null, onStateLoaded = null, cartCount = 0, onGoToCart = null, onDraftToChat = null }) {
+  const _isChat = scope === 'chat'
   const [state, setState] = useState(null)
   const [streaming, setStreaming] = useState(null)   // { msgId, text }
   const [input, setInput] = useState('')
@@ -56,8 +116,12 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
   const [editId, setEditId] = useState(null)
   const [editText, setEditText] = useState('')
   const [newIdea, setNewIdea] = useState('')
+  const [atts, setAtts] = useState([])            // 輸入框待送的附件 [{ name, type, dataUrl, inlineDataUrl? }]
+  const [dragOver, setDragOver] = useState(false)
+  const [lightbox, setLightbox] = useState(null)  // 點開的大圖網址
   const keyRef = useRef(null)
   const listRef = useRef(null)
+  const fileInputRef = useRef(null)
   const spokenRef = useRef({ msgId: null, upTo: 0 })
   const streamingRef = useRef(null)
   const openedAtRef = useRef(0)   // 開面板的時間：之前的訊息不朗讀（開面板 effect 內設定）
@@ -129,24 +193,63 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
   const handoff = useCallback(async (InVia = 'button') => {
     if (!keyRef.current) return
     const d = await postJson('/api/companion/handoff', { key: keyRef.current, via: InVia })
-    if (d.ok) { flash('📤 已交付給實作聊天室——它會先列計畫，請到 QA 分頁審查', 6000); speak('已交付給實作聊天室。') }
-    else flash(d.error ?? '交付失敗', 6000)
-  }, [flash, speak])
+    if (d.ok) {
+      if (_isChat) { flash('📤 已送進聊天室', 6000); speak('已送進聊天室。') }
+      else { flash('📤 已交付給實作聊天室——它會先列計畫，請到 QA 分頁審查', 6000); speak('已交付給實作聊天室。') }
+    } else flash(d.error ?? '交付失敗', 6000)
+  }, [_isChat, flash, speak])
+
+  // CHAT 預設出口：整理好的指示放進聊天室輸入框，少爺看過、改過再自己送（父層關面板露出輸入框）
+  const draftToChat = useCallback(async () => {
+    if (!keyRef.current || !onDraftToChat) return
+    const d = await postJson('/api/companion/compose', { key: keyRef.current, mark: true })
+    if (d.ok) { speak('放進輸入框了，看過再送。'); onDraftToChat(d.text) }
+    else flash(d.error ?? '整理失敗（TC 伺服器可能還沒重啟到新版）', 6000)
+  }, [onDraftToChat, flash, speak])
 
   const dismissHandoff = useCallback(() => {
     if (keyRef.current) postJson('/api/companion/dismiss-handoff', { key: keyRef.current })
   }, [])
 
+  // 待送附件跟著下一句送出（打字或語音都算）：先貼截圖、再開口說，圖就跟著這句話過去
   const send = useCallback(async (InText, InVia = 'text') => {
     const _t = String(InText ?? '').trim()
-    if (!_t || !keyRef.current) return
-    // 交付／擱置只認固定口令（程式判定）；提議交付時才生效
-    if (state?.pendingHandoff && HANDOFF_RE.test(_t)) { setInput(''); await handoff(InVia); return }
-    if (state?.pendingHandoff && DISMISS_RE.test(_t)) { setInput(''); dismissHandoff(); return }
+    if ((!_t && !atts.length) || !keyRef.current) return
+    // 交付／擱置只認固定口令（程式判定）；提議交付時才生效。CHAT 的口令走預設出口（放進輸入框）
+    if (!atts.length && state?.pendingHandoff && HANDOFF_RE.test(_t)) { setInput(''); if (_isChat) await draftToChat(); else await handoff(InVia); return }
+    if (!atts.length && state?.pendingHandoff && DISMISS_RE.test(_t)) { setInput(''); dismissHandoff(); return }
     if (InVia === 'text') setInput('')
-    const d = await postJson('/api/companion/say', { key: keyRef.current, text: _t, via: InVia })
-    if (!d.ok) flash(d.error ?? '送出失敗', 6000)
-  }, [state?.pendingHandoff, handoff, dismissHandoff, flash])
+    const _sending = atts
+    setAtts([])
+    const d = await postJson('/api/companion/say', { key: keyRef.current, text: _t, via: InVia, attachments: _sending })
+    if (!d.ok) { flash(d.error ?? '送出失敗', 6000); if (_sending.length) setAtts(prev => [..._sending, ...prev]) }
+    else if (d.skipped?.length) flash(`有附件沒收進來：${d.skipped.join('；')}`, 8000)
+  }, [atts, state?.pendingHandoff, _isChat, draftToChat, handoff, dismissHandoff, flash])
+
+  const addFiles = useCallback(async (InFiles) => {
+    const _list = Array.from(InFiles ?? [])
+    if (!_list.length) return
+    try {
+      const _new = await Promise.all(_list.map(fileToAttachment))
+      setAtts(prev => [...prev, ..._new])
+    } catch { flash('讀不到這個檔案', 5000) }
+  }, [flash])
+
+  // 貼上：剪貼簿有圖片／檔案就收成附件（純文字照常貼進輸入框）
+  const onPaste = useCallback((e) => {
+    const _files = Array.from(e.clipboardData?.items ?? []).filter(i => i.kind === 'file').map(i => i.getAsFile()).filter(Boolean)
+    if (!_files.length) return
+    e.preventDefault()
+    addFiles(_files)
+  }, [addFiles])
+
+  const onDrop = useCallback((e) => {
+    e.preventDefault()
+    setDragOver(false)
+    addFiles(e.dataTransfer?.files)
+  }, [addFiles])
+
+  const attUrl = (InId) => `/api/companion/att?key=${encodeURIComponent(state?.key ?? '')}&id=${encodeURIComponent(InId)}`
 
   // 語音附加層：外放模式朗讀時暫停收音（防回音）；耳機模式開口即打斷朗讀
   const _support = voiceSupport()
@@ -175,12 +278,12 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
     await postJson('/api/companion/reset', { key: keyRef.current })
   }, [cancel])
 
-  // Esc 關閉
+  // Esc：有大圖先關大圖，否則關面板
   useEffect(() => {
-    const _onKey = (e) => { if (e.key === 'Escape') onClose?.() }
+    const _onKey = (e) => { if (e.key === 'Escape') { if (lightbox) setLightbox(null); else onClose?.() } }
     window.addEventListener('keydown', _onKey)
     return () => window.removeEventListener('keydown', _onKey)
-  }, [onClose])
+  }, [onClose, lightbox])
 
   // 關面板時停朗讀
   useEffect(() => () => { try { window.speechSynthesis?.cancel() } catch { /* 無朗讀 */ } }, [])
@@ -196,6 +299,9 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
   const _ripplesOpen = (state?.ripples ?? []).filter(r => r.status === 'proposed')
   const _ripplesDone = (state?.ripples ?? []).filter(r => r.status !== 'proposed')
   const _streamingShown = streaming && !_messages.some(m => m.id === streaming.msgId) ? streaming : null
+  const _cost = costText(state?.cost)
+  const _attsOpen = (state?.attachments ?? []).filter(a => !a.handed)
+  const _attWhen = scope === 'som' ? '結帳時附上' : _isChat ? '交回聊天室時附上' : '交付時附上'
 
   return (
     <div className="fixed inset-0 z-40 bg-black/50 flex justify-end" onClick={onClose}>
@@ -204,11 +310,14 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
         {/* 標頭 */}
         <div className="shrink-0 px-3 py-2 border-b border-[var(--border)] flex items-center gap-2 flex-wrap">
           <span className="text-[var(--gold)] text-xs font-semibold">🗣 陪聊</span>
-          <span className="text-[9px] px-1 rounded border border-[var(--gold)]/30 text-[var(--gold)]/80" title="以開發者朋友的角度陪你想：查脈絡與情境、做設計推理，順帶提出其他系統與體驗可以一起完善的地方">開發者朋友</span>
+          {_isChat
+            ? <span className="text-[9px] px-1 rounded border border-[var(--gold)]/30 text-[var(--gold)]/80" title="獨立於這個聊天室的顧問：從聊天室的標籤、最近對話、糾正訊號、相關聊天室快速切入你的思考點，先把推理補完整再送進聊天室，省下事後修正的 prompt">顧問</span>
+            : <span className="text-[9px] px-1 rounded border border-[var(--gold)]/30 text-[var(--gold)]/80" title="以開發者朋友的角度陪你想：查脈絡與情境、做設計推理，順帶提出其他系統與體驗可以一起完善的地方">開發者朋友</span>}
           <span className="text-[11px] text-[var(--text)] truncate max-w-[280px]" title={state?.title ?? ''}>{state?.title ?? subtitle}</span>
           <span className="flex items-center gap-1 text-[10px] text-[var(--text-muted)]" title={state?.model ? `模型：${state.model}` : ''}>
             <span className={`inline-block w-1.5 h-1.5 rounded-full ${_status.dot}`} />{_status.label}
           </span>
+          {_cost && <span className="text-[9px] text-[var(--text-muted)] font-mono cursor-help" title={_cost.title}>💲{_cost.short}</span>}
           <div className="flex-1" />
           {onGoToCart && (
             <button onClick={onGoToCart} title="轉跳購物車——檢查選件、寫描述，接著按「➕ 開新聊天室」"
@@ -237,12 +346,17 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
         )}
 
         <div className="flex-1 flex min-h-0">
-          {/* 對話 */}
-          <div className="flex-1 min-w-0 flex flex-col">
+          {/* 對話（整欄可拖放圖片／檔案進來當附件） */}
+          <div className={`flex-1 min-w-0 flex flex-col ${dragOver ? 'ring-2 ring-inset ring-[var(--gold)]/60 bg-[var(--gold)]/5' : ''}`}
+            onDragOver={e => { if (e.dataTransfer?.types?.includes('Files')) { e.preventDefault(); setDragOver(true) } }}
+            onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setDragOver(false) }}
+            onDrop={onDrop}>
             <div ref={listRef} className="flex-1 overflow-y-auto p-3 space-y-2">
               {!_messages.length && !_streamingShown && (
                 <div className="text-[11px] text-[var(--text-muted)] text-center mt-8 leading-relaxed">
-                  {scope === 'qa'
+                  {_isChat
+                    ? <>我是旁邊的顧問，不是這個聊天室本身——已經讀了它的標籤、最近對話、你糾正過的地方和相關聊天室。<br />說說你接下來想叫它做什麼，我幫你找出還沒考慮到的因素、補完推理，<br />想清楚了再按「✍ 放進輸入框」（看過再送）或「📤 直接送出」，省下事後修正的來回。</>
+                    : scope === 'qa'
                     ? <>說說你對這個 QA 的想法——我會以開發者朋友的角度查脈絡與情境、一起推理，<br />邊聊邊整理到右邊的想法板，順帶把其他該一起完善的系統列在「🧩 連帶設計」；<br />你確認後按「📤 交付實作」或說「交付」，就送進綁定的聊天室動工。</>
                     : <>說說你的議題——我會以開發者朋友的角度，邊查侍酒師的設計脈絡與情境邊跟你對齊、一起推理，<br />把議題和相關條目放進購物車（跟你手動 🛒 加入的一樣），其他該一起完善的系統列在「🧩 連帶設計」；<br />聊完按「🛒 前往購物車」接著開新聊天室。</>}
                 </div>
@@ -256,6 +370,15 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
                         m.role === 'user' ? 'bg-[var(--gold)]/15 text-[var(--text)] border border-[var(--gold)]/30' : 'bg-white/5 text-[var(--text)] border border-[var(--border)]'}`}>
                         {m.via === 'voice' && <span className="text-[9px] text-[var(--text-muted)] mr-1">🎙</span>}
                         {m.text}
+                        {m.attachments?.length > 0 && (
+                          <div className={`flex flex-wrap gap-1 ${m.text ? 'mt-1' : ''}`}>
+                            {m.attachments.map(a => a.type?.startsWith('image/')
+                              ? <img key={a.id} src={attUrl(a.id)} alt={a.name} title={`${a.name}（點開看大圖）`} onClick={() => setLightbox(attUrl(a.id))}
+                                  className="max-h-32 max-w-[220px] rounded border border-[var(--border)] cursor-zoom-in object-contain bg-black/20" />
+                              : <a key={a.id} href={attUrl(a.id)} target="_blank" rel="noreferrer"
+                                  className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--border)] text-[var(--text)] hover:border-[var(--gold)]/60">📎 {a.name}</a>)}
+                          </div>
+                        )}
                       </div>
                     </div>
                   )
@@ -275,13 +398,31 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
                 {listening ? (interim ? <span className="text-[var(--text)]">{interim}</span> : '聆聽中…') : (speaking && voiceMode === 'speaker' ? '朗讀中（暫停收音）…' : '麥克風待機')}
               </div>
             )}
-            {/* 文字輸入（永遠可用） */}
-            <div className="shrink-0 p-2 border-t border-[var(--border)] flex items-end gap-2">
-              <textarea value={input} onChange={e => setInput(e.target.value)} rows={2}
+            {/* 待送附件（跟著下一句送出，打字或語音都算） */}
+            {atts.length > 0 && (
+              <div className="shrink-0 px-2 pt-2 border-t border-[var(--border)] flex flex-wrap gap-1.5">
+                {atts.map((a, i) => (
+                  <div key={i} className="relative" title={a.inlineDataUrl ? `${a.name}（陪聊看縮圖，原圖交出去時附上）` : a.name}>
+                    {a.type?.startsWith('image/')
+                      ? <img src={a.inlineDataUrl ?? a.dataUrl} alt={a.name} className="h-12 w-12 object-cover rounded border border-[var(--border)]" />
+                      : <div className="h-12 px-2 flex items-center rounded border border-[var(--border)] bg-[var(--surface-2)] text-[9px] text-[var(--text-muted)] max-w-[100px] truncate">📎 {a.name}</div>}
+                    <button onClick={() => setAtts(prev => prev.filter((_, j) => j !== i))} title="移除"
+                      className="absolute -top-1 -right-1 flex w-4 h-4 rounded-full bg-red-700/90 text-white text-[8px] items-center justify-center">✕</button>
+                  </div>
+                ))}
+              </div>
+            )}
+            {/* 文字輸入（永遠可用）：可貼上圖片、📎 選檔、或把檔案拖進對話欄 */}
+            <div className={`shrink-0 p-2 flex items-end gap-2 ${atts.length ? '' : 'border-t border-[var(--border)]'}`}>
+              <button onClick={() => fileInputRef.current?.click()} title="附加圖片或檔案（也可以直接貼上截圖、或拖進對話欄）"
+                className="shrink-0 w-7 h-7 flex items-center justify-center rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--gold)] hover:border-[var(--gold)]/60 text-[12px]">📎</button>
+              <input ref={fileInputRef} type="file" multiple accept={ATT_ACCEPT} className="hidden"
+                onChange={e => { addFiles(e.target.files); e.target.value = '' }} />
+              <textarea value={input} onChange={e => setInput(e.target.value)} rows={2} onPaste={onPaste}
                 onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(input) } }}
-                placeholder="打字也可以——Enter 送出、Shift+Enter 換行"
+                placeholder="打字也可以——Enter 送出、Shift+Enter 換行；可直接貼上截圖"
                 className="flex-1 bg-transparent border border-[var(--border)] focus:border-[var(--gold)]/60 rounded px-2 py-1.5 text-[12px] text-[var(--text)] outline-none resize-none" />
-              <button onClick={() => send(input)} disabled={!input.trim()}
+              <button onClick={() => send(input)} disabled={!input.trim() && !atts.length}
                 className="shrink-0 px-3 py-1.5 rounded border border-[var(--gold)]/60 text-[var(--gold)] text-[11px] hover:bg-[var(--gold)]/10 disabled:opacity-40">送出</button>
             </div>
           </div>
@@ -301,7 +442,7 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
                     <span className="text-[9px] text-[var(--text-muted)]">
                       {scope === 'som'
                         ? ((state.briefRev ?? 0) > (state.briefDoneRev ?? 0) ? '✓ 在購物車（結帳帶去）' : '已結帳／已拿掉')
-                        : '交付時附上'}
+                        : _isChat ? '交回聊天室時附上' : '交付時附上'}
                     </span>
                   </div>
                   {state.brief.summary && <div className="text-[10px] text-[var(--text)] whitespace-pre-wrap break-words">{state.brief.summary}</div>}
@@ -311,6 +452,21 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
                   {state.brief.open?.length > 0 && (
                     <div className="text-[9px] text-amber-300/90">待你定：{state.brief.open.join('；')}</div>
                   )}
+                </div>
+              )}
+              {/* CHAT：陪聊整理好一則可以直接送進聊天室的指示 */}
+              {_isChat && state?.pendingHandoff && (
+                <div className="rounded border border-amber-400/50 bg-amber-400/5 p-2 space-y-1.5">
+                  <div className="text-[10px] text-amber-300">顧問整理好了——放進輸入框看過再送，或直接送出</div>
+                  <div className="text-[10px] text-[var(--text)] whitespace-pre-wrap max-h-40 overflow-y-auto">{state.pendingHandoff.summary}</div>
+                  <div className="flex gap-1">
+                    <button onClick={draftToChat} disabled={!onDraftToChat}
+                      className="flex-1 py-1 rounded border border-green-500/50 text-green-400 text-[10px] hover:bg-green-500/10 disabled:opacity-40">✍ 放進輸入框</button>
+                    <button onClick={() => { if (confirm('不經過輸入框，直接把整理送進聊天室？')) handoff('button') }}
+                      className="px-2 py-1 rounded border border-[var(--gold)]/50 text-[var(--gold)] text-[10px] hover:bg-[var(--gold)]/10">📤 直接送出</button>
+                    <button onClick={dismissHandoff}
+                      className="px-2 py-1 rounded border border-[var(--border)] text-[var(--text-muted)] text-[10px] hover:text-[var(--text)]">再想想</button>
+                  </div>
                 </div>
               )}
               {/* QA：陪聊提議交付 */}
@@ -351,7 +507,7 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
                         <div className="flex items-center gap-1 mt-1">
                           <span className={`text-[9px] px-1 rounded border ${_meta.cls}`}>{_meta.label}</span>
                           <div className="flex-1" />
-                          {i.status === 'draft' && scope === 'qa' && (
+                          {i.status === 'draft' && scope !== 'som' && (
                             <button onClick={() => boardOp('confirm', i.id)} title="確認這個想法" className="text-[9px] text-[var(--text-muted)] hover:text-green-400 opacity-0 group-hover:opacity-100">✓</button>
                           )}
                           <button onClick={() => { setEditId(i.id); setEditText(i.text) }} title="改字" className="text-[9px] text-[var(--text-muted)] hover:text-[var(--gold)] opacity-0 group-hover:opacity-100">✎</button>
@@ -371,7 +527,7 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
               {/* 🧩 連帶設計：開發者朋友的設計推理——其他系統與體驗可以順勢完善的地方（少爺按採納才算數） */}
               {(_ripplesOpen.length > 0 || _ripplesDone.length > 0) && (
                 <div className="pt-2 mt-2 border-t border-[var(--border)] space-y-1.5">
-                  <div className="text-[10px] uppercase tracking-widest text-purple-300/90">🧩 連帶設計（{_ripplesOpen.length}）</div>
+                  <div className="text-[10px] uppercase tracking-widest text-purple-300/90">{_isChat ? '🧩 補完推理' : '🧩 連帶設計'}（{_ripplesOpen.length}）</div>
                   {_ripplesOpen.map(r => (
                     <div key={r.id} className="rounded border border-purple-400/40 bg-purple-400/5 px-2 py-1.5">
                       <div className="text-[11px] text-[var(--text)] break-words">{r.text}</div>
@@ -448,18 +604,32 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
                 </div>
               )}
 
-              {/* QA：陪聊查到的相關脈絡（交付時一併附給實作聊天室） */}
-              {scope === 'qa' && _contextRefs.length > 0 && (
+              {/* 📎 附件：還沒交出去的這批，交出去（交付／交回聊天室／結帳）時以存檔路徑附上 */}
+              {_attsOpen.length > 0 && (
                 <div className="pt-2 mt-2 border-t border-[var(--border)] space-y-1">
-                  <div className="text-[10px] uppercase tracking-widest text-[var(--gold)]/80">🔗 相關脈絡（交付時附上）</div>
+                  <div className="text-[10px] uppercase tracking-widest text-[var(--gold)]/80">📎 附件（{_attsOpen.length}，{_attWhen}）</div>
+                  <div className="flex flex-wrap gap-1">
+                    {_attsOpen.map(a => a.type?.startsWith('image/')
+                      ? <img key={a.id} src={attUrl(a.id)} alt={a.name} title={a.name} onClick={() => setLightbox(attUrl(a.id))}
+                          className="h-10 w-10 object-cover rounded border border-[var(--border)] cursor-zoom-in" />
+                      : <a key={a.id} href={attUrl(a.id)} target="_blank" rel="noreferrer" title={a.name}
+                          className="text-[9px] px-1 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] max-w-[110px] truncate">📎 {a.name}</a>)}
+                  </div>
+                </div>
+              )}
+
+              {/* QA／CHAT：陪聊查到的相關脈絡（交出去時一併附上） */}
+              {scope !== 'som' && _contextRefs.length > 0 && (
+                <div className="pt-2 mt-2 border-t border-[var(--border)] space-y-1">
+                  <div className="text-[10px] uppercase tracking-widest text-[var(--gold)]/80">🔗 相關脈絡（{_isChat ? '交回聊天室' : '交付'}時附上）</div>
                   {_contextRefs.map(r => <div key={r.ref} className="text-[10px] text-[var(--text-muted)] break-words" title={r.ref}>{r.icon ?? '·'} {r.title}</div>)}
                 </div>
               )}
 
-              {/* QA：已交付紀錄 */}
-              {scope === 'qa' && _handed.length > 0 && (
+              {/* QA／CHAT：已交出紀錄 */}
+              {scope !== 'som' && _handed.length > 0 && (
                 <div className="pt-2 mt-2 border-t border-[var(--border)] space-y-1">
-                  <div className="text-[10px] uppercase tracking-widest text-blue-400/80">📤 已交付（{_handed.length}）</div>
+                  <div className="text-[10px] uppercase tracking-widest text-blue-400/80">📤 {_isChat ? '已交回聊天室' : '已交付'}（{_handed.length}）</div>
                   {_handed.map(i => <div key={i.id} className="text-[10px] text-[var(--text-muted)] break-words">· {i.text}</div>)}
                 </div>
               )}
@@ -469,6 +639,21 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
                 <button onClick={onGoToCart}
                   className="w-full py-1.5 rounded border border-green-500/50 text-green-400 text-[11px] hover:bg-green-500/10">
                   🛒 前往購物車{cartCount ? `（${cartCount}）` : ''} → 開新聊天室
+                </button>
+              </div>
+            )}
+            {_isChat && (
+              <div className="shrink-0 p-2 border-t border-[var(--border)] flex gap-1">
+                <button onClick={draftToChat} disabled={!onDraftToChat || (!_ideas.length && !state?.pendingHandoff && !state?.brief?.summary)}
+                  title="把目前的整理（摘要、已定／待定、思考點、採納的補完推理、相關脈絡）放進聊天室輸入框，你看過、改過再送"
+                  className="flex-1 py-1.5 rounded border border-green-500/50 text-green-400 text-[11px] hover:bg-green-500/10 disabled:opacity-40">
+                  ✍ 放進輸入框
+                </button>
+                <button onClick={() => { if (confirm('不經過輸入框，直接把目前的整理送進聊天室？')) handoff('button') }}
+                  disabled={!_ideas.length && !state?.pendingHandoff && !state?.brief?.summary}
+                  title="直接送進聊天室（開著的分頁會直投，聊天室忙就排隊）"
+                  className="px-3 py-1.5 rounded border border-[var(--gold)]/50 text-[var(--gold)] text-[11px] hover:bg-[var(--gold)]/10 disabled:opacity-40">
+                  📤 直接送出
                 </button>
               </div>
             )}
@@ -484,6 +669,13 @@ export function CompanionPanel({ scope, refId, subtitle = '', onClose, cartKeyOf
           </div>
         </div>
       </div>
+      {/* 點開的大圖 */}
+      {lightbox && (
+        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center cursor-zoom-out"
+          onClick={e => { e.stopPropagation(); setLightbox(null) }}>
+          <img src={lightbox} alt="附件" className="max-w-[95vw] max-h-[95vh] rounded shadow-2xl" />
+        </div>
+      )}
     </div>
   )
 }

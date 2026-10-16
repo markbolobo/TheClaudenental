@@ -111,6 +111,7 @@ function composePrompt(draft, items) {
         if (it.decisions?.length) lines.push(`   已說定: ${it.decisions.join(' | ')}`)
         if (it.open?.length) lines.push(`   還要少爺定（動工前先問）: ${it.open.join(' | ')}`)
         if (it.ripples?.length) lines.push(`   採納的連帶建議: ${it.ripples.map(r => `${r.text}${r.why ? `——${r.why}` : ''}${r.facets?.length ? `〔影響：${r.facets.join('、')}〕` : ''}`).join(' | ')}`)
+        if (it.attachments?.length) lines.push(`   附件（少爺在陪聊時給的圖片／檔案，請用 Read 打開看）: ${it.attachments.map(a => `${a.name}→${a.file}`).join(' | ')}`)
         if (it.duties?.length) lines.push(`   交接要求: ${it.duties.join(' ')}`)
         return
       }
@@ -1205,15 +1206,18 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
   const syncCompanionBrief = useCallback((InState) => {
     if (!InState?.key || InState.scope !== 'som' || InState.refId !== projectId) return
     const _key = `${InState.key}:brief`
-    const _active = !!InState.brief && (InState.briefRev ?? 0) > (InState.briefDoneRev ?? 0)
+    // 陪聊時給的圖片／檔案跟著這個選件走（還沒結帳、沒拿掉的那批）；只有附件、還沒有摘要時也要出現
+    const _atts = (InState.attachments ?? []).filter(a => !a.handed && a.file)
+    const _active = (!!InState.brief && (InState.briefRev ?? 0) > (InState.briefDoneRev ?? 0)) || _atts.length > 0
     if (!_active) { setCart(c => c.some(i => i.key === _key) ? c.filter(i => i.key !== _key) : c); return }
     // 採納的連帶建議：已用按鈕採納、以想法選件進車的帶自己的理由，這裡只補陪聊口頭採納、沒有獨立選件的
     const _adopted = (InState.ripples ?? []).filter(r => r.status === 'adopted' && !r.handed
       && !(InState.cartLog ?? []).some(e => e.id === `x${r.id}` && !e.removed && !e.checkedOut))
     const _item = {
       key: _key, project: data?.project, nodeKind: 'companionBrief', companionKey: InState.key, rev: InState.briefRev,
-      summary: InState.brief.summary ?? '', decisions: InState.brief.decisions ?? [], open: InState.brief.open ?? [],
+      summary: InState.brief?.summary ?? '', decisions: InState.brief?.decisions ?? [], open: InState.brief?.open ?? [],
       ripples: _adopted.map(r => ({ text: r.text, why: r.why ?? '', facets: r.facets ?? [] })), duties: InState.handoffDuties ?? [],
+      attachments: _atts.map(a => ({ name: a.name, file: a.file })),
     }
     setCart(c => {
       const _at = c.findIndex(i => i.key === _key)
@@ -1696,7 +1700,7 @@ export function SommelierPanel({ onGoToChat, projects: projectsProp = null, acti
                           {it.nodeKind === 'companionBrief' ? '陪聊整理（交接摘要：議題・已定・待定・交接要求）' : it.nodeKind === 'idea' ? it.ideaText : it.nodeKind === 'archNode' ? it.nodeTitle : it.nodeKind === 'memoryNote' ? it.noteTitle : it.nodeKind === 'bp' ? it.bpName : it.nodeKind === 'intent' ? it.intentTitle : it.nodeKind === 'scenario' ? it.scenarioTitle : it.nodeKind === 'scenarioNew' ? '新情境（建骨架＋九面向訪談）' : it.member ? `${it.symbol}::${it.member}` : it.symbol}
                         </code>
                         {it.nodeKind === 'companionBrief'
-                          ? <div className="text-[9px] text-[var(--text-muted)] line-clamp-2">{it.summary || '（摘要整理中）'}{it.open?.length ? ` · 待定 ${it.open.length}` : ''}{it.ripples?.length ? ` · 連帶 ${it.ripples.length}` : ''}</div>
+                          ? <div className="text-[9px] text-[var(--text-muted)] line-clamp-2">{it.summary || '（摘要整理中）'}{it.open?.length ? ` · 待定 ${it.open.length}` : ''}{it.ripples?.length ? ` · 連帶 ${it.ripples.length}` : ''}{it.attachments?.length ? ` · 📎 附件 ${it.attachments.length}` : ''}</div>
                           : it.nodeKind === 'idea'
                           ? <div className="text-[9px] text-[var(--text-muted)] truncate">🗣 陪聊放入{it.facets?.length ? ` · 影響：${it.facets.join('、')}` : ''}{it.anchors?.length ? ` · 相關：${it.anchors.join('、')}` : ''}</div>
                           : it.nodeKind === 'archNode'

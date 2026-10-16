@@ -4,6 +4,14 @@
 /** 一題的 key＝server 說明快取／派工紀錄的 key：專案|層|來源 id|OPEN-n */
 export const decisionKey = (pid, layer, sourceId, openId) => `${pid}|${layer}|${sourceId}|${openId}`
 
+/** 三種來源的圖示：🧭 設計脈絡、🎬 情境體驗、🧪 QA 計畫書（只屬於某個 QA Run 的題） */
+export const layerIcon = (InLayer) => ({ intent: '🧭', scenario: '🎬', qa: '🧪' })[InLayer] ?? '⬜'
+
+/** 選項裡被標成建議的那一個（「建議」欄或選項內「（建議）」）；沒有回 null——「其餘照建議」一鍵填入用 */
+export function recommendedChoiceOf(InChoices, InD) {
+  return InChoices.find(c => c.recommended) ?? (InD?.recommend?.key ? InChoices.find(c => c.key === InD.recommend.key) ?? null : null)
+}
+
 const DRAFT_STORE_KEY = 'tc_decision_drafts_v1'
 export function loadDecisionDrafts() {
   try { return JSON.parse(localStorage.getItem(DRAFT_STORE_KEY)) ?? {} } catch { return {} }
