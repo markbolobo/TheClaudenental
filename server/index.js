@@ -5603,11 +5603,55 @@ app.get('/api/sommelier/data/:projectId', async (request, reply) => {
           (intentScenarioIndex[iid] ??= []).push({ id: sc.id, title: sc.title, phase: sc.phase, status: sc.status })
         }
     } catch { /* scenario_experience.json 不存在 → 前五層照回,前端優雅降級 */ }
-    return { ok: true, data, arch, symbolCanvasIndex, memory, symbolMemoryIndex, assetGraph, symbolBpIndex, designIntent, symbolIntentIndex, scenario, intentScenarioIndex, extractCommand: proj.extractCommand ?? null }
+    // 介面視覺層（第七血肉，選配，少爺 2026-10-20 立）：presentation/UI_##_*.md 由 extract_ui_presentation.mjs 萃取；建 scenario→UI 反查索引（情境細節頁「此情境出現的 UI」）
+    let uiPresentation = null
+    const scenarioUiIndex = {}
+    try {
+      uiPresentation = JSON.parse(fs.readFileSync(path.join(proj.dataDir, 'generated', 'ui_presentation.json'), 'utf8'))
+      for (const u of uiPresentation.uis ?? [])
+        for (const sid of u.scenarioIds ?? []) {
+          (scenarioUiIndex[sid] ??= []).push({ id: u.id, num: u.num, title: u.title, group: u.group, purpose: u.purpose, skins: (u.skins ?? []).length })
+        }
+    } catch { /* ui_presentation.json 不存在 → 前六層照回,前端優雅降級 */ }
+    return { ok: true, data, arch, symbolCanvasIndex, memory, symbolMemoryIndex, assetGraph, symbolBpIndex, designIntent, symbolIntentIndex, scenario, intentScenarioIndex, uiPresentation, scenarioUiIndex, extractCommand: proj.extractCommand ?? null }
   } catch (e) {
     reply.code(404)
     return { ok: false, error: `尚無萃取資料:${e.message}`, hint: proj.extractCommand ?? null }
   }
+})
+
+// 介面視覺提案頁（唯讀，第七血肉）：供侍酒師「🎨 介面視覺」用 iframe 嵌入 <projectRoot>/AI_Utils 底下的提案 HTML 與其 shared/ 子目錄。
+// 路徑形如 /api/sommelier/ui-proposal/roman/AI_Utils/ChantUI_Proposal.html；頁內相對路徑（shared/x.js）會自然落回同一條路由。
+// 防穿越：只收 AI_Utils/<檔> 或 AI_Utils/shared/<…>、副檔名白名單、逐段拒 . / .. / 空段，最後以 realpath 再比一次（擋 junction／symlink 逃逸）。
+const UI_PROPOSAL_MIME = {
+  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
+  '.png': 'image/png', '.svg': 'image/svg+xml', '.woff2': 'font/woff2',
+}
+app.get('/api/sommelier/ui-proposal/:projectId/*', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const cfg = readSommelierConfig()
+  const proj = (cfg.projects ?? []).find(p => p.id === request.params.projectId)
+  const _projRoot = proj?.projectRoot ?? proj?.projectPath
+  if (!proj || !_projRoot) { reply.code(404); return { ok: false, error: 'unknown project or no projectRoot' } }
+  const _rel = String(request.params['*'] ?? '').replace(/\\/g, '/')
+  const _segs = _rel.split('/')
+  if (!_rel || _rel.includes('\0') || _segs.some(s => s === '' || s === '.' || s === '..') || !/^AI_Utils\/(?:[^/]+|shared\/.+)$/.test(_rel)) {
+    reply.code(400); return { ok: false, error: 'path not allowed' }
+  }
+  const _mime = UI_PROPOSAL_MIME[path.extname(_rel).toLowerCase()]
+  if (!_mime) { reply.code(400); return { ok: false, error: 'ext not allowed' } }
+  const _base = path.resolve(_projRoot, 'AI_Utils')
+  const _abs = path.resolve(_projRoot, _rel)
+  if (!_abs.startsWith(_base + path.sep)) { reply.code(400); return { ok: false, error: 'traversal forbidden' } }
+  let _real
+  try { _real = fs.realpathSync(_abs) } catch { reply.code(404); return { ok: false, error: 'file not found' } }
+  let _realBase = _base
+  try { _realBase = fs.realpathSync(_base) } catch { /* AI_Utils 不存在時上一步已 404 */ }
+  if (!_real.startsWith(_realBase + path.sep)) { reply.code(400); return { ok: false, error: 'traversal forbidden' } }
+  if (!fs.statSync(_real).isFile()) { reply.code(404); return { ok: false, error: 'file not found' } }
+  reply.type(_mime)
+  reply.header('Cache-Control', 'no-cache')
+  return fs.readFileSync(_real)
 })
 
 // 重萃取（第五階段閉環）：跑 project extractCommand（離線三萃取器 cpp/arch/memory）。
@@ -6910,7 +6954,7 @@ function markWakeUndelivered(sessionId) {
   } catch (e) { logEvent('qa.wake.undelivered.error', { sessionId, error: String(e?.message ?? e) }) }
 }
 
-const QA_WAKE_ACTIONS = { 'start-now': '按了「▶ 立即開跑」→ 請進入階段二（埋 LOG + 雙編譯 + 重啟 Editor）', pause: '要求暫停', resume: '要求繼續', abort: '要求中止', comment: '留言', decision: '在待定奪面板送出定奪（TC 已把決定寫回原檔；定奪清單與處理步驟在最新一則留言）', close: '按了「✔ 結案」→ 階段五（清 QAC LOG + 雙編譯 + 重啟 Editor；無頭啟動 Editor 用 Start-Process detached）＋維護侍酒師閉環：把本 run 需求「實作驗證後的收斂」沉澱回四種血肉（C++ code / 架構 canvas / 拼圖 memory；藍圖 md 暫跳過），Editor 開著時跑 extract_asset_graph.py 更新藍圖資產層，最後 POST /api/sommelier/refresh/roman 重萃取讓侍酒師吃到最新拼圖＋設計思路模板維護（增量）：分析本 run「需求原話→設計決策/取捨→驗證結果」軌跡，萃取少爺這輪怎麼設計體驗，增量併入 .agent/knowledge/Roman_DesignThinking_Templates.md（基線 2026-07-31 全量、此後僅以 run 為單位增量），有更新列入 knowledgeUpdated 回寫＋情境體驗層維護（少爺 2026-09-15 立）：本 run 動到的意圖檔所涵蓋的情境檔 scenario/S##_*.md 推進狀態標記（💡→📐→🔬→✅）、補討論紀錄與素材清單（qa_finalize_check.py B8 機檢；SOP .agent/workflows/z_sub_scenario_experience.md §6）' }
+const QA_WAKE_ACTIONS = { 'start-now': '按了「▶ 立即開跑」→ 請進入階段二（埋 LOG + 雙編譯 + 重啟 Editor）', pause: '要求暫停', resume: '要求繼續', abort: '要求中止', comment: '留言', decision: '在待定奪面板送出定奪（TC 已把決定寫回原檔；定奪清單與處理步驟在最新一則留言）', close: '按了「✔ 結案」→ 階段五（清 QAC LOG + 雙編譯 + 重啟 Editor；無頭啟動 Editor 用 Start-Process detached；🔴 結案規則凌駕自動化暫停：總開關暫停中也照做編譯、重啟 Editor、資產層萃取，只有自動 PIE 不跑）＋維護侍酒師閉環：把本 run 需求「實作驗證後的收斂」沉澱回四種血肉（C++ code / 架構 canvas / 拼圖 memory；藍圖 md 暫跳過），Editor 開著時跑 extract_asset_graph.py 更新藍圖資產層，最後 POST /api/sommelier/refresh/roman 重萃取讓侍酒師吃到最新拼圖＋設計思路模板維護（增量）：分析本 run「需求原話→設計決策/取捨→驗證結果」軌跡，萃取少爺這輪怎麼設計體驗，增量併入 .agent/knowledge/Roman_DesignThinking_Templates.md（基線 2026-07-31 全量、此後僅以 run 為單位增量），有更新列入 knowledgeUpdated 回寫＋情境體驗層維護（少爺 2026-09-15 立）：本 run 動到的意圖檔所涵蓋的情境檔 scenario/S##_*.md 推進狀態標記（💡→📐→🔬→✅）、補討論紀錄與素材清單（qa_finalize_check.py B8 機檢；SOP .agent/workflows/z_sub_scenario_experience.md §6）' }
 function qaWakeBoundSession(run, action, text, attachPaths = [], model = null, effort = null, inPlaceLink = true) {
   try {
     // 預約結案中的留言喚醒：讓 Claude 知道推 finished 時 TC 會代按 ✔ 結案（少爺 2026-10-05）

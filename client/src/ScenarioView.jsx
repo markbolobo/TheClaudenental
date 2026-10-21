@@ -100,7 +100,7 @@ function SimpleTable({ header, rows, rich, statusCol }) {
   )
 }
 
-export function ScenarioView({ scenario, designIntent, projectId, query, initialId, onJumpToIntent, onJumpToMemory, cartKeys, onToggleScenarioCart, onToggleNewScenarioCart, onGoToChat = null, onReload = null }) {
+export function ScenarioView({ scenario, designIntent, projectId, query, initialId, onJumpToIntent, onJumpToMemory, cartKeys, onToggleScenarioCart, onToggleNewScenarioCart, onGoToChat = null, onReload = null, scenarioUiIndex = {}, onJumpToUi = null }) {
   const scenarios = useMemo(() => scenario?.scenarios ?? [], [scenario])
   const phases = useMemo(() => scenario?.phases ?? [], [scenario])
   const [sid, setSid] = useState(initialId ?? null)
@@ -322,6 +322,19 @@ export function ScenarioView({ scenario, designIntent, projectId, query, initial
                 </div>
               ))}
             </Section>
+
+            {(scenarioUiIndex[s.id] ?? []).length > 0 && (
+              <Section title="此情境出現的 UI" hint="點了跳介面視覺（🎨＝已有視覺提案的版本數）">
+                <div className="flex flex-wrap gap-1">
+                  {[...scenarioUiIndex[s.id]].sort((a, b) => a.num - b.num).map(x => (
+                    <button key={x.id} onClick={() => onJumpToUi?.(x.id)} title={`${x.group} 組・目的 ${x.purpose}`}
+                      className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--gold)]/30 text-[var(--gold)]/80 hover:border-[var(--gold)]">
+                      🖼️ #{x.num} {x.title}<span className="ml-1 text-[8px] text-[var(--text-muted)]">{x.purpose}</span>{x.skins > 0 && <span className="ml-1 text-[8px]">🎨{x.skins}</span>}
+                    </button>
+                  ))}
+                </div>
+              </Section>
+            )}
 
             <Section title="玩家能做什麼"><MarkedList items={s.canDo} rich={rich} /></Section>
 
