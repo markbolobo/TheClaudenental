@@ -4795,7 +4795,8 @@ app.post('/api/git/auto-commit/result', async (request, reply) => {
   }
   _results[projectId] = [_entry, ...(_results[projectId] ?? [])].slice(0, 10)
   writeGitAutoResults(_results)
-  broadcast({ type: 'git_autocommit_result', projectId, result: _entry })
+  const _gp = findGitProject(projectId)
+  broadcast({ type: 'git_autocommit_result', projectId, projectName: _gp?.name ?? projectId, cellarCommit: isCellarCommitProject(projectId), result: _entry })
   logEvent('git.autocommit.result', { projectId, hash: _entry.hash })
   return { ok: true }
 })
@@ -5047,56 +5048,67 @@ app.post('/api/git/push/start', async (request, reply) => {
   return { ok: true, started: true, job: gitPushJob }
 })
 
+// 酒窖層架（少爺 2026-10-22「層架的概念，類似 UI 收納」）：工具以 shelf 歸層，前端依此順序分組、可收合；
+// 沒標或標了不存在的層架＝落到「其他」。新工具加一筆時記得標 shelf。
+const CELLAR_SHELVES = [
+  { id: 'commit',    icon: '🍾', name: '版控提交' },
+  { id: 'anim',      icon: '🎞️', name: '動畫' },
+  { id: 'mesh',      icon: '🧱', name: '網格' },
+  { id: 'audio',     icon: '🎵', name: '音訊' },
+  { id: 'dev',       icon: '🛠️', name: '開發環境' },
+  { id: 'knowledge', icon: '📚', name: '知識訂閱' },
+  { id: 'other',     icon: '📦', name: '其他' },
+]
 const CELLAR_TOOLS = [
   {
-    id: 'tc-commit', name: 'TC Commit（一鍵提交）', kind: 'claude',
+    id: 'tc-commit', shelf: 'commit', name: 'TC Commit（一鍵提交）', kind: 'claude',
     desc: '喚 Claude 讀 TC 變更、照繁中規則寫訊息並直接提交（不 push）',
     // prompt 不寫死：執行時用 buildAutoCommitPrompt 依 sommelier.json 的 tc 規則現算（與版控面板同一產生點）
     claude: { cwd: 'C:\\Project\\TheClaudenental', model: 'sonnet', effort: 'low', gitProjectId: 'tc' },
   },
   {
-    id: 'cooldown-timer', name: 'Claude 冷卻鬧鐘', kind: 'execute',
+    id: 'cooldown-timer', shelf: 'dev', name: 'Claude 冷卻鬧鐘', kind: 'execute',
     desc: '到冷卻時間自動點擊繼續（AutoClicker）',
     exec: ['wscript.exe', ['C:\\Project\\MasterBrain\\AI_Utils\\ClaudeCooldownTimer\\啟動鬧鐘點擊器.vbs']],
   },
   {
-    id: 'anim-toolkit', name: 'UE 動畫工具包', kind: 'execute',
+    id: 'anim-toolkit', shelf: 'anim', name: 'UE 動畫工具包', kind: 'execute',
     desc: '啟動動畫工具包服務面板（選資產＋勾服務執行；需 UE Editor 開啟）',
     exec: ['cmd.exe', ['/c', 'C:\\Project\\UE_AnimToolkit\\AnimToolkit.bat']],
   },
   {
-    id: 'mixamo-root-motion', name: 'Mixamo → UE Root Motion 加工器', kind: 'execute',
+    id: 'mixamo-root-motion', shelf: 'anim', name: 'Mixamo → UE Root Motion 加工器', kind: 'execute',
     desc: 'Mixamo 下載的 FBX 轉成 UE Root Motion 動畫（拖放批量；走 Blender，不需 UE Editor）',
     // 與 anim-toolkit 同模式：cmd.exe /c 中介，.bat 內再 start pythonw 開 GUI
     exec: ['cmd.exe', ['/c', 'C:\\Project\\UE_AnimToolkit\\MixamoRootMotion.bat']],
   },
   {
-    id: 'footwork-synth', name: '米字步步法生成器', kind: 'execute',
+    id: 'footwork-synth', shelf: 'anim', name: '米字步步法生成器', kind: 'execute',
     desc: '以一支架式待機生成維持架式的八方向步法動畫＋曲線加工＋BlendSpace＋機檢（需 UE Editor 開著）',
     // 與 anim-toolkit 同模式：cmd.exe /c 中介，.bat 內再 start pythonw 開 GUI
     exec: ['cmd.exe', ['/c', 'C:\\Project\\UE_AnimToolkit\\FootworkSynth.bat']],
   },
   {
-    id: 'mesh-fracture', name: '網格切碎塊 / 階段破損', kind: 'execute',
+    id: 'mesh-fracture', shelf: 'mesh', name: '網格切碎塊 / 階段破損', kind: 'execute',
     desc: '把模型切成碎塊並產生階段破損版（可破壞建築用；走 Blender，不需 UE Editor）',
     // 與 anim-toolkit 同模式：cmd.exe /c 中介，.bat 無參數時 start pythonw 開 GUI（detached 無主控台，結果走彈窗）
     exec: ['cmd.exe', ['/c', 'C:\\Project\\UE_MeshToolkit\\MeshFracture.bat']],
   },
   {
-    id: 'music-forge', name: 'Music Forge 程序化配樂', kind: 'execute',
+    id: 'music-forge', shelf: 'audio', name: 'Music Forge 程序化配樂', kind: 'execute',
     desc: '依分數腳本渲染互動配樂分軌＋QA 報告、只重寫音樂庫、互動試聽（純 Python，不需 UE Editor）',
     // 同 mesh-fracture 模式：.bat 無參數時 start pythonw 開 GUI（detached 無主控台，結果走彈窗）
     exec: ['cmd.exe', ['/c', 'C:\\Project\\UE_AudioToolkit\\MusicForge.bat']],
   },
   {
-    id: 'ue-ref-viewer', name: 'UE Reference Viewer（裝進 VS Code）', kind: 'execute',
+    id: 'ue-ref-viewer', shelf: 'dev', name: 'UE Reference Viewer（裝進 VS Code）', kind: 'execute',
     desc: 'VS Code 擴充：選取符號按 Alt+R 開三欄引用圖；點此確保裝的是最新版',
     // 擴充沒有獨立視窗可開，「啟動」＝把 repo 裡最新的 .vsix 裝進 VS Code（已是最新就跳過）
     // 必經 cmd.exe 中介：酒窖 spawn 是 detached + stdio ignore，powershell 直跑會拿不到標準 handle 而以 exit 0 空跑；同理沒有主控台，腳本結果走彈窗
     exec: ['cmd.exe', ['/c', 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\\Project\\vscode-ue-reference-viewer\\Install-Extension.ps1']],
   },
   {
-    id: 'knowledge-sub-theorangeduck', name: '知識訂閱：The Orange Duck（立即檢查）', kind: 'execute',
+    id: 'knowledge-sub-theorangeduck', shelf: 'knowledge', name: '知識訂閱：The Orange Duck（立即檢查）', kind: 'execute',
     desc: '立刻跑一輪誓約 Claude_知識訂閱_TheOrangeDuck：偵測新文章／文章修改／微部落格，有新內容就自動吸收；結果看 Marker 與自動建立的 TC 卡',
     // 觸發同一個 Windows 排程，Marker 的上次執行與成敗同步更新
     exec: ['cmd.exe', ['/c', 'schtasks', '/run', '/tn', 'Claude_知識訂閱_TheOrangeDuck']],
@@ -5104,15 +5116,68 @@ const CELLAR_TOOLS = [
     markerId: 'win:Claude_知識訂閱_TheOrangeDuck',
   },
 ]
+// ─── 酒窖：工具集一鍵提交（少爺 2026-10-22）────────────────────────────────────
+// C:\Project\UE_*Toolkit 每個 git repo 自動一筆，排在 TC Commit 之後；新開工具集（git init 後）下次開酒窖就現身。
+// 提交規則 SSOT＝sommelier.json projects[].git（Invoke-ProjectCommit.ps1 也讀它）→ 缺的自動補：
+// 英文訊息、全部變更進 commit、enabled:false（同 tc：不進侍酒師／QA，只為了有 git 規則）。
+// 勿擾預設開（quietDefault）；少爺在酒窖改過就以設定為準。
+const TOOLKIT_PARENT_DIR = 'C:\\Project'
+const TOOLKIT_DIR_RE = /^UE_[A-Za-z0-9]+Toolkit$/
+const TOOLKIT_GIT_RULE = { staging: 'all', lang: 'en', coAuthor: true }
+
+function discoverToolkitRepos() {
+  try {
+    return fs.readdirSync(TOOLKIT_PARENT_DIR, { withFileTypes: true })
+      .filter(d => d.isDirectory() && TOOLKIT_DIR_RE.test(d.name) && fs.existsSync(path.join(TOOLKIT_PARENT_DIR, d.name, '.git')))
+      .map(d => ({ name: d.name, root: path.join(TOOLKIT_PARENT_DIR, d.name), projectId: d.name.toLowerCase() }))
+      .sort((a, b) => a.name.localeCompare(b.name))
+  } catch { return [] }
+}
+
+function ensureToolkitGitProjects(InRepos) {
+  const _cfg = readSommelierConfig()
+  _cfg.projects = _cfg.projects ?? []
+  const _added = []
+  for (const _r of InRepos) {
+    if (_cfg.projects.some(p => p.id === _r.projectId)) continue
+    _cfg.projects.push({ id: _r.projectId, name: _r.name, projectRoot: _r.root.replace(/\\/g, '/'), enabled: false, toolkit: true, git: { ...TOOLKIT_GIT_RULE } })
+    _added.push(_r.projectId)
+  }
+  if (!_added.length) return
+  atomicWriteJson(SOMMELIER_CONFIG_FILE, _cfg)
+  logEvent('cellar.toolkit.git.add', { ids: _added })
+}
+
+// 酒窖完整清單＝固定工具＋工具集提交（每次現算）
+function cellarTools() {
+  const _repos = discoverToolkitRepos()
+  ensureToolkitGitProjects(_repos)
+  const _commits = _repos.map(r => ({
+    id: `commit-${r.projectId}`, shelf: 'commit', name: `${r.name} Commit（一鍵提交）`, kind: 'claude',
+    desc: `喚 Claude 讀 ${r.name} 變更、寫英文訊息並直接提交（不 push）`,
+    claude: { cwd: r.root, model: 'sonnet', effort: 'low', gitProjectId: r.projectId },
+    quietDefault: true,
+  }))
+  const _at = CELLAR_TOOLS.findIndex(t => t.id === 'tc-commit') + 1
+  return [...CELLAR_TOOLS.slice(0, _at), ..._commits, ...CELLAR_TOOLS.slice(_at)]
+}
+
+// 酒窖提交類專案（TC 自身＋工具集）：不在版控面板，完成結果改走彈跳視窗
+function isCellarCommitProject(InProjectId) {
+  return InProjectId === 'tc' || discoverToolkitRepos().some(r => r.projectId === InProjectId)
+}
+
 // 酒窖工具的勿擾設定鍵：觸發誓約排程的工具沿用該誓約的鍵
 function cellarQuietKey(InTool) { return InTool.markerId ? markerQuietKey(InTool.markerId) : `cellar.quiet.${InTool.id}` }
+function isCellarQuiet(InTool) { return getTcSetting(cellarQuietKey(InTool), InTool.quietDefault === true) === true }
 app.get('/api/tools', async () => ({
   ok: true,
-  tools: CELLAR_TOOLS.map(t => ({ id: t.id, name: t.name, kind: t.kind, desc: t.desc, quiet: isQuietSetting(cellarQuietKey(t)), quietMarkerId: t.markerId ?? null })),
+  shelves: CELLAR_SHELVES,
+  tools: cellarTools().map(t => ({ id: t.id, shelf: CELLAR_SHELVES.some(s => s.id === t.shelf) ? t.shelf : 'other', name: t.name, kind: t.kind, desc: t.desc, quiet: isCellarQuiet(t), quietMarkerId: t.markerId ?? null })),
 }))
 app.post('/api/tools/quiet', async (request, reply) => {
   const { id, quiet } = request.body ?? {}
-  const _t = CELLAR_TOOLS.find(t => t.id === id)
+  const _t = cellarTools().find(t => t.id === id)
   if (!_t || typeof quiet !== 'boolean') { reply.code(400); return { ok: false, error: '需要有效的工具 id 與 quiet（true／false）' } }
   if (_t.markerId) {
     const _r = await setMarkerQuiet(_t.markerId, quiet)
@@ -5124,9 +5189,9 @@ app.post('/api/tools/quiet', async (request, reply) => {
   return { ok: true, quiet }
 })
 app.post('/api/tools/run/:id', async (request) => {
-  const _t = CELLAR_TOOLS.find(t => t.id === request.params.id)
+  const _t = cellarTools().find(t => t.id === request.params.id)
   if (!_t) return { ok: false, error: '未知工具' }
-  const _quiet = isQuietSetting(cellarQuietKey(_t))
+  const _quiet = isCellarQuiet(_t)
   // 喚 Claude 型：跑固定 prompt 的子進程（打包失敗自動分析同一套做法）
   if (_t.kind === 'claude') {
     const _c = _t.claude ?? {}

@@ -14,12 +14,20 @@ const KIND_META = {
 
 export default function CellarPanel({ onClose }) {
   const [tools, setTools] = useState(null)
+  const [shelves, setShelves] = useState([])
+  // 層架收合（少爺 2026-10-22 層架收納）：記住展開過的層架；預設全部收起
+  const [openShelves, setOpenShelves] = useState(() => { try { return JSON.parse(localStorage.getItem('tc_cellar_open_shelves') ?? '[]') } catch { return [] } })
+  const toggleShelf = (InId) => setOpenShelves(_prev => {
+    const _next = _prev.includes(InId) ? _prev.filter(x => x !== InId) : [..._prev, InId]
+    try { localStorage.setItem('tc_cellar_open_shelves', JSON.stringify(_next)) } catch { /* 無痕視窗 */ }
+    return _next
+  })
   const [err, setErr] = useState(null)
   const [hint, setHint] = useState('')
 
   useEffect(() => {
     fetch('/api/tools').then(r => r.json()).then(d => {
-      if (d.ok) setTools(d.tools ?? [])
+      if (d.ok) { setTools(d.tools ?? []); setShelves(d.shelves ?? []) }
       else setErr(d.error ?? '載入失敗')
     }).catch(e => setErr(String(e)))
   }, [])
@@ -62,19 +70,40 @@ export default function CellarPanel({ onClose }) {
           {!tools && !err && <div className="text-[10px] text-[var(--text-muted)] text-center py-8">載入中…</div>}
           {err && <div className="text-[10px] text-red-400 text-center py-8">⚠️ {err}</div>}
           {tools?.length === 0 && <div className="text-[10px] text-[var(--text-muted)] text-center py-8">酒窖尚無工具</div>}
-          {tools?.map(t => {
-            const km = KIND_META[t.kind] ?? { icon: '•', label: t.kind, cls: 'text-[var(--text-muted)] border-[var(--border)]' }
+          {tools && shelves.map(s => {
+            const _items = tools.filter(t => t.shelf === s.id)
+            if (!_items.length) return null
+            const _open = openShelves.includes(s.id)
+            const _quietCount = _items.filter(t => t.quiet).length
             return (
-              <div key={t.id} className="flex items-start gap-2 border border-[var(--border)] rounded p-2.5 hover:border-[var(--gold-border)] transition-colors">
-                <button onClick={() => runTool(t)} className="flex-1 min-w-0 text-left">
-                  <div className="flex items-center gap-2">
-                    <span className={`text-[9px] px-1.5 py-0.5 rounded border shrink-0 ${km.cls}`}>{km.icon} {km.label}</span>
-                    <span className="text-[12px] text-[var(--text)] flex-1">{t.name}</span>
-                  </div>
-                  {t.desc && <div className="text-[9px] text-[var(--text-muted)] mt-1">{t.desc}</div>}
+              <div key={s.id} className="border border-[var(--border)] rounded">
+                <button onClick={() => toggleShelf(s.id)}
+                  className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left hover:bg-white/5 transition-colors">
+                  <span className="text-[10px] text-[var(--text-muted)] w-3">{_open ? '▾' : '▸'}</span>
+                  <span className="text-[12px]">{s.icon}</span>
+                  <span className="text-[11px] text-[var(--gold)] tracking-wider flex-1">{s.name}</span>
+                  <span className="text-[9px] text-[var(--text-muted)] font-mono">{_items.length} 項{_quietCount ? ` · 🔕${_quietCount}` : ''}</span>
                 </button>
-                <QuietToggle on={!!t.quiet} busy={quietBusy === t.id} onToggle={(v) => toggleQuiet(t, v)}
-                  title={t.quietMarkerId ? `${QUIET_HINT}\n跑的是誓約排程，與 Marker 同一個設定（改哪邊都一樣）` : QUIET_HINT} />
+                {_open && (
+                  <div className="p-2 pt-0 space-y-2">
+                    {_items.map(t => {
+                      const km = KIND_META[t.kind] ?? { icon: '•', label: t.kind, cls: 'text-[var(--text-muted)] border-[var(--border)]' }
+                      return (
+                        <div key={t.id} className="flex items-start gap-2 border border-[var(--border)] rounded p-2.5 hover:border-[var(--gold-border)] transition-colors">
+                          <button onClick={() => runTool(t)} className="flex-1 min-w-0 text-left">
+                            <div className="flex items-center gap-2">
+                              <span className={`text-[9px] px-1.5 py-0.5 rounded border shrink-0 ${km.cls}`}>{km.icon} {km.label}</span>
+                              <span className="text-[12px] text-[var(--text)] flex-1">{t.name}</span>
+                            </div>
+                            {t.desc && <div className="text-[9px] text-[var(--text-muted)] mt-1">{t.desc}</div>}
+                          </button>
+                          <QuietToggle on={!!t.quiet} busy={quietBusy === t.id} onToggle={(v) => toggleQuiet(t, v)}
+                            title={t.quietMarkerId ? `${QUIET_HINT}\n跑的是誓約排程，與 Marker 同一個設定（改哪邊都一樣）` : QUIET_HINT} />
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
               </div>
             )
           })}

@@ -2026,7 +2026,7 @@ function TcCommitResultModal({ result, onClose }) {
     <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center" onClick={onClose}>
       <div className="w-[30rem] max-h-[70vh] overflow-y-auto bg-[var(--surface)] border border-[var(--border)] rounded-lg p-4 shadow-2xl" onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-1">
-          <div className="text-[var(--gold)] text-xs tracking-widest uppercase">⚡ TC Commit 完成</div>
+          <div className="text-[var(--gold)] text-xs tracking-widest uppercase">⚡ {result.projectName && result.projectName !== 'TheClaudenental' ? result.projectName : 'TC'} Commit 完成</div>
           <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text)] text-sm leading-none">✕</button>
         </div>
         <div className="flex items-center gap-2 text-[10px] text-[var(--text-muted)] font-mono mb-2">
@@ -2572,7 +2572,8 @@ export default function App() {
     // tc 自身不在版控面板（只服務高桌會專案）→ 改用彈跳視窗呈現（少爺 2026-08-20）
     if (msg.type === 'git_autocommit_result') {
       try { window.dispatchEvent(new CustomEvent('tc-git-autocommit', { detail: msg })) } catch {}
-      if (msg.projectId === 'tc' && msg.result) setTcCommitPopup(msg.result)
+      // 工具集一鍵提交（少爺 2026-10-22）同樣不在版控面板 → 共用此彈窗，標題帶專案名
+      if ((msg.cellarCommit || msg.projectId === 'tc') && msg.result) setTcCommitPopup({ ...msg.result, projectName: msg.projectName ?? msg.projectId })
     }
     // 侍酒師重萃取完成／待定奪子任務綁定（少爺 2026-09-29 待定奪面板）：轉發給 Sommelier 就地重抓
     if (msg.type === 'sommelier_refreshed') {
