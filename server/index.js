@@ -19,6 +19,7 @@ import { ASK_TOOL, askQuestionsOf, askKeyOf, askSummary, buildAskAnswer, asciiJs
 import { classifyApiError, isWeeklyLimit, parseResetText, resolveAutoResumeSettings, decideAction, pickBatch, resumePrompt, recoverAuthFailedRecord, isAutoSwitchThrashing, recordsToReattribute, AUTO_RESUME_DEFAULTS } from './usageInterrupts.js'
 import { readTranscriptLines, transcriptLineEnd, heatEntryFromLine, newScanSummary, accumulateScanSummary } from './transcriptReader.js'
 import { AUTO_SWITCH_DEFAULTS, resolveAutoSwitchSettings, accountStatus, decideSwitch, decideRevert, detectExternalSwitch, raiseCooling, rollbackCoolingSince, mergeCredentials, matchAccountByCredentials, liveOrganizationUuid, accountRecordFrom, accountPublicView, parseLoginUrl } from './accountVault.js'
+import { parseCodexAuth, openaiAccountPublicView, pickOpenaiAccount, parseCodexLoginUrl, buildOutsourceArgs } from './openaiVault.js'
 
 const PORT = 3001
 const CLAUDIA_URL = 'http://localhost:48901'
@@ -5057,8 +5058,49 @@ const CELLAR_SHELVES = [
   { id: 'audio',     icon: '🎵', name: '音訊' },
   { id: 'dev',       icon: '🛠️', name: '開發環境' },
   { id: 'knowledge', icon: '📚', name: '知識訂閱' },
+  { id: 'research',  icon: '📖', name: '遊戲參考' },
   { id: 'other',     icon: '📦', name: '其他' },
 ]
+// ─── 酒窖：遊戲機制參考檔產生器（少爺 2026-10-23）──────────────────────────────────
+// 「照 Reference_Sekiro_CombatSystem.md 的指令產出其他遊戲的這種檔案…輸入其他遊戲的名稱後按下產出按鈕」
+// 「還有可以瀏覽其他的這類檔案」「有類似連結，點下就會 Windows 問我要用哪種方式開啟的程度即可」
+// 規則 SSOT＝MasterBrain 的 SOP（改規則只改那份 md，不必改這裡、不必重啟 TC）；這裡只帶入遊戲名稱
+const GAME_REFERENCE_SOP = 'C:\\Project\\MasterBrain\\.agent\\workflows\\z_sub_game_reference_research.md'
+const GAME_REFERENCE_DIR = 'C:\\Project\\MasterBrain\\GameMechanics'
+const GAME_REFERENCE_FILE_RE = /^Reference_.+\.md$/
+
+function buildGameReferencePrompt(InGame, InEntry) {
+  return [
+    `(${InEntry}) 請為《${InGame}》產出遊戲機制參考檔。全程不要問我。`,
+    `完整照這份作業程序做（先 Read 全文）：${GAME_REFERENCE_SOP}`,
+    `原始指令（隻狼那份的出身，換成這款遊戲）：「提供我${InGame}的所有戰鬥系統，還有看有哪些招式(配合機制的玩法)，以及參數背後承擔的設計意圖」。`,
+    `格式範本：C:\\Project\\MasterBrain\\GameMechanics\\Roman\\Reference_Sekiro_CombatSystem.md。`,
+  ].join('\n')
+}
+
+// 已產出的參考檔（遞迴掃 GameMechanics；標題取第一個 # 行）
+function listGameReferenceFiles() {
+  const _out = []
+  const _walk = (InDir) => {
+    let _entries = []
+    try { _entries = fs.readdirSync(InDir, { withFileTypes: true }) } catch { return }
+    for (const _e of _entries) {
+      const _abs = path.join(InDir, _e.name)
+      if (_e.isDirectory()) { _walk(_abs); continue }
+      if (!GAME_REFERENCE_FILE_RE.test(_e.name)) continue
+      let _title = _e.name
+      try {
+        const _head = fs.readFileSync(_abs, 'utf8').slice(0, 2000)
+        const _m = _head.match(/^#\s+(.+)$/m)
+        if (_m) _title = _m[1].trim()
+      } catch { /* 讀不到就用檔名 */ }
+      _out.push({ rel: path.relative(GAME_REFERENCE_DIR, _abs), title: _title, mtime: fs.statSync(_abs).mtimeMs })
+    }
+  }
+  _walk(GAME_REFERENCE_DIR)
+  return _out.sort((a, b) => b.mtime - a.mtime)
+}
+
 const CELLAR_TOOLS = [
   {
     id: 'tc-commit', shelf: 'commit', name: 'TC Commit（一鍵提交）', kind: 'claude',
@@ -5114,6 +5156,15 @@ const CELLAR_TOOLS = [
     exec: ['cmd.exe', ['/c', 'schtasks', '/run', '/tn', 'Claude_知識訂閱_TheOrangeDuck']],
     // 跑的就是該誓約的排程 → 勿擾與誓約共用同一個設定（兩邊顯示、改哪邊都一樣）
     markerId: 'win:Claude_知識訂閱_TheOrangeDuck',
+  },
+  {
+    id: 'game-reference', shelf: 'research', name: '遊戲機制參考檔產生器', kind: 'claude',
+    desc: '輸入遊戲名稱按產出：喚 Claude 照隻狼那份的格式研究戰鬥系統、招式與設計意圖，寫成 Reference_*.md；下方可瀏覽已產出的檔',
+    // input＝前端顯示輸入框＋產出鈕；browse＝前端列出已產出檔，點擊跳 Windows「選擇開啟方式」
+    input: { placeholder: '遊戲名稱（例：鬼武者、Hi-Fi RUSH、仁王 2）', button: '產出', maxLength: 80 },
+    browse: true,
+    // 研究不改檔案以外的東西、可多款並行 → 不受「同專案已有 Claude 進程」閘門限制；cwd 用羅馬才讀得到羅馬的哲學與記憶
+    claude: { cwd: 'C:\\Project\\RomanPrototype', model: null, effort: 'high', promptBuilder: 'gameReference', skipProjectGate: true },
   },
 ]
 // ─── 酒窖：工具集一鍵提交（少爺 2026-10-22）────────────────────────────────────
@@ -5173,8 +5224,27 @@ function isCellarQuiet(InTool) { return getTcSetting(cellarQuietKey(InTool), InT
 app.get('/api/tools', async () => ({
   ok: true,
   shelves: CELLAR_SHELVES,
-  tools: cellarTools().map(t => ({ id: t.id, shelf: CELLAR_SHELVES.some(s => s.id === t.shelf) ? t.shelf : 'other', name: t.name, kind: t.kind, desc: t.desc, quiet: isCellarQuiet(t), quietMarkerId: t.markerId ?? null })),
+  tools: cellarTools().map(t => ({ id: t.id, shelf: CELLAR_SHELVES.some(s => s.id === t.shelf) ? t.shelf : 'other', name: t.name, kind: t.kind, desc: t.desc, quiet: isCellarQuiet(t), quietMarkerId: t.markerId ?? null, input: t.input ?? null, browse: !!t.browse })),
 }))
+// 酒窖工具的已產出檔清單（目前只有遊戲機制參考檔產生器）
+app.get('/api/tools/files/:id', async (request, reply) => {
+  const _t = cellarTools().find(t => t.id === request.params.id)
+  if (!_t?.browse) { reply.code(404); return { ok: false, error: '此工具沒有可瀏覽的檔案' } }
+  return { ok: true, dir: GAME_REFERENCE_DIR, files: listGameReferenceFiles() }
+})
+// 點檔名＝跳出 Windows「你要如何開啟這個檔案？」（rundll32 shell32 OpenAs_RunDLL）；只放行清單裡的檔
+app.post('/api/tools/files/:id/open', async (request, reply) => {
+  const _t = cellarTools().find(t => t.id === request.params.id)
+  if (!_t?.browse) { reply.code(404); return { ok: false, error: '此工具沒有可瀏覽的檔案' } }
+  const _rel = String(request.body?.rel ?? '')
+  if (!listGameReferenceFiles().some(f => f.rel === _rel)) { reply.code(400); return { ok: false, error: `不在清單裡的檔案：${_rel}` } }
+  const _abs = path.join(GAME_REFERENCE_DIR, _rel)
+  try {
+    spawn('rundll32.exe', ['shell32.dll,OpenAs_RunDLL', _abs], { detached: true, stdio: 'ignore' }).unref()
+    logEvent('cellar.file.openas', { id: _t.id, rel: _rel })
+    return { ok: true, opened: _abs }
+  } catch (e) { reply.code(500); return { ok: false, error: e.message } }
+})
 app.post('/api/tools/quiet', async (request, reply) => {
   const { id, quiet } = request.body ?? {}
   const _t = cellarTools().find(t => t.id === id)
@@ -5196,10 +5266,16 @@ app.post('/api/tools/run/:id', async (request) => {
   if (_t.kind === 'claude') {
     const _c = _t.claude ?? {}
     if (!isSafeCwd(_c.cwd)) return { ok: false, error: `工作目錄不存在：${_c.cwd}` }
-    // 專案層閘門（不是聊天室排隊）：酒窖的 Claude 工具目前都是提交類，同 cwd 有無頭聊天室正在改檔時不跑
-    if (claudeLanes.runningInProject(_c.cwd).length) return { ok: false, error: `「${_t.name}」：該專案已有 Claude 進程執行中（可能正在改檔），等它跑完再按` }
+    // 專案層閘門（不是聊天室排隊）：提交類工具在同 cwd 有無頭聊天室正在改檔時不跑；研究類（skipProjectGate）不受限
+    if (!_c.skipProjectGate && claudeLanes.runningInProject(_c.cwd).length) return { ok: false, error: `「${_t.name}」：該專案已有 Claude 進程執行中（可能正在改檔），等它跑完再按` }
     // gitProjectId 型：prompt 依該專案當下的 git 規則現算（規則改了不必動程式碼）
     let _prompt = _c.prompt
+    // 帶輸入型：輸入框內容（去換行、限長）帶進 prompt
+    if (_c.promptBuilder === 'gameReference') {
+      const _game = String(request.body?.input ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, _t.input?.maxLength ?? 80)
+      if (!_game) return { ok: false, error: '請先輸入遊戲名稱' }
+      _prompt = buildGameReferencePrompt(_game, `TC 酒窖「${_t.name}」`)
+    }
     if (_c.gitProjectId) {
       const _gp = findGitProject(_c.gitProjectId)
       if (!_gp) return { ok: false, error: `「${_t.name}」：專案「${_c.gitProjectId}」未設 git 規則` }
@@ -5208,7 +5284,8 @@ app.post('/api/tools/run/:id', async (request) => {
     if (!_prompt) return { ok: false, error: `「${_t.name}」：沒有可執行的 prompt` }
     spawnClaude(_c.cwd, _prompt, null, _c.model ?? null, _c.effort ?? null, null, 0, _quiet)
     logEvent('cellar.claude.spawn', { id: _t.id, cwd: _c.cwd, model: _c.model ?? null, effort: _c.effort ?? null, quiet: _quiet })
-    return { ok: true, ran: `${_t.name}（已喚起 Claude${_quiet ? '・勿擾' : ''}，完成後看版控狀態或聊天室）` }
+    const _after = _t.browse ? '完成後按「瀏覽已產出」重新整理，或看聊天室' : '完成後看版控狀態或聊天室'
+    return { ok: true, ran: `${_t.name}（已喚起 Claude${_quiet ? '・勿擾' : ''}，${_after}）` }
   }
   if (_t.kind !== 'execute') return { ok: false, error: '此工具非執行型（execute）' }
   if (!_t.exec) return { ok: false, error: `「${_t.name}」尚未接上啟動指令（UE 內 GUI 開發中）` }
@@ -9241,6 +9318,196 @@ app.post('/api/accounts/login/:id/cancel', async (request) => {
   if (_j.status === 'waiting_browser') { _j.status = 'cancelled'; try { _j.proc.kill() } catch {} }
   return { ok: true }
 })
+
+// ─── OpenAI（Codex）帳號＋外包給其他模型（少爺 2026-10-25）────────────────────────────────
+// 「TC是工具既是介面，而AI只是驅動的燃料」：帳號面板可加 OpenAI 帳號；聊天室把設計交付單之類的工作外包給 GPT，
+// 拿回交付文件後由 Claude 照做（「類似外包給其他模型去處理，之後(Opus 5.5)實作可以直接照做」）。
+// 一個帳號＝一個 CODEX_HOME：匯入目前登入＝登記 ~/.codex 本身（不複製，避免更新權杖兩份互相作廢）；新加入的放 tc_accounts/openai/<帳號 id>/。
+// 純判斷在 openaiVault.js，機檢 openaiVault.check.mjs。
+const OPENAI_DIR = path.join(ACCOUNTS_DIR, 'openai')
+const OPENAI_INDEX_FILE = path.join(OPENAI_DIR, 'accounts.json')
+const CODEX_DEFAULT_HOME = path.join(os.homedir(), '.codex')
+const OUTSOURCE_TIMEOUT_MS = 60 * 60 * 1000
+let openaiState = (() => { try { const _s = JSON.parse(fs.readFileSync(OPENAI_INDEX_FILE, 'utf-8')); return { accounts: _s.accounts ?? {}, activeId: _s.activeId ?? null } } catch { return { accounts: {}, activeId: null } } })()
+const openaiLoginJobs = new Map()
+const outsourceJobs = new Map()   // 外包工作 id → { proc, status, accountId, model, outputFile, log, startedAt, endedAt, exitCode }
+let codexExeCache = null
+
+function saveOpenaiState() {
+  fs.mkdirSync(OPENAI_DIR, { recursive: true })
+  atomicWriteJson(OPENAI_INDEX_FILE, openaiState)
+  broadcast({ type: 'accounts_update' })
+}
+
+/** Codex 執行檔：PATH 上的 codex 優先，否則找 Windows 市集版 Codex 安裝資料夾（版本更新後路徑會變，每次失效重找） */
+function findCodexExe() {
+  if (codexExeCache && fs.existsSync(codexExeCache)) return codexExeCache
+  const _which = spawnSync('where', ['codex'], { encoding: 'utf-8', windowsHide: true })
+  const _onPath = String(_which.stdout ?? '').split(/\r?\n/).find(p => /codex(\.exe)?$/i.test(p.trim()) && !/WindowsApps\\OpenAI\.Codex/i.test(p))
+  if (_onPath) return (codexExeCache = _onPath.trim())
+  const _ps = spawnSync('powershell', ['-NoProfile', '-Command', '(Get-AppxPackage -Name OpenAI.Codex).InstallLocation'], { encoding: 'utf-8', windowsHide: true })
+  const _loc = String(_ps.stdout ?? '').trim()
+  const _exe = _loc ? path.join(_loc, 'app', 'resources', 'codex.exe') : ''
+  return (codexExeCache = _exe && fs.existsSync(_exe) ? _exe : null)
+}
+
+function openaiAccountList() { return Object.values(openaiState.accounts) }
+
+/** 登記一個 CODEX_HOME 為帳號；同帳號再登記＝更新資料並解除停用 */
+function storeOpenaiAccount(InHome, InSource, InShared) {
+  const _info = parseCodexAuth(readJsonFile(path.join(InHome, 'auth.json')))
+  if (!_info) throw new Error('這個 Codex 資料夾沒有可辨識的登入')
+  const _prev = openaiState.accounts[_info.accountId]
+  openaiState.accounts[_info.accountId] = { ..._prev, ..._info, homeDir: InHome, shared: InShared, source: _prev?.source ?? InSource, addedAt: _prev?.addedAt ?? Date.now(), disabled: false }
+  if (!openaiState.activeId) openaiState.activeId = _info.accountId
+  saveOpenaiState()
+  logEvent('openai.account.store', { accountId: _info.accountId, source: InSource })
+  return openaiState.accounts[_info.accountId]
+}
+
+/** 加入帳號：在臨時 CODEX_HOME 跑官方 `codex login`（開瀏覽器登入），成功後改名成 openai/<帳號 id>/ 並複製目前的 config.toml（模型設定） */
+function startOpenaiLogin() {
+  const _exe = findCodexExe()
+  if (!_exe) throw new Error('找不到 Codex（請先安裝 Codex App 或 codex CLI）')
+  const _id = `login-${Date.now()}`
+  const _dir = path.join(OPENAI_DIR, _id)
+  fs.mkdirSync(_dir, { recursive: true })
+  const _env = { ...process.env, CODEX_HOME: _dir }
+  delete _env.OPENAI_API_KEY
+  const _proc = spawn(_exe, ['login'], { cwd: _dir, env: _env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+  const _job = { id: _id, dir: _dir, proc: _proc, output: '', url: null, status: 'waiting_browser', error: null, accountUuid: null, startedAt: Date.now() }
+  openaiLoginJobs.set(_id, _job)
+  const _onData = d => { _job.output = (_job.output + d.toString()).slice(-8000); _job.url = _job.url ?? parseCodexLoginUrl(_job.output); broadcast({ type: 'account_login_update', id: _id }) }
+  _proc.stdout.on('data', _onData)
+  _proc.stderr.on('data', _onData)
+  const _timer = setTimeout(() => { if (_job.status === 'waiting_browser') { _job.status = 'failed'; _job.error = '超過 15 分鐘沒完成登入'; try { _proc.kill() } catch {} } }, ACCOUNT_LOGIN_TIMEOUT_MS)
+  _proc.on('exit', (InCode) => {
+    clearTimeout(_timer)
+    let _keep = false
+    if (_job.status === 'waiting_browser') {
+      const _info = InCode === 0 ? parseCodexAuth(readJsonFile(path.join(_dir, 'auth.json'))) : null
+      if (_info) {
+        try {
+          const _home = path.join(OPENAI_DIR, _info.accountId.replace(/[^\w.-]/g, '_'))
+          fs.rmSync(_home, { recursive: true, force: true })
+          fs.renameSync(_dir, _home)
+          _keep = true
+          try { fs.copyFileSync(path.join(CODEX_DEFAULT_HOME, 'config.toml'), path.join(_home, 'config.toml')) } catch {}
+          storeOpenaiAccount(_home, 'login', false)
+          _job.status = 'done'; _job.accountUuid = _info.accountId
+        } catch (e) { _job.status = 'failed'; _job.error = e.message }
+      } else { _job.status = 'failed'; _job.error = InCode === 0 ? '登入完成但讀不到帳號' : `登入程序結束（代碼 ${InCode}）` }
+    }
+    if (!_keep) try { fs.rmSync(_dir, { recursive: true, force: true }) } catch {}
+    broadcast({ type: 'account_login_update', id: _id })
+  })
+  return _job
+}
+
+app.get('/api/openai/accounts', async () => {
+  const _now = Date.now()
+  const _defaultInfo = parseCodexAuth(readJsonFile(path.join(CODEX_DEFAULT_HOME, 'auth.json')))
+  return {
+    accounts: openaiAccountList().map(a => openaiAccountPublicView(a, _now, openaiState.activeId)),
+    activeId: openaiState.activeId,
+    codexFound: !!findCodexExe(),
+    currentLoginInVault: !_defaultInfo || !!openaiState.accounts[_defaultInfo.accountId],
+  }
+})
+
+app.post('/api/openai/accounts/import-current', async () => {
+  try { const _a = storeOpenaiAccount(CODEX_DEFAULT_HOME, 'import', true); return { ok: true, accountId: _a.accountId } }
+  catch (e) { return { ok: false, error: e.message } }
+})
+
+app.post('/api/openai/accounts/:id/activate', async (request) => {
+  const _a = openaiState.accounts[request.params.id]
+  if (!_a) return { ok: false, error: '保管庫沒有這個帳號' }
+  openaiState.activeId = _a.accountId
+  saveOpenaiState()
+  return { ok: true }
+})
+
+app.post('/api/openai/accounts/:id/disable', async (request) => {
+  const _a = openaiState.accounts[request.params.id]
+  if (!_a) return { ok: false, error: '保管庫沒有這個帳號' }
+  _a.disabled = request.body?.disabled !== false
+  saveOpenaiState()
+  return { ok: true, disabled: _a.disabled }
+})
+
+app.delete('/api/openai/accounts/:id', async (request) => {
+  const _a = openaiState.accounts[request.params.id]
+  if (!_a) return { ok: false, error: '保管庫沒有這個帳號' }
+  delete openaiState.accounts[_a.accountId]
+  if (openaiState.activeId === _a.accountId) openaiState.activeId = openaiAccountList()[0]?.accountId ?? null
+  // 匯入的 ~/.codex 是 Codex App 自己的登入，只取消登記、不刪檔
+  if (!_a.shared && _a.homeDir?.startsWith(OPENAI_DIR)) try { fs.rmSync(_a.homeDir, { recursive: true, force: true }) } catch {}
+  saveOpenaiState()
+  return { ok: true }
+})
+
+app.post('/api/openai/accounts/login', async () => {
+  for (const j of openaiLoginJobs.values()) if (j.status === 'waiting_browser') return { ok: true, job: loginJobView(j), reused: true }
+  try { return { ok: true, job: loginJobView(startOpenaiLogin()) } } catch (e) { return { ok: false, error: e.message } }
+})
+
+app.get('/api/openai/accounts/login/:id', async (request) => {
+  const _j = openaiLoginJobs.get(request.params.id)
+  return _j ? { ok: true, job: loginJobView(_j) } : { ok: false, error: '沒有這個登入工作' }
+})
+
+app.post('/api/openai/accounts/login/:id/cancel', async (request) => {
+  const _j = openaiLoginJobs.get(request.params.id)
+  if (!_j) return { ok: false, error: '沒有這個登入工作' }
+  if (_j.status === 'waiting_browser') { _j.status = 'cancelled'; try { _j.proc.kill() } catch {} }
+  return { ok: true }
+})
+
+function outsourceJobView(InJob) {
+  return { id: InJob.id, status: InJob.status, accountId: InJob.accountId, model: InJob.model, outputFile: InJob.outputFile, startedAt: InJob.startedAt, endedAt: InJob.endedAt, exitCode: InJob.exitCode, error: InJob.error, logTail: InJob.log.slice(-1500) }
+}
+
+/** 外包：用使用中的 OpenAI 帳號跑 `codex exec`（預設唯讀），最後一則回覆寫到 outputFile */
+app.post('/api/outsource/run', async (request) => {
+  const _b = request.body ?? {}
+  const _exe = findCodexExe()
+  if (!_exe) return { ok: false, error: '找不到 Codex（請先安裝 Codex App 或 codex CLI）' }
+  let _prompt = String(_b.prompt ?? '')
+  if (!_prompt && _b.promptFile) try { _prompt = fs.readFileSync(_b.promptFile, 'utf-8') } catch (e) { return { ok: false, error: `讀不到委託檔：${e.message}` } }
+  if (!_prompt.trim()) return { ok: false, error: '沒有委託內容（prompt 或 promptFile）' }
+  if (!_b.outputFile) return { ok: false, error: '要指定 outputFile（交付文件寫到哪）' }
+  const _acc = pickOpenaiAccount(openaiAccountList(), openaiState.activeId, _b.accountId ?? null, Date.now())
+  if (!_acc) return { ok: false, error: 'TC 帳號面板沒有可用的 OpenAI 帳號（先匯入目前的 Codex 登入或加入帳號）' }
+  const _id = `os-${Date.now()}`
+  const _env = { ...process.env, CODEX_HOME: _acc.homeDir }
+  delete _env.OPENAI_API_KEY
+  const _proc = spawn(_exe, buildOutsourceArgs({ ..._b, outputFile: _b.outputFile }), { cwd: _b.cwd ?? os.homedir(), env: _env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+  const _job = { id: _id, proc: _proc, status: 'running', accountId: _acc.accountId, model: _b.model ?? null, outputFile: _b.outputFile, log: '', startedAt: Date.now(), endedAt: null, exitCode: null, error: null }
+  outsourceJobs.set(_id, _job)
+  _acc.lastUsedAt = Date.now(); saveOpenaiState()
+  const _onData = d => { _job.log = (_job.log + d.toString()).slice(-20000) }
+  _proc.stdout.on('data', _onData)
+  _proc.stderr.on('data', _onData)
+  _proc.stdin.end(_prompt)
+  const _timer = setTimeout(() => { if (_job.status === 'running') { _job.status = 'failed'; _job.error = '超過 60 分鐘'; try { _proc.kill() } catch {} } }, OUTSOURCE_TIMEOUT_MS)
+  _proc.on('exit', (InCode) => {
+    clearTimeout(_timer)
+    _job.exitCode = InCode; _job.endedAt = Date.now()
+    if (_job.status === 'running') _job.status = InCode === 0 && fs.existsSync(_job.outputFile) ? 'done' : 'failed'
+    logEvent('outsource.done', { id: _id, accountId: _acc.accountId, status: _job.status, ms: _job.endedAt - _job.startedAt })
+    broadcast({ type: 'outsource_update', id: _id })
+  })
+  logEvent('outsource.start', { id: _id, accountId: _acc.accountId, model: _job.model, outputFile: _job.outputFile })
+  return { ok: true, job: outsourceJobView(_job) }
+})
+
+app.get('/api/outsource/jobs/:id', async (request) => {
+  const _j = outsourceJobs.get(request.params.id)
+  return _j ? { ok: true, job: outsourceJobView(_j) } : { ok: false, error: '沒有這個外包工作（伺服器重啟後紀錄會清空）' }
+})
+
+app.get('/api/outsource/jobs', async () => ({ jobs: [...outsourceJobs.values()].map(outsourceJobView).reverse().slice(0, 20) }))
 
 async function usageInterruptTick() {
   if (usageTickRunning) return

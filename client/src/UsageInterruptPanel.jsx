@@ -168,6 +168,96 @@ function AccountsSection({ accounts, onChanged }) {
   )
 }
 
+/** OpenAI 帳號區（少爺 2026-10-25「AI只是驅動的燃料」）：聊天室外包給 GPT 時用「使用中」的那個帳號；不影響 Claude 聊天室的帳號 */
+function OpenaiAccountsSection({ openai, onChanged }) {
+  const [busy, setBusy] = useState(null)
+  const [err, setErr] = useState(null)
+  const [job, setJob] = useState(null)
+
+  useEffect(() => {
+    if (!job || job.status !== 'waiting_browser') return
+    const t = setInterval(() => {
+      fetch(`/api/openai/accounts/login/${job.id}`).then(r => r.json()).then(d => {
+        if (d?.job) { setJob(d.job); if (d.job.status !== 'waiting_browser') onChanged() }
+      }).catch(() => {})
+    }, 2000)
+    return () => clearInterval(t)
+  }, [job, onChanged])
+
+  const run = async (key, fn) => {
+    setBusy(key); setErr(null)
+    try { const r = await fn(); if (r && r.ok === false) setErr(r.error ?? '動作失敗') } catch (e) { setErr(String(e)) }
+    setBusy(null)
+    onChanged()
+  }
+
+  const startLogin = () => run('login', async () => {
+    const r = await postJson('/api/openai/accounts/login')
+    if (r?.job) setJob(r.job)
+    return r
+  })
+
+  return (
+    <div className="mb-3 rounded border border-[var(--border)] p-2">
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-[10px] text-[var(--gold)]">OpenAI 帳號（外包用）</span>
+        <span className="text-[9px] text-[var(--text-muted)]">
+          Codex：<span className={openai?.codexFound ? 'text-green-400' : 'text-amber-400'}>{openai ? (openai.codexFound ? '已找到' : '找不到（請安裝 Codex App）') : '…'}</span>
+        </span>
+      </div>
+      {err && <div className="text-[10px] text-red-400 mb-1">⚠️ {err}</div>}
+      {openai && !openai.currentLoginInVault && (
+        <div className="text-[9px] text-amber-400 mb-1 flex items-center gap-2">
+          這台電腦的 Codex 已登入、但還沒登記到 TC。
+          <button onClick={() => run('import', () => postJson('/api/openai/accounts/import-current'))} disabled={!!busy}
+            className="px-2 py-0.5 rounded border border-[var(--gold-border)] text-[var(--gold)] hover:bg-[var(--gold)]/10 disabled:opacity-50">
+            {busy === 'import' ? '登記中…' : '登記目前的 Codex 登入'}
+          </button>
+        </div>
+      )}
+      {(openai?.accounts ?? []).map(x => {
+        const st = ACCOUNT_STATUS[x.status] ?? ACCOUNT_STATUS.available
+        return (
+          <div key={x.accountId} className="flex items-center gap-2 py-1 border-t border-[var(--border)] first:border-t-0">
+            <span className={`text-[9px] px-1.5 py-0.5 rounded border ${st.cls}`}>{st.label}</span>
+            <span className="text-[11px] text-[var(--text)] truncate flex-1" title={x.accountId}>
+              {x.active && <span className="text-[var(--gold)]">● 使用中 </span>}{x.email ?? x.accountId.slice(0, 8)}
+              <span className="text-[9px] text-[var(--text-muted)]"> · {x.plan ?? '?'}{x.shared ? ' · 與 Codex App 共用登入' : ''}{x.lastUsedAt ? ` · 上次外包 ${fmtWhen(x.lastUsedAt)}` : ''}</span>
+            </span>
+            {!x.active && x.status === 'available' && (
+              <button onClick={() => run(`act:${x.accountId}`, () => postJson(`/api/openai/accounts/${x.accountId}/activate`))} disabled={!!busy}
+                className="text-[9px] px-2 py-0.5 rounded border border-[var(--gold-border)] text-[var(--gold)] hover:bg-[var(--gold)]/10 disabled:opacity-50">設為使用中</button>
+            )}
+            <button onClick={() => run(`dis:${x.accountId}`, () => postJson(`/api/openai/accounts/${x.accountId}/disable`, { disabled: !x.disabled }))} disabled={!!busy}
+              className="text-[9px] px-2 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text)] disabled:opacity-50">
+              {x.disabled ? '啟用' : '停用'}
+            </button>
+            <button onClick={() => { if (window.confirm(`從 TC 移除 ${x.email ?? x.accountId}？${x.shared ? '（只取消登記，Codex App 的登入不受影響）' : '之後要用得重新加入。'}`)) run(`rm:${x.accountId}`, () => postJson(`/api/openai/accounts/${x.accountId}`, null, 'DELETE')) }} disabled={!!busy}
+              className="text-[9px] px-2 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-red-400 disabled:opacity-50">移除</button>
+          </div>
+        )
+      })}
+      <div className="flex items-center gap-2 mt-1.5">
+        <button onClick={startLogin} disabled={!!busy || job?.status === 'waiting_browser' || !openai?.codexFound}
+          className="text-[9px] px-2 py-0.5 rounded border border-[var(--gold-border)] text-[var(--gold)] hover:bg-[var(--gold)]/10 disabled:opacity-50">
+          ＋ 加入 OpenAI 帳號（開瀏覽器登入）
+        </button>
+        {job && <span className="text-[9px] text-[var(--text-muted)]">{LOGIN_STATUS[job.status] ?? job.status}{job.error ? `：${job.error}` : ''}</span>}
+        {job?.status === 'waiting_browser' && (
+          <button onClick={() => run('cancel', async () => { const r = await postJson(`/api/openai/accounts/login/${job.id}/cancel`); setJob(j => ({ ...j, status: 'cancelled' })); return r })}
+            className="text-[9px] px-2 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text)]">取消</button>
+        )}
+      </div>
+      {job?.status === 'waiting_browser' && job.url && (
+        <div className="text-[9px] text-[var(--text-muted)] mt-1">瀏覽器應已開啟 ChatGPT 登入頁；沒開的話<a href={job.url} target="_blank" rel="noopener noreferrer" className="text-[var(--gold)] underline">點這裡登入</a>。</div>
+      )}
+      <div className="text-[9px] text-[var(--text-muted)] mt-1.5 leading-relaxed">
+        聊天室要「外包給 GPT」時用使用中的帳號（工具 <code>Invoke-Outsource.py</code>）：GPT 親手產出成品（例如視覺），Claude 驗收後在專案裡實作。這裡換帳號不影響 Claude 聊天室。
+      </div>
+    </div>
+  )
+}
+
 function fmtWhen(ts) {
   if (!ts) return '—'
   const d = new Date(ts)
@@ -208,10 +298,12 @@ export default function UsageInterruptPanel({ onClose }) {
   const [showDone, setShowDone] = useState(false)
 
   const [accounts, setAccounts] = useState(null)
+  const [openai, setOpenai] = useState(null)
 
   const load = useCallback(() => {
     fetch('/api/usage/interrupts').then(r => r.json()).then(setData).catch(e => setErr(String(e)))
     fetch('/api/accounts').then(r => r.json()).then(setAccounts).catch(() => {})
+    fetch('/api/openai/accounts').then(r => r.json()).then(setOpenai).catch(() => {})
   }, [])
   useEffect(() => { load(); const t = setInterval(load, 15000); return () => clearInterval(t) }, [load])
 
@@ -243,6 +335,7 @@ export default function UsageInterruptPanel({ onClose }) {
           ；開關在 ⚙ 總設定「用量中斷」。偵測與記錄永遠開著、不花用量。
         </div>
         <AccountsSection accounts={accounts} onChanged={load} />
+        <OpenaiAccountsSection openai={openai} onChanged={load} />
         <label className="flex items-center gap-1 text-[9px] text-[var(--text-muted)] mb-2">
           <input type="checkbox" checked={showDone} onChange={e => setShowDone(e.target.checked)} /> 顯示已處理的紀錄
         </label>

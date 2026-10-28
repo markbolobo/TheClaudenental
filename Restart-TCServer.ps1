@@ -31,6 +31,7 @@ $gateChecks = @(
     @{ File = 'qaDecisions.check.mjs'; Why = 'QA 待定奪機檢未通過（npm run check:qadecisions），QA Run 與侍酒師共用的定奪面板接線被改壞了' },
     @{ File = 'usageInterrupts.check.mjs'; Why = '用量中斷機檢未通過（npm run check:usage），偵測／開關／續接接線被改壞了' }
     @{ File = 'accountVault.check.mjs'; Why = '換帳號機檢未通過（npm run check:accounts），換帳號判斷／權杖保管／續接接線被改壞了' }
+    @{ File = 'openaiVault.check.mjs'; Why = 'OpenAI 帳號／外包機檢未通過（npm run check:openai），權杖保管或外包接線被改壞了' }
     @{ File = 'transcriptReader.check.mjs'; Why = '逐字稿增量讀取機檢未通過（npm run check:transcripts），用量熱度／掃描器／監看又會整份重讀、server 會卡住' }
 )
 foreach ($gate in $gateChecks) {

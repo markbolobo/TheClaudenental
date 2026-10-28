@@ -32,12 +32,37 @@ export default function CellarPanel({ onClose }) {
     }).catch(e => setErr(String(e)))
   }, [])
 
+  // 帶輸入型工具（少爺 2026-10-23 遊戲機制參考檔產生器）：輸入框內容逐工具記
+  const [inputs, setInputs] = useState({})
   const runTool = async (t) => {
+    const _input = (inputs[t.id] ?? '').trim()
+    if (t.input && !_input) { setHint(`⚠️ 「${t.name}」請先輸入${t.input.placeholder ?? '內容'}`); return }
     setHint(`執行「${t.name}」…`)
     const _res = await fetch(`/api/tools/run/${t.id}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(t.input ? { input: _input } : {}),
     }).then(r => r.json()).catch(e => ({ ok: false, error: e.message }))
     setHint(_res.ok ? `✅ 已執行：${_res.ran}` : `⚠️ ${_res.error ?? '執行失敗'}`)
+    if (_res.ok && t.input) setInputs(_prev => ({ ..._prev, [t.id]: '' }))
+  }
+
+  // 已產出檔瀏覽（少爺 2026-10-23「可以瀏覽其他的這類檔案」）：點檔名＝Windows「選擇開啟方式」
+  const [files, setFiles] = useState({})
+  const [openFiles, setOpenFiles] = useState([])
+  const loadFiles = async (t) => {
+    const _res = await fetch(`/api/tools/files/${t.id}`).then(r => r.json()).catch(e => ({ ok: false, error: e.message }))
+    if (_res.ok) setFiles(_prev => ({ ..._prev, [t.id]: _res.files }))
+    else setHint(`⚠️ 讀不到已產出檔：${_res.error ?? '未知原因'}`)
+  }
+  const toggleFiles = (t) => {
+    const _open = openFiles.includes(t.id)
+    setOpenFiles(_prev => _open ? _prev.filter(x => x !== t.id) : [..._prev, t.id])
+    if (!_open) loadFiles(t)
+  }
+  const openFile = async (t, f) => {
+    const _res = await fetch(`/api/tools/files/${t.id}/open`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rel: f.rel }),
+    }).then(r => r.json()).catch(e => ({ ok: false, error: e.message }))
+    setHint(_res.ok ? `📄 已請 Windows 選擇開啟方式：${f.rel}` : `⚠️ 開不了：${_res.error ?? '未知原因'}`)
   }
 
   // 勿擾逐項設定；與誓約共用的工具會連帶改那個誓約的排程（server 回讀驗證後才回 ok）
@@ -88,17 +113,57 @@ export default function CellarPanel({ onClose }) {
                   <div className="p-2 pt-0 space-y-2">
                     {_items.map(t => {
                       const km = KIND_META[t.kind] ?? { icon: '•', label: t.kind, cls: 'text-[var(--text-muted)] border-[var(--border)]' }
+                      const _header = (
+                        <>
+                          <div className="flex items-center gap-2">
+                            <span className={`text-[9px] px-1.5 py-0.5 rounded border shrink-0 ${km.cls}`}>{km.icon} {km.label}</span>
+                            <span className="text-[12px] text-[var(--text)] flex-1">{t.name}</span>
+                          </div>
+                          {t.desc && <div className="text-[9px] text-[var(--text-muted)] mt-1">{t.desc}</div>}
+                        </>
+                      )
+                      const _filesOpen = openFiles.includes(t.id)
                       return (
-                        <div key={t.id} className="flex items-start gap-2 border border-[var(--border)] rounded p-2.5 hover:border-[var(--gold-border)] transition-colors">
-                          <button onClick={() => runTool(t)} className="flex-1 min-w-0 text-left">
-                            <div className="flex items-center gap-2">
-                              <span className={`text-[9px] px-1.5 py-0.5 rounded border shrink-0 ${km.cls}`}>{km.icon} {km.label}</span>
-                              <span className="text-[12px] text-[var(--text)] flex-1">{t.name}</span>
+                        <div key={t.id} className="border border-[var(--border)] rounded p-2.5 hover:border-[var(--gold-border)] transition-colors">
+                          <div className="flex items-start gap-2">
+                            {/* 帶輸入型：整張卡不是按鈕，改由「產出」鈕執行 */}
+                            {t.input
+                              ? <div className="flex-1 min-w-0">{_header}</div>
+                              : <button onClick={() => runTool(t)} className="flex-1 min-w-0 text-left">{_header}</button>}
+                            <QuietToggle on={!!t.quiet} busy={quietBusy === t.id} onToggle={(v) => toggleQuiet(t, v)}
+                              title={t.quietMarkerId ? `${QUIET_HINT}\n跑的是誓約排程，與 Marker 同一個設定（改哪邊都一樣）` : QUIET_HINT} />
+                          </div>
+                          {t.input && (
+                            <div className="flex items-center gap-2 mt-2">
+                              <input value={inputs[t.id] ?? ''} maxLength={t.input.maxLength ?? 80} placeholder={t.input.placeholder ?? ''}
+                                onChange={e => setInputs(_prev => ({ ..._prev, [t.id]: e.target.value }))}
+                                onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) runTool(t) }}
+                                className="flex-1 min-w-0 bg-black/30 border border-[var(--border)] rounded px-2 py-1 text-[11px] text-[var(--text)] focus:border-[var(--gold-border)] outline-none" />
+                              <button onClick={() => runTool(t)}
+                                className="text-[11px] px-3 py-1 rounded border border-[var(--gold)]/50 text-[var(--gold)] hover:bg-[var(--gold)]/10 shrink-0">{t.input.button ?? '執行'}</button>
                             </div>
-                            {t.desc && <div className="text-[9px] text-[var(--text-muted)] mt-1">{t.desc}</div>}
-                          </button>
-                          <QuietToggle on={!!t.quiet} busy={quietBusy === t.id} onToggle={(v) => toggleQuiet(t, v)}
-                            title={t.quietMarkerId ? `${QUIET_HINT}\n跑的是誓約排程，與 Marker 同一個設定（改哪邊都一樣）` : QUIET_HINT} />
+                          )}
+                          {t.browse && (
+                            <div className="mt-2">
+                              <button onClick={() => toggleFiles(t)} className="text-[10px] text-[var(--text-muted)] hover:text-[var(--gold)]">
+                                {_filesOpen ? '▾' : '▸'} 瀏覽已產出{files[t.id] ? `（${files[t.id].length}）` : ''}
+                              </button>
+                              {_filesOpen && (
+                                <div className="mt-1 space-y-0.5">
+                                  <button onClick={() => loadFiles(t)} className="text-[9px] text-[var(--text-muted)] hover:text-[var(--gold)]">↻ 重新整理</button>
+                                  {!files[t.id] && <div className="text-[9px] text-[var(--text-muted)]">載入中…</div>}
+                                  {files[t.id]?.length === 0 && <div className="text-[9px] text-[var(--text-muted)]">還沒有產出的檔</div>}
+                                  {files[t.id]?.map(f => (
+                                    <button key={f.rel} onClick={() => openFile(t, f)} title={`${f.rel}\n點一下：Windows 選擇開啟方式`}
+                                      className="w-full flex items-baseline gap-2 text-left px-1.5 py-0.5 rounded hover:bg-white/5">
+                                      <span className="text-[11px] text-sky-300 underline underline-offset-2 truncate flex-1">{f.title}</span>
+                                      <span className="text-[9px] text-[var(--text-muted)] font-mono shrink-0">{new Date(f.mtime).toLocaleDateString('zh-TW')}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )}
                         </div>
                       )
                     })}

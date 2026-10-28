@@ -12,6 +12,7 @@
     "check:qadecisions": "node qaDecisions.check.mjs",
     "check:usage": "node usageInterrupts.check.mjs",
     "check:accounts": "node accountVault.check.mjs",
+    "check:openai": "node openaiVault.check.mjs",
     "check:transcripts": "node transcriptReader.check.mjs"
   },
   "keywords": [],
