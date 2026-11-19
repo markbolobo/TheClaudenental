@@ -5176,6 +5176,11 @@ const TOOLKIT_PARENT_DIR = 'C:\\Project'
 const TOOLKIT_DIR_RE = /^UE_[A-Za-z0-9]+Toolkit$/
 const TOOLKIT_GIT_RULE = { staging: 'all', lang: 'en', coAuthor: true }
 
+// 酒窖固定提交的 repo（不是工具集、但同樣只在酒窖提交）：MasterBrain（少爺 2026-11-19「我需要TC 酒窖有MasterBrain的一鍵提交」）
+const CELLAR_FIXED_COMMIT_REPOS = [
+  { name: 'MasterBrain', root: 'C:\\Project\\MasterBrain', projectId: 'masterbrain' },
+]
+
 function discoverToolkitRepos() {
   try {
     return fs.readdirSync(TOOLKIT_PARENT_DIR, { withFileTypes: true })
@@ -5185,13 +5190,20 @@ function discoverToolkitRepos() {
   } catch { return [] }
 }
 
+// 酒窖一鍵提交的全部 repo＝固定（MasterBrain）＋掃到的工具集；固定的排前面
+function discoverCellarCommitRepos() {
+  const _fixed = CELLAR_FIXED_COMMIT_REPOS.filter(r => fs.existsSync(path.join(r.root, '.git')))
+  return [..._fixed, ...discoverToolkitRepos()]
+}
+
 function ensureToolkitGitProjects(InRepos) {
   const _cfg = readSommelierConfig()
   _cfg.projects = _cfg.projects ?? []
   const _added = []
   for (const _r of InRepos) {
     if (_cfg.projects.some(p => p.id === _r.projectId)) continue
-    _cfg.projects.push({ id: _r.projectId, name: _r.name, projectRoot: _r.root.replace(/\\/g, '/'), enabled: false, toolkit: true, git: { ...TOOLKIT_GIT_RULE } })
+    const _isToolkit = TOOLKIT_DIR_RE.test(_r.name)
+    _cfg.projects.push({ id: _r.projectId, name: _r.name, projectRoot: _r.root.replace(/\\/g, '/'), enabled: false, toolkit: _isToolkit, cellarCommit: true, git: { ...TOOLKIT_GIT_RULE } })
     _added.push(_r.projectId)
   }
   if (!_added.length) return
@@ -5201,7 +5213,7 @@ function ensureToolkitGitProjects(InRepos) {
 
 // 酒窖完整清單＝固定工具＋工具集提交（每次現算）
 function cellarTools() {
-  const _repos = discoverToolkitRepos()
+  const _repos = discoverCellarCommitRepos()
   ensureToolkitGitProjects(_repos)
   const _commits = _repos.map(r => ({
     id: `commit-${r.projectId}`, shelf: 'commit', name: `${r.name} Commit（一鍵提交）`, kind: 'claude',
@@ -5215,7 +5227,7 @@ function cellarTools() {
 
 // 酒窖提交類專案（TC 自身＋工具集）：不在版控面板，完成結果改走彈跳視窗
 function isCellarCommitProject(InProjectId) {
-  return InProjectId === 'tc' || discoverToolkitRepos().some(r => r.projectId === InProjectId)
+  return InProjectId === 'tc' || discoverCellarCommitRepos().some(r => r.projectId === InProjectId)
 }
 
 // 酒窖工具的勿擾設定鍵：觸發誓約排程的工具沿用該誓約的鍵
@@ -5794,6 +5806,83 @@ app.get('/api/sommelier/ui-proposal/:projectId/*', async (request, reply) => {
   reply.type(_mime)
   reply.header('Cache-Control', 'no-cache')
   return fs.readFileSync(_real)
+})
+
+// ─── 視覺頁（少爺 2026-10-30「我想要在TC有個視覺頁面(跟著專案)，其中要有可以瀏覽各專案的視覺，我預期我會看到類似檔案總管的畫面，點擊任意視覺，就會直接在瀏覽器開新分頁顯示」）──
+// 根目錄：sommelier.json projects[].visualRoots＝[{label, path}]；未設＝<projectRoot>/AI_Utils（存在才列）。
+// 樹只列視覺副檔名（網頁、圖片、影片）；檔案路由照提案頁的防穿越寫法（逐段拒 . / .. / 空段＋realpath 比對），
+// 網頁內的相對資源（js／css／json／字型）走同一條路由，所以頁面在新分頁裡照常載入。
+const VISUAL_VIEW_EXT = new Set(['.html', '.htm', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.mp4', '.webm'])
+const VISUAL_MIME = {
+  ...UI_PROPOSAL_MIME, '.htm': 'text/html; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8',
+  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.mp4': 'video/mp4', '.webm': 'video/webm',
+  '.woff': 'font/woff', '.ttf': 'font/ttf', '.otf': 'font/otf', '.txt': 'text/plain; charset=utf-8',
+}
+const VISUAL_SKIP_DIRS = new Set(['node_modules', '__pycache__', '.git', 'shared'])
+const VISUAL_SCAN_MAX_DEPTH = 8
+const VISUAL_SCAN_MAX_FILES = 5000
+
+// 專案的視覺根目錄（只回傳存在的資料夾）
+function visualRootsOf(InProj) {
+  const _root = InProj?.projectRoot ?? InProj?.projectPath
+  const _list = Array.isArray(InProj?.visualRoots) && InProj.visualRoots.length ? InProj.visualRoots
+    : (_root ? [{ label: 'AI_Utils', path: path.join(_root, 'AI_Utils') }] : [])
+  return _list.filter(r => r?.path && fs.existsSync(r.path) && fs.statSync(r.path).isDirectory())
+}
+
+// 掃一個資料夾：只留視覺檔與含視覺檔的子資料夾；InBudget＝剩餘可列檔數（共用計數，防爆量）
+function scanVisualDir(InAbs, InRel, InDepth, InBudget) {
+  const _node = { name: path.basename(InAbs), rel: InRel, dirs: [], files: [] }
+  let _entries = []
+  try { _entries = fs.readdirSync(InAbs, { withFileTypes: true }) } catch { return _node }
+  for (const _E of _entries) {
+    if (InBudget.left <= 0) break
+    const _rel = InRel ? `${InRel}/${_E.name}` : _E.name
+    if (_E.isDirectory()) {
+      if (InDepth >= VISUAL_SCAN_MAX_DEPTH || VISUAL_SKIP_DIRS.has(_E.name) || _E.name.startsWith('.')) continue
+      const _child = scanVisualDir(path.join(InAbs, _E.name), _rel, InDepth + 1, InBudget)
+      if (_child.files.length || _child.dirs.length) _node.dirs.push(_child)
+    } else if (_E.isFile() && VISUAL_VIEW_EXT.has(path.extname(_E.name).toLowerCase())) {
+      let _st = null
+      try { _st = fs.statSync(path.join(InAbs, _E.name)) } catch { continue }
+      const _ext = path.extname(_E.name).toLowerCase()
+      _node.files.push({ name: _E.name, rel: _rel, size: _st.size, mtime: _st.mtimeMs,
+        kind: (_ext === '.html' || _ext === '.htm') ? 'page' : (_ext === '.mp4' || _ext === '.webm') ? 'video' : 'image' })
+      InBudget.left--
+    }
+  }
+  _node.dirs.sort((a, b) => a.name.localeCompare(b.name))
+  _node.files.sort((a, b) => b.mtime - a.mtime)
+  return _node
+}
+
+app.get('/api/visuals/:projectId/tree', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const proj = (readSommelierConfig().projects ?? []).find(p => p.id === request.params.projectId)
+  if (!proj) { reply.code(404); return { ok: false, error: 'unknown project' } }
+  const _budget = { left: VISUAL_SCAN_MAX_FILES }
+  const roots = visualRootsOf(proj).map((r, i) => ({ index: i, label: r.label ?? path.basename(r.path), path: r.path, tree: scanVisualDir(r.path, '', 0, _budget) }))
+  return { ok: true, projectId: proj.id, roots, truncated: _budget.left <= 0 }
+})
+
+app.get('/api/visuals/:projectId/file/:rootIndex/*', async (request, reply) => {
+  if (!requireOwner(request, reply)) return { ok: false, error: 'owner only' }
+  const proj = (readSommelierConfig().projects ?? []).find(p => p.id === request.params.projectId)
+  const _root = proj ? visualRootsOf(proj)[Number(request.params.rootIndex)] : null
+  if (!_root) { reply.code(404); return { ok: false, error: 'unknown project or root' } }
+  const _rel = String(request.params['*'] ?? '').replace(/\\/g, '/')
+  if (!_rel || _rel.includes('\0') || _rel.split('/').some(s => s === '' || s === '.' || s === '..')) { reply.code(400); return { ok: false, error: 'path not allowed' } }
+  const _mime = VISUAL_MIME[path.extname(_rel).toLowerCase()]
+  if (!_mime) { reply.code(400); return { ok: false, error: 'ext not allowed' } }
+  const _base = path.resolve(_root.path)
+  const _abs = path.resolve(_base, _rel)
+  if (!_abs.startsWith(_base + path.sep)) { reply.code(400); return { ok: false, error: 'traversal forbidden' } }
+  let _real, _realBase
+  try { _real = fs.realpathSync(_abs); _realBase = fs.realpathSync(_base) } catch { reply.code(404); return { ok: false, error: 'file not found' } }
+  if (!_real.startsWith(_realBase + path.sep) || !fs.statSync(_real).isFile()) { reply.code(404); return { ok: false, error: 'file not found' } }
+  reply.type(_mime)
+  reply.header('Cache-Control', 'no-cache')
+  return reply.send(fs.createReadStream(_real))
 })
 
 // 重萃取（第五階段閉環）：跑 project extractCommand（離線三萃取器 cpp/arch/memory）。
@@ -9508,6 +9597,18 @@ app.get('/api/outsource/jobs/:id', async (request) => {
 })
 
 app.get('/api/outsource/jobs', async () => ({ jobs: [...outsourceJobs.values()].map(outsourceJobView).reverse().slice(0, 20) }))
+
+// 取消外包：外包是無頭 codex exec，Codex App 與 ChatGPT 都看不到這個工作，只能從 TC 停（11-09 少爺「我無法停止」）
+app.post('/api/outsource/jobs/:id/cancel', async (request) => {
+  const _j = outsourceJobs.get(request.params.id)
+  if (!_j) return { ok: false, error: '沒有這個外包工作（伺服器重啟後紀錄會清空）' }
+  if (_j.status !== 'running') return { ok: false, error: `工作已是 ${_j.status}` }
+  _j.status = 'cancelled'; _j.error = '使用者取消'
+  try { spawn('taskkill', ['/PID', String(_j.proc.pid), '/T', '/F'], { windowsHide: true }) } catch { try { _j.proc.kill() } catch {} }
+  logEvent('outsource.cancel', { id: _j.id })
+  broadcast({ type: 'outsource_update', id: _j.id })
+  return { ok: true, job: outsourceJobView(_j) }
+})
 
 async function usageInterruptTick() {
   if (usageTickRunning) return

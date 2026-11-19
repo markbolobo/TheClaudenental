@@ -51,7 +51,11 @@ function Get-RunningHeadless {
     try {
         # 伺服器偶有十餘秒的事件迴圈卡頓（2026-10-12 實測 11.5 秒）⇒ 放寬到 30 秒，避免誤判查詢失敗
         $r = Invoke-RestMethod -Uri "$Api/api/claude/processes" -TimeoutSec 30
-        return , [string[]]@($r.processes | Where-Object { $_.status -eq 'running' } | ForEach-Object { [string]$_.sessionId })
+        # 外包任務（/api/outsource/run 帶起的 codex 子行程）也會被 pm2 restart 砍斷（2026-10-30 關卡設計室差點砍掉 GPT-6 的地貌外包）⇒ 一併等
+        $o = Invoke-RestMethod -Uri "$Api/api/outsource/jobs" -TimeoutSec 30
+        $heads = @($r.processes | Where-Object { $_.status -eq 'running' } | ForEach-Object { [string]$_.sessionId })
+        $jobs = @($o.jobs | Where-Object { $_.status -eq 'running' } | ForEach-Object { 'outsource:' + [string]$_.id })
+        return , [string[]]@($heads + $jobs)
     } catch {
         return $null
     }

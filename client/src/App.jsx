@@ -6,6 +6,8 @@ import { SommelierPanel } from './Sommelier.jsx'
 import { reloginSession } from './relogin.js'
 import { QAMonitorPanel } from './QAMonitor.jsx'
 import AutomationPauseToggle from './AutomationPauseToggle.jsx'
+import EditorQuietToggle from './EditorQuietToggle.jsx'
+import VisualsPanel from './VisualsPanel.jsx'
 import BountySettings from './BountySettings.jsx'
 import MarkerPanel from './MarkerPanel.jsx'
 import UsageInterruptPanel, { useUsageInterruptCount } from './UsageInterruptPanel.jsx'
@@ -1758,6 +1760,7 @@ function TcSettingsModal({ onClose }) {
 const TABS = [
   { id: 'chat',      label: 'Chat' },
   { id: 'sommelier', label: '🍷 侍酒師' },
+  { id: 'visuals',   label: '🖼 視覺' },
   { id: 'qa',        label: '🧪 QA' },
   { id: 'todos',     label: '待辦' },
   { id: 'metrics',   label: '📊 儀表板' },
@@ -2777,6 +2780,7 @@ export default function App() {
           ⧗ Marker
         </button>
         <AutomationPauseToggle />
+        <EditorQuietToggle />
         <button
           onClick={() => setShowUsageInterrupts(true)}
           title="用量中斷 — Token 用完被中斷的聊天室、重設時間與續接（自動續接開關在 ⚙ 總設定）"
@@ -2930,6 +2934,7 @@ export default function App() {
             {activeTab === 'qa'      && <QAMonitorPanel selectedSessionId={selectedId} onGoToChat={handleContinueInChat} projects={tcProjects} activeProjectId={activeProjectId} onSelectProject={setActiveProjectId} onManageProjects={() => setShowHighTable(true)} />}
             {activeTab === 'metrics' && <MetricsDashboard />}
             {activeTab === 'sommelier' && <SommelierPanel onGoToChat={handleContinueInChat} projects={tcProjects} activeProjectId={activeProjectId} onSelectProject={setActiveProjectId} onManageProjects={() => setShowHighTable(true)} />}
+            {activeTab === 'visuals'   && <VisualsPanel projects={tcProjects} activeProjectId={activeProjectId} onSelectProject={setActiveProjectId} onManageProjects={() => setShowHighTable(true)} />}
             {activeTab === 'history'   && <HistoryPanel onContinue={handleContinueInChat} />}
             {activeTab === 'prompt'    && <PromptStudioPanel />}
             {activeTab === 'prefs'     && <PreferencesPanel />}
